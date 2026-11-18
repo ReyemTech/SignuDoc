@@ -4,6 +4,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 
 import { requestAccountClosure } from "../account.ts";
 import { type DbPool, withTransaction } from "../db/connection.ts";
@@ -820,6 +821,44 @@ test("account purge retires an unreconciled Part 11 alert without recreating cip
   );
 });
 
+async function leaveSigningLockAlertPending(
+  person: string,
+  emailService: EmailService,
+) {
+  await database.query(
+    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+    [person, clock()],
+  );
+  const offline = afterStatement(
+    database,
+    (sql) => sql.includes("INSERT INTO recovery_jobs"),
+    async () => {
+      throw new Error("fixture queue insertion unavailable");
+    },
+  );
+  await checkSigningCredentials(
+    { userId: person, email: `${person}@example.test`, password: "wrong" },
+    { database: offline, emailService },
+  );
+  const audit = await database.query<{ id: string }>(
+    "SELECT id FROM system_audit_events WHERE target_user_id = $1 AND event = 'signing_locked'",
+    [person],
+  );
+  assert.equal(audit.rowCount, 1);
+  return audit.rows[0]!.id;
+}
+
+async function retrySigningLockAlerts(
+  auditIds: string[],
+  emailService: EmailService,
+) {
+  await database.query(
+    "UPDATE system_audit_events SET signing_lock_alert_retry_at = clock_timestamp() WHERE id = ANY($1)",
+    [auditIds],
+  );
+  await runRecoveryJobs({ database, emailService });
+}
+
 for (const lock of ["owner row", "owner table"] as const) {
   test(`a contended alert ${lock} leaves time for unrelated ready email in the same drain`, async () => {
     const person = await user();
@@ -828,27 +867,11 @@ for (const lock of ["owner row", "owner table"] as const) {
     await database.query(`UPDATE "user" SET role = 'admin' WHERE id = $1`, [
       admin,
     ]);
-    await database.query(
-      'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
-      [person, clock()],
-    );
     const provider = mail();
-    const offline = afterStatement(
-      database,
-      (sql) => sql.includes("INSERT INTO recovery_jobs"),
-      async () => {
-        throw new Error("fixture queue insertion unavailable");
-      },
+    const auditId = await leaveSigningLockAlertPending(
+      person,
+      provider.emailService,
     );
-    await checkSigningCredentials(
-      { userId: person, email: `${person}@example.test`, password: "wrong" },
-      { database: offline, emailService: provider.emailService },
-    );
-    const audit = await database.query<{ id: string }>(
-      "SELECT id FROM system_audit_events WHERE target_user_id = $1 AND event = 'signing_locked'",
-      [person],
-    );
-    assert.equal(audit.rowCount, 1);
 
     const address = `${recipient}@example.test`;
     const { id: readyId } = await enqueueEmail(
@@ -902,7 +925,124 @@ for (const lock of ["owner row", "owner table"] as const) {
     } finally {
       await holder.query("ROLLBACK");
       holder.release();
-      await runRecoveryJobs({ database, emailService: provider.emailService });
+      await retrySigningLockAlerts([auditId], provider.emailService);
     }
   });
 }
+
+test("a healthy alert cohort can take longer than one second to materialize", async () => {
+  const person = await user();
+  const admins = await Promise.all([user(), user(), user()]);
+  await database.query(`UPDATE "user" SET role = 'admin' WHERE id = ANY($1)`, [
+    admins,
+  ]);
+  const audience = (
+    await database.query<{ id: string }>(
+      `SELECT id FROM "user" WHERE role = 'admin' ORDER BY id`,
+    )
+  ).rows.map((row) => row.id);
+  const provider = mail();
+  const auditId = await leaveSigningLockAlertPending(
+    person,
+    provider.emailService,
+  );
+  let inserts = 0;
+  const slow = afterStatement(
+    database,
+    (sql, values) =>
+      sql.includes("INSERT INTO recovery_jobs") && values[4] === person,
+    async () => {
+      if (inserts++ < 3) await delay(450);
+    },
+  );
+  try {
+    const started = performance.now();
+    const result = await runRecoveryJobs({
+      database: slow,
+      limit: 1,
+      maxDurationMs: 9000,
+      emailService: provider.emailService,
+    });
+    assert.equal(result.budgetExhausted, false);
+    assert.ok(performance.now() - started >= 1250);
+    const jobs = await database.query<{ dedupe_key: string }>(
+      "SELECT dedupe_key FROM recovery_jobs WHERE user_id = $1 ORDER BY dedupe_key",
+      [person],
+    );
+    assert.deepEqual(
+      jobs.rows.map((row) => row.dedupe_key),
+      audience.map((adminId) => `signing-lock/${auditId}/${adminId}`),
+    );
+    assert.equal(
+      (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+      0,
+    );
+  } finally {
+    await retrySigningLockAlerts([auditId], provider.emailService);
+  }
+});
+
+test("a busy oldest alert yields to a later audit under a one-source limit", async () => {
+  const oldest = await user();
+  const later = await user();
+  const admin = await user();
+  await database.query(`UPDATE "user" SET role = 'admin' WHERE id = $1`, [
+    admin,
+  ]);
+  const provider = mail();
+  const oldestAudit = await leaveSigningLockAlertPending(
+    oldest,
+    provider.emailService,
+  );
+  const laterAudit = await leaveSigningLockAlertPending(
+    later,
+    provider.emailService,
+  );
+
+  const holder = await database.connect();
+  try {
+    await holder.query("BEGIN");
+    await holder.query('SELECT id FROM "user" WHERE id = $1 FOR UPDATE', [
+      oldest,
+    ]);
+    const drain = () =>
+      runRecoveryJobs({
+        database,
+        limit: 1,
+        maxDurationMs: 1600,
+        emailService: provider.emailService,
+      });
+    await drain();
+    await drain();
+
+    const auditState = await database.query<{
+      id: string;
+      reconciled: boolean;
+    }>(
+      `SELECT id, signing_lock_alert_reconciled_at IS NOT NULL AS reconciled
+        FROM system_audit_events WHERE id = ANY($1) ORDER BY sequence`,
+      [[oldestAudit, laterAudit]],
+    );
+    assert.deepEqual(auditState.rows, [
+      { id: oldestAudit, reconciled: false },
+      { id: laterAudit, reconciled: true },
+    ]);
+    const jobs = await database.query<{ user_id: string }>(
+      "SELECT DISTINCT user_id FROM recovery_jobs WHERE user_id = ANY($1)",
+      [[oldest, later]],
+    );
+    assert.deepEqual(jobs.rows, [{ user_id: later }]);
+    assert.ok(
+      provider.sent.some((entry) =>
+        entry.message.textBody.includes(`${later}@example.test`),
+      ),
+    );
+  } finally {
+    await holder.query("ROLLBACK");
+    holder.release();
+    await retrySigningLockAlerts(
+      [oldestAudit, laterAudit],
+      provider.emailService,
+    );
+  }
+});

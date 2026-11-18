@@ -1,4 +1,5 @@
 import {
+  type DbExecutor,
   type DbPool,
   queryMany,
   queryOne,
@@ -13,7 +14,28 @@ import {
   createRecoveryBudget,
 } from "./worker-database.ts";
 
-const RECONCILIATION_BUDGET_MS = 1000;
+const INLINE_RECONCILIATION_BUDGET_MS = 1000;
+
+function isLockContention(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "55P03"
+  );
+}
+
+function withShortLockWait<T>(
+  database: DbPool,
+  run: (tx: DbExecutor) => Promise<T>,
+): Promise<T> {
+  return withTransaction(async (tx) => {
+    // Keep table locks and other contended statements brief while allowing
+    // a healthy cohort to use its work budget for all of its recipients.
+    await tx.query("SET LOCAL lock_timeout = '100ms'");
+    return run(tx);
+  }, database);
+}
 
 export function buildSigningLockAlert(
   person: { email: string; name: string },
@@ -50,7 +72,7 @@ async function reconcileSigningLockAlert(
   database: DbPool,
   env: EnvSource,
 ): Promise<string[]> {
-  return withTransaction(async (tx) => {
+  return withShortLockWait(database, async (tx) => {
     // Same ordering as lockout and account purge: owner first, then audit
     // and queue. A purge that wins leaves a retired audit with no payload.
     const user = await queryOne<{ name: string; lockedAt: number | null }>(
@@ -118,7 +140,49 @@ async function reconcileSigningLockAlert(
       [audit.id],
     );
     return jobs;
-  }, database);
+  });
+}
+
+const LOCK_AUDIT_COLUMNS = `
+  audit.id, audit.target_user_id AS "userId", audit.actor_email AS email, audit.sequence,
+  audit.created_at AS "lockedAt", (audit.metadata->>'failedAttempts')::int AS "failedAttempts"
+`;
+
+async function discoverSigningLockAlerts({
+  auditId,
+  database,
+  limit,
+}: {
+  auditId?: string;
+  database: DbPool;
+  limit: number;
+}): Promise<LockAudit[]> {
+  return withShortLockWait(database, (tx) =>
+    auditId
+      ? queryMany<LockAudit>(
+          tx,
+          `SELECT ${LOCK_AUDIT_COLUMNS}
+          FROM system_audit_events audit
+          WHERE id = $1 AND ${PENDING_SIGNING_LOCK_ALERT}
+            AND (signing_lock_alert_retry_at IS NULL OR signing_lock_alert_retry_at <= clock_timestamp())`,
+          [auditId],
+        )
+      : queryMany<LockAudit>(
+          tx,
+          `WITH due AS (
+            SELECT id FROM system_audit_events
+            WHERE ${PENDING_SIGNING_LOCK_ALERT}
+              AND (signing_lock_alert_retry_at IS NULL OR signing_lock_alert_retry_at <= clock_timestamp())
+            ORDER BY signing_lock_alert_retry_at NULLS FIRST, sequence LIMIT $1
+            FOR UPDATE SKIP LOCKED
+          )
+          UPDATE system_audit_events AS audit
+          SET signing_lock_alert_retry_at = clock_timestamp() + interval '30 seconds'
+          FROM due WHERE audit.id = due.id
+          RETURNING ${LOCK_AUDIT_COLUMNS}`,
+          [limit],
+        ),
+  );
 }
 
 /** Uses the caller's scoped executor during a scheduled recovery run. */
@@ -135,17 +199,15 @@ async function reconcileSigningLockAlerts({
   limit: number;
   signal: AbortSignal;
 }): Promise<string[]> {
-  const pending = await queryMany<LockAudit>(
-    database,
-    `SELECT id, target_user_id AS "userId", actor_email AS email, sequence,
-        created_at AS "lockedAt", (metadata->>'failedAttempts')::int AS "failedAttempts"
-      FROM system_audit_events
-      WHERE ${PENDING_SIGNING_LOCK_ALERT}
-        AND ($1::text IS NULL OR id = $1)
-        AND (signing_lock_alert_retry_at IS NULL OR signing_lock_alert_retry_at <= clock_timestamp())
-      ORDER BY signing_lock_alert_retry_at NULLS FIRST, sequence LIMIT $2`,
-    [auditId ?? null, limit],
-  );
+  let pending: LockAudit[];
+  try {
+    // The discovery transaction commits before locking any account. Its
+    // retry time survives a contended owner, exhausted budget, or restart.
+    pending = await discoverSigningLockAlerts({ auditId, database, limit });
+  } catch (error) {
+    if (isLockContention(error)) return [];
+    throw error;
+  }
   const jobs: string[] = [];
   for (const audit of pending) {
     if (signal.aborted) break;
@@ -153,21 +215,8 @@ async function reconcileSigningLockAlerts({
       jobs.push(...(await reconcileSigningLockAlert(audit, database, env)));
     } catch (error) {
       if (signal.aborted) break;
-      if (
-        typeof error === "object" &&
-        error !== null &&
-        "code" in error &&
-        error.code === "55P03"
-      )
-        continue;
+      if (isLockContention(error)) continue;
       console.error("[recovery] Signing lock alert reconciliation deferred.");
-      if (!auditId) {
-        await database.query(
-          `UPDATE system_audit_events SET signing_lock_alert_retry_at = clock_timestamp() + interval '30 seconds'
-            WHERE id = $1 AND signing_lock_alert_reconciled_at IS NULL`,
-          [audit.id],
-        );
-      }
     }
   }
   return jobs;
@@ -185,10 +234,7 @@ export async function reconcileSigningLockAlertsBeforeClaims({
   limit: number;
   runBudget: ReturnType<typeof createRecoveryBudget>;
 }): Promise<void> {
-  const allowance = Math.min(
-    RECONCILIATION_BUDGET_MS,
-    Math.floor(runBudget.remainingMs() / 4),
-  );
+  const allowance = Math.floor(runBudget.remainingMs() / 4);
   if (allowance < 1) return;
 
   const budget = createRecoveryBudget(allowance);
@@ -213,7 +259,7 @@ export async function tryReconcileSigningLockAlert(
   auditId: string,
   database: DbPool,
 ) {
-  const budget = createRecoveryBudget(RECONCILIATION_BUDGET_MS);
+  const budget = createRecoveryBudget(INLINE_RECONCILIATION_BUDGET_MS);
   try {
     return await reconcileSigningLockAlerts({
       auditId,
