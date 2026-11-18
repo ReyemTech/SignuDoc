@@ -1,3 +1,4 @@
+import { addAbortSignal, Readable } from "node:stream";
 import {
   DeleteObjectCommand,
   GetObjectCommand,
@@ -88,7 +89,8 @@ function isMissingKey(error: unknown): boolean {
 
 export function createS3StorageService({
   env = process.env,
-}: { env?: EnvSource } = {}): StorageService {
+  signal,
+}: { env?: EnvSource; signal?: AbortSignal } = {}): StorageService {
   const bucketName = requireConfigValue(
     "storage",
     "S3_BUCKET",
@@ -113,11 +115,14 @@ export function createS3StorageService({
     try {
       const result = await client.send(
         new GetObjectCommand({ Bucket: bucketName, Key: normalizedKey }),
+        { abortSignal: signal },
       );
       if (!result.Body) {
         throw new Error("S3 returned an object without a body.");
       }
 
+      if (signal && result.Body instanceof Readable)
+        addAbortSignal(signal, result.Body);
       return { normalizedKey, result, body: result.Body };
     } catch (error) {
       if (isMissingKey(error)) {
@@ -133,6 +138,7 @@ export function createS3StorageService({
       try {
         await client.send(
           new DeleteObjectCommand({ Bucket: bucketName, Key: normalizedKey }),
+          { abortSignal: signal },
         );
       } catch (error) {
         if (!isMissingKey(error)) throw error;
@@ -167,6 +173,7 @@ export function createS3StorageService({
       try {
         const result = await client.send(
           new HeadObjectCommand({ Bucket: bucketName, Key: normalizedKey }),
+          { abortSignal: signal },
         );
 
         return {
@@ -189,7 +196,9 @@ export function createS3StorageService({
 
           // HEAD has no error body. The SDK's NotFound can mean the key or
           // the bucket is missing. Confirm access to the bucket first.
-          await client.send(new HeadBucketCommand({ Bucket: bucketName }));
+          await client.send(new HeadBucketCommand({ Bucket: bucketName }), {
+            abortSignal: signal,
+          });
         }
 
         return { bucketName, exists: false, key: normalizedKey };
@@ -197,6 +206,10 @@ export function createS3StorageService({
     },
     async putObject(input) {
       const normalizedKey = normalizeStorageKey(input.key);
+      const abortSignal =
+        input.signal && signal
+          ? AbortSignal.any([signal, input.signal])
+          : (input.signal ?? signal);
       const command = new PutObjectCommand({
         Bucket: bucketName,
         Key: normalizedKey,
@@ -207,7 +220,7 @@ export function createS3StorageService({
 
       for (let attempt = 1; ; attempt++) {
         try {
-          await client.send(command);
+          await client.send(command, { abortSignal });
           break;
         } catch (error) {
           if (!input.keepExisting || !(error instanceof S3ServiceException)) {

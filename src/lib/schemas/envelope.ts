@@ -137,6 +137,7 @@ export const signatureLevelSchema = z.enum(["simple", "advanced", "qualified"]);
 export type EnvelopeSignatureLevel = z.infer<typeof signatureLevelSchema>;
 
 export const envelopeRecordSchema = z.object({
+  finalizationPending: z.boolean().optional(),
   id: idSchema,
   userId: idSchema,
   title: envelopeTitleSchema,

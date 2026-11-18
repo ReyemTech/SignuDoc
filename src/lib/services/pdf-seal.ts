@@ -48,6 +48,7 @@ export type SealOptions = {
   reason: string;
   signingTime?: Date;
   /** An RFC 3161 time-stamping service. Without one the seal is PAdES B-B. */
+  signal?: AbortSignal;
   timestampUrl?: string | null;
 };
 
@@ -127,7 +128,10 @@ function certificateIssuerAsn1(certificate: forge.asn1.Asn1): forge.asn1.Asn1 {
 export async function buildCadesSignature(
   content: Uint8Array,
   identity: SealIdentity,
-  { timestampUrl }: { timestampUrl?: string | null } = {},
+  {
+    timestampUrl,
+    signal,
+  }: { timestampUrl?: string | null; signal?: AbortSignal } = {},
 ): Promise<Uint8Array> {
   if (identity.certificateChainPem.length === 0) {
     throw new PdfSealError("The seal identity has no certificate.");
@@ -167,7 +171,11 @@ export async function buildCadesSignature(
   const unsignedAttributes: forge.asn1.Asn1[] = [];
 
   if (timestampUrl) {
-    const token = await requestTimestampToken(signatureValue, timestampUrl);
+    const token = await requestTimestampToken(
+      signatureValue,
+      timestampUrl,
+      signal,
+    );
 
     unsignedAttributes.push(attribute(OID.timeStampToken, token));
   }
@@ -265,10 +273,11 @@ function assertTokenMatchesRequest(
 async function requestTimestampToken(
   signatureValue: Buffer,
   timestampUrl: string,
+  signal?: AbortSignal,
 ): Promise<forge.asn1.Asn1> {
   const imprint = createHash("sha256").update(signatureValue).digest();
 
-  return (await fetchTimestampToken(imprint, timestampUrl)).asn1;
+  return (await fetchTimestampToken(imprint, timestampUrl, signal)).asn1;
 }
 
 /**
@@ -278,13 +287,15 @@ async function requestTimestampToken(
 export async function requestDocumentTimestamp(
   digest: Buffer,
   timestampUrl: string,
+  signal?: AbortSignal,
 ): Promise<Buffer> {
-  return (await fetchTimestampToken(digest, timestampUrl)).der;
+  return (await fetchTimestampToken(digest, timestampUrl, signal)).der;
 }
 
 async function fetchTimestampToken(
   imprint: Buffer,
   timestampUrl: string,
+  signal?: AbortSignal,
 ): Promise<{ asn1: forge.asn1.Asn1; der: Buffer }> {
   const nonce = randomBytes(8);
 
@@ -311,7 +322,9 @@ async function fetchTimestampToken(
       body: Buffer.from(derOf(request), "binary"),
       headers: { "content-type": "application/timestamp-query" },
       method: "POST",
-      signal: AbortSignal.timeout(TIMESTAMP_TIMEOUT_MS),
+      signal: signal
+        ? AbortSignal.any([signal, AbortSignal.timeout(TIMESTAMP_TIMEOUT_MS)])
+        : AbortSignal.timeout(TIMESTAMP_TIMEOUT_MS),
     });
   } catch (error) {
     throw new PdfSealError("The time-stamping service could not be reached.", {
@@ -367,16 +380,23 @@ class CadesSigner extends Signer {
   readonly identity: SealIdentity;
   readonly timestampUrl: string | null;
 
-  constructor(identity: SealIdentity, timestampUrl: string | null) {
+  readonly signal?: AbortSignal;
+  constructor(
+    identity: SealIdentity,
+    timestampUrl: string | null,
+    signal?: AbortSignal,
+  ) {
     super();
     this.identity = identity;
     this.timestampUrl = timestampUrl;
+    this.signal = signal;
   }
 
   async sign(content: Buffer): Promise<Buffer> {
     return Buffer.from(
       await buildCadesSignature(new Uint8Array(content), this.identity, {
         timestampUrl: this.timestampUrl,
+        signal: this.signal,
       }),
     );
   }
@@ -408,7 +428,7 @@ export async function saveSealedPdf(
   const unsigned = await pdfDocument.save({ useObjectStreams: false });
   const signed = await new SignPdf().sign(
     Buffer.from(unsigned),
-    new CadesSigner(identity, options.timestampUrl ?? null),
+    new CadesSigner(identity, options.timestampUrl ?? null, options.signal),
     signingTime,
   );
 

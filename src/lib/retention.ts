@@ -18,6 +18,7 @@ import { findRecordKeeper } from "./people.ts";
 import {
   buildEnvelopeThumbnailKey,
   getRecipientCertificateKey,
+  parseFinalizationAttemptKey,
 } from "./services/storage-keys.ts";
 import {
   createStorageService,
@@ -534,9 +535,10 @@ async function handOverFinishedEnvelopes(
 }
 
 export class AccountPurgeDeferredError extends Error {
-  constructor(userId: string) {
+  constructor(userId: string, reason?: string) {
     super(
-      `Account ${userId} holds finished envelopes and no other user can keep them. Its purge is deferred until another administrator exists or the records are exported and deleted by hand.`,
+      reason ??
+        `Account ${userId} holds finished envelopes and no other user can keep them. Its purge is deferred until another administrator exists or the records are exported and deleted by hand.`,
     );
     this.name = "AccountPurgeDeferredError";
   }
@@ -594,6 +596,20 @@ async function deleteAccountRows(
       `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
       [userId],
     );
+
+    // The JSON lookup also works on a disabled install predating the migration.
+    if (
+      await queryOne(
+        database,
+        `SELECT id FROM envelopes WHERE user_id=$1 AND status='sent'
+      AND to_jsonb(envelopes)->>'finalization_pending'='true' LIMIT 1`,
+        [userId],
+      )
+    )
+      throw new AccountPurgeDeferredError(
+        userId,
+        "Account purge deferred while accepted signatures await final documents.",
+      );
 
     if (!(await handOverFinishedEnvelopes(userId, now, database))) {
       throw new AccountPurgeDeferredError(userId);
@@ -1203,6 +1219,28 @@ export async function deletePendingFile(
   storageService: StorageService,
 ): Promise<boolean> {
   try {
+    const attempt = parseFinalizationAttemptKey(key);
+    if (attempt) {
+      // The manifest is removed in the same commit that publishes pointers.
+      // A single snapshot sees the active manifest or the published result.
+      // An abandoned lease can never re-acquire its immutable names.
+      const held = await queryOne(
+        database,
+        `SELECT 1 FROM envelopes WHERE id = $1
+          AND (signed_pdf_key = $2 OR evidence_key = $3)
+        UNION ALL
+        SELECT 1 FROM finalization_attempts WHERE lease_token = $4 AND $2 = ANY(storage_keys)
+        LIMIT 1`,
+        [attempt.envelopeId, key, attempt.internalKey, attempt.leaseToken],
+      );
+      if (held) {
+        await database.query(
+          "UPDATE pending_file_deletions SET last_tried_at = $2 WHERE storage_key = $1",
+          [key, getCurrentUnixTimestamp()],
+        );
+        return false;
+      }
+    }
     // Deleting a file that is already gone succeeds.
     await storageService.deleteObject(key);
     await database.query(

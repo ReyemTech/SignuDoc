@@ -126,6 +126,43 @@ export function buildEnvelopeSignedPdfKey(
   return path.posix.join(buildEnvelopePrefix(input), "final.pdf");
 }
 
+export function buildFinalizationAttemptKeys(
+  input: EnvelopeStorageIdentity & { attemptId: string },
+) {
+  const prefix = path.posix.join(
+    buildEnvelopePrefix(input),
+    "finalization",
+    input.attemptId,
+  );
+  return {
+    signedPdf: path.posix.join(prefix, "final.pdf"),
+    certificate: path.posix.join(
+      prefix,
+      CERTIFICATE_ROOT_SEGMENT,
+      INTERNAL_CERTIFICATE_FILE_NAME,
+    ),
+    recipientCertificate: path.posix.join(
+      prefix,
+      CERTIFICATE_ROOT_SEGMENT,
+      RECIPIENT_CERTIFICATE_FILE_NAME,
+    ),
+  };
+}
+
+/** The envelope and lease owning an immutable finalization output. */
+export function parseFinalizationAttemptKey(key: string) {
+  const match =
+    /^users\/[^/]+\/envelopes\/([^/]+)\/finalization\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/(?:final\.pdf|certificates\/(?:internal|recipient)\.pdf)$/.exec(
+      key,
+    );
+  if (!match) return null;
+  return {
+    envelopeId: match[1],
+    leaseToken: match[2],
+    internalKey: key.replace(/\/recipient\.pdf$/, "/internal.pdf"),
+  };
+}
+
 export function buildEnvelopeCertificateKey(
   input: EnvelopeStorageIdentity & {
     audience: CertificateAudience;

@@ -21,6 +21,7 @@ import {
 } from "../utils/env.ts";
 import {
   addLongTermValidation,
+  createValidationFetch,
   isSelfSigned,
   parseCertificate,
   type ValidationFetch,
@@ -148,7 +149,7 @@ async function identityFromDatabase(
   const key = encryptionKey(env);
   // Read before the transaction: settings come through another connection,
   // which a full pool could not give while this one waits on the lock.
-  const branding = await getBranding(env);
+  const branding = await getBranding(env, database);
 
   return withTransaction(async (tx) => {
     // One instance makes the key; any other waits here and then reads it.
@@ -251,11 +252,13 @@ export async function saveInstallSealedPdf(
   purpose: SealPurpose,
   {
     branding: givenBranding,
+    signal,
     database,
     env = process.env,
     identity,
   }: {
     branding?: Branding;
+    signal?: AbortSignal;
     database?: DbPool;
     env?: EnvSource;
     identity?: SealIdentity;
@@ -272,6 +275,7 @@ export async function saveInstallSealedPdf(
         ? `Signed with ${branding.productName}; sealed so that later changes are detectable`
         : `${branding.productName} audit certificate`,
     timestampUrl,
+    signal,
   };
 
   return sealForTheLongTerm(pdfDocument, sealIdentity, options);
@@ -298,7 +302,9 @@ export async function sealForTheLongTerm(
   if (!timestampUrl) {
     const sealed = await saveSealedPdf(pdfDocument, identity, options);
 
-    return fromAuthority ? withLongTermValidation(sealed, null, fetch) : sealed;
+    return fromAuthority
+      ? withLongTermValidation(sealed, null, fetch, "seal", options.signal)
+      : sealed;
   }
 
   let sealed: Uint8Array;
@@ -312,16 +318,25 @@ export async function sealForTheLongTerm(
   } catch (error) {
     // A time-stamping service that is down must not stop a signing. The
     // document is still sealed, only without the independent time.
+    options.signal?.throwIfAborted();
     console.error("[seal] Timestamping failed; sealing without it.", error);
     sealed = await saveSealedPdf(pdfDocument, identity, {
       ...options,
       timestampUrl: null,
     });
 
-    return fromAuthority ? withLongTermValidation(sealed, null, fetch) : sealed;
+    return fromAuthority
+      ? withLongTermValidation(sealed, null, fetch, "seal", options.signal)
+      : sealed;
   }
 
-  return withLongTermValidation(sealed, timestampUrl, fetch);
+  return withLongTermValidation(
+    sealed,
+    timestampUrl,
+    fetch,
+    "seal",
+    options.signal,
+  );
 }
 
 /** Whether the seal certificate was issued by someone else. */
@@ -348,15 +363,26 @@ async function withLongTermValidation(
   timestampUrl: string | null,
   fetch: ValidationFetch | undefined,
   whose: "seal" | "signers" = "seal",
+  signal?: AbortSignal,
 ): Promise<Uint8Array> {
   try {
+    const lookup = fetch ?? createValidationFetch();
     const result = await addLongTermValidation(sealed, {
-      fetch,
+      fetch: signal
+        ? (url, request, options) =>
+            lookup(url, request, {
+              ...options,
+              signal: options?.signal
+                ? AbortSignal.any([options.signal, signal])
+                : signal,
+            })
+        : lookup,
       timestamp: timestampUrl
-        ? (digest) => requestDocumentTimestamp(digest, timestampUrl)
+        ? (digest) => requestDocumentTimestamp(digest, timestampUrl, signal)
         : null,
     });
 
+    signal?.throwIfAborted();
     if (result.revoked.length > 0) {
       console.error(
         whose === "seal"
@@ -373,6 +399,7 @@ async function withLongTermValidation(
 
     return result.bytes;
   } catch (error) {
+    signal?.throwIfAborted();
     console.error(
       "[seal] Adding long-term validation failed; keeping the seal without it.",
       error,
@@ -393,13 +420,15 @@ export async function finishSignerSignedPdf(
   {
     env = process.env,
     fetch,
-  }: { env?: EnvSource; fetch?: ValidationFetch } = {},
+    signal,
+  }: { env?: EnvSource; fetch?: ValidationFetch; signal?: AbortSignal } = {},
 ): Promise<Uint8Array> {
   return withLongTermValidation(
     revision,
     readEnv(env, "SEAL_TIMESTAMP_URL") ?? null,
     fetch,
     "signers",
+    signal,
   );
 }
 

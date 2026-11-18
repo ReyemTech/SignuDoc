@@ -1,3 +1,5 @@
+import type { DbPool } from "../db/connection.ts";
+import type { EnvSource } from "../utils/env.ts";
 import { randomUUID } from "node:crypto";
 
 import { PDFDocument, type PDFImage, type PDFPage, rgb } from "pdf-lib";
@@ -30,6 +32,7 @@ import {
   type SealPurpose,
 } from "./seal-identity.ts";
 import {
+  type buildFinalizationAttemptKeys,
   buildEnvelopeCertificateKey,
   buildEnvelopeSignedPdfKey,
 } from "./storage-keys.ts";
@@ -71,12 +74,18 @@ const defaultSealer: PdfSealer = (pdfDocument, purpose) =>
  * connection, so a caller can seal while it holds one in a transaction
  * without waiting on a pool that its own concurrent requests have filled.
  */
-export async function loadInstallSealer(): Promise<PdfSealer> {
-  const identity = await getSealIdentity();
-  const branding = await getBranding();
+export async function loadInstallSealer(
+  options: { database?: DbPool; env?: EnvSource; signal?: AbortSignal } = {},
+): Promise<PdfSealer> {
+  const identity = await getSealIdentity(options);
+  const branding = await getBranding(options.env, options.database);
 
   return (pdfDocument, purpose) =>
-    saveInstallSealedPdf(pdfDocument, purpose, { branding, identity });
+    saveInstallSealedPdf(pdfDocument, purpose, {
+      ...options,
+      branding,
+      identity,
+    });
 }
 
 const CERTIFICATE_FINGERPRINT_VERSION = 1;
@@ -1500,6 +1509,10 @@ export async function finalizeEnvelope(
   },
   {
     seal,
+    generatedAt = Math.floor(Date.now() / 1000),
+    keys,
+    env,
+    signal,
     signedRevision,
     storageService = createStorageService(),
   }: SealOption & {
@@ -1507,17 +1520,20 @@ export async function finalizeEnvelope(
      * The last signer's revision, when the signers signed with their own
      * certificates: it is the signed document, and gets validation data.
      */
+    generatedAt?: number;
+    keys?: ReturnType<typeof buildFinalizationAttemptKeys>;
+    env?: EnvSource;
+    signal?: AbortSignal;
     signedRevision?: Uint8Array;
     storageService?: StorageService;
   } = {},
 ): Promise<FinalizedEnvelopeArtifacts> {
-  const generatedAt = Math.floor(Date.now() / 1000);
   const storageIdentity = {
     envelopeId: input.envelope.id,
     userId: input.envelope.userId,
   };
   const signedPdfBytes = signedRevision
-    ? await finishSignerSignedPdf(signedRevision)
+    ? await finishSignerSignedPdf(signedRevision, { env, signal })
     : await renderFinalizedEnvelopePdf(
         {
           auditEvents: input.auditEvents,
@@ -1550,7 +1566,7 @@ export async function finalizeEnvelope(
       ...(await storageService.putObject({
         body: signedPdfBytes,
         contentType: "application/pdf",
-        key: buildEnvelopeSignedPdfKey(storageIdentity),
+        key: keys?.signedPdf ?? buildEnvelopeSignedPdfKey(storageIdentity),
       })),
       body: signedPdfBytes,
       sha256: signedPdfSha256,
@@ -1561,10 +1577,12 @@ export async function finalizeEnvelope(
         auditEvents: input.auditEvents,
         certificate: {
           bucketName: input.sourcePdf.bucketName,
-          key: buildEnvelopeCertificateKey({
-            ...storageIdentity,
-            audience: "internal",
-          }),
+          key:
+            keys?.certificate ??
+            buildEnvelopeCertificateKey({
+              ...storageIdentity,
+              audience: "internal",
+            }),
         },
         copyRecipients: input.copyRecipients,
         envelope: completedEnvelope,
@@ -1581,10 +1599,12 @@ export async function finalizeEnvelope(
         auditEvents: input.auditEvents,
         certificate: {
           bucketName: input.sourcePdf.bucketName,
-          key: buildEnvelopeCertificateKey({
-            ...storageIdentity,
-            audience: "recipient",
-          }),
+          key:
+            keys?.recipientCertificate ??
+            buildEnvelopeCertificateKey({
+              ...storageIdentity,
+              audience: "recipient",
+            }),
         },
         copyRecipients: input.copyRecipients,
         envelope: completedEnvelope,
@@ -1604,6 +1624,7 @@ export async function finalizeEnvelope(
       signedPdf,
     };
   } catch (error) {
+    if (keys) throw error; // The durable manifest retires this attempt.
     await Promise.all([
       ...(signedPdf
         ? [storageService.deleteObject(signedPdf.key).catch(() => undefined)]

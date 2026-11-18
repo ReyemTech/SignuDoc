@@ -1,7 +1,11 @@
+import { PDFDocument } from "pdf-lib";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 
 import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueRecoveryJob } from "./recovery/jobs.ts";
+import { finalizationPayload } from "./recovery/finalization-payload.ts";
+import { sha256Hex } from "./services/pdf-seal.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
@@ -2501,7 +2505,6 @@ export async function submitSigningForToken(
   const durable = isDurableJobsEnabled();
   const emailService =
     givenEmailService ?? (durable ? undefined : createEmailService());
-  const durableBranding = durable ? await getBranding() : null;
   const emailJobs: string[] = [];
   const part11Signature = await reauthenticatePart11Signer(
     context,
@@ -2524,6 +2527,74 @@ export async function submitSigningForToken(
     fieldUpdates,
   } = buildSignerSubmission(context, parsedInput, submittedAt);
   const presentedTokenHash = hashOpaqueToken(token);
+
+  async function persistSignerFieldsAndAcceptance(tx: DbExecutor) {
+    for (const update of fieldUpdates.values()) {
+      const result = await tx.query(
+        `
+          UPDATE fields
+          SET
+            input_method = $1,
+            value = $2,
+            image_key = $3,
+            checked = $4,
+            submitted_at = $5,
+            updated_at = $6
+          WHERE id = $7
+            AND envelope_id = $8
+            AND signer_id = $9
+          `,
+        [
+          update.inputMethod,
+          update.value,
+          update.imageKey,
+          update.checked,
+          update.submittedAt,
+          submittedAt,
+          update.fieldId,
+          context.envelope.id,
+          currentSignerId,
+        ],
+      );
+
+      if (result.rowCount !== 1) {
+        throw new SigningMutationError(
+          "Unable to save one or more field values.",
+          500,
+        );
+      }
+    }
+
+    const signedSignerResult = await tx.query(
+      `
+        UPDATE signers
+        SET
+          status = 'signed',
+          signing_token_hash = NULL,
+          signing_token_expires_at = NULL,
+          signed_at = $1,
+          updated_at = $2
+        WHERE id = $3
+          AND envelope_id = $4
+          AND status = 'notified'
+          AND signing_token_hash = $5
+        `,
+      [
+        submittedAt,
+        submittedAt,
+        currentSignerId,
+        context.envelope.id,
+        presentedTokenHash,
+      ],
+    );
+
+    if (signedSignerResult.rowCount !== 1) {
+      throw new SigningMutationError(
+        "This signing link is no longer active.",
+        409,
+      );
+    }
+  }
 
   let signingStatePersisted = false;
 
@@ -2597,6 +2668,9 @@ export async function submitSigningForToken(
     });
 
     if (nextSigner && nextSignerLink) {
+      const durableBranding = durable
+        ? await getBranding(undefined, database)
+        : null;
       if (!nextSignerId) {
         throw new SigningMutationError(
           "Envelope routing is out of sync for the next signer.",
@@ -2651,71 +2725,7 @@ export async function submitSigningForToken(
           tokenHash: presentedTokenHash,
         });
 
-        for (const update of fieldUpdates.values()) {
-          const result = await tx.query(
-            `
-              UPDATE fields
-              SET
-                input_method = $1,
-                value = $2,
-                image_key = $3,
-                checked = $4,
-                submitted_at = $5,
-                updated_at = $6
-              WHERE id = $7
-                AND envelope_id = $8
-                AND signer_id = $9
-            `,
-            [
-              update.inputMethod,
-              update.value,
-              update.imageKey,
-              update.checked,
-              update.submittedAt,
-              submittedAt,
-              update.fieldId,
-              context.envelope.id,
-              currentSignerId,
-            ],
-          );
-
-          if (result.rowCount !== 1) {
-            throw new SigningMutationError(
-              "Unable to save one or more field values.",
-              500,
-            );
-          }
-        }
-
-        const signedSignerResult = await tx.query(
-          `
-            UPDATE signers
-            SET
-              status = 'signed',
-              signing_token_hash = NULL,
-              signing_token_expires_at = NULL,
-              signed_at = $1,
-              updated_at = $2
-            WHERE id = $3
-              AND envelope_id = $4
-              AND status = 'notified'
-              AND signing_token_hash = $5
-          `,
-          [
-            submittedAt,
-            submittedAt,
-            currentSignerId,
-            context.envelope.id,
-            presentedTokenHash,
-          ],
-        );
-
-        if (signedSignerResult.rowCount !== 1) {
-          throw new SigningMutationError(
-            "This signing link is no longer active.",
-            409,
-          );
-        }
+        await persistSignerFieldsAndAcceptance(tx);
 
         const activatedNextSigner = await queryOne<{
           email: string;
@@ -2862,6 +2872,102 @@ export async function submitSigningForToken(
       fieldUpdates,
       submittedAt,
     );
+    if (durable) {
+      // Bind each appearance to the bytes accepted with the final signature.
+      // The last signer's drawn bytes are still available from validation.
+      const uploads = new Map(
+        drawnSignatureUploads.map(({ imageKey, body }) => [imageKey, body]),
+      );
+      const images: { key: string; sha256: string }[] = [];
+      const imageValidation = completedFields.some((field) => field.imageKey)
+        ? await PDFDocument.create()
+        : null;
+      for (const key of new Set(
+        completedFields.flatMap((f) => (f.imageKey ? [f.imageKey] : [])),
+      )) {
+        const bytes =
+          uploads.get(key) ?? (await storageService.getObject(key)).body;
+        try {
+          await imageValidation!.embedPng(bytes);
+        } catch {
+          throw new SigningMutationError(
+            "A drawn signature must be a readable PNG image.",
+            400,
+          );
+        }
+        images.push({ key, sha256: sha256Hex(bytes) });
+      }
+      await withTransaction(async (tx) => {
+        await lockSentEnvelope(context.envelope.id, tx);
+        await lockSignerForPresentedToken(tx, {
+          envelopeId: context.envelope.id,
+          signerId: currentSignerId,
+          tokenHash: presentedTokenHash,
+        });
+        const accepted = await queryOne<{ generatedAt: number }>(
+          tx,
+          `UPDATE envelopes
+             SET finalization_pending = true, updated_at = floor(extract(epoch FROM statement_timestamp()))
+             WHERE id = $1 AND NOT finalization_pending
+               AND (expires_at IS NULL OR expires_at > floor(extract(epoch FROM statement_timestamp())))
+               AND EXISTS (
+                 SELECT 1 FROM signers WHERE id = $2 AND
+                   (signing_token_expires_at IS NULL OR signing_token_expires_at >= floor(extract(epoch FROM statement_timestamp())))
+               )
+             RETURNING updated_at AS "generatedAt"`,
+          [context.envelope.id, currentSignerId],
+        );
+        if (!accepted) throw new SigningAccessError("expired");
+        if (providerSignature)
+          replacedRevisionKey = await commitProviderRevision(
+            tx,
+            context.envelope.id,
+            providerSignature,
+            routedAt,
+          );
+        await persistSignerFieldsAndAcceptance(tx);
+        await recordAuditEvent(signedAuditEvent, tx);
+        const envelope = await getEnvelopeRow(context.envelope.id, tx);
+        if (!envelope) throw new SigningAccessError("expired");
+        const sender = await getSenderRow(envelope.userId, tx);
+        if (!sender) throw new SigningAccessError("expired");
+        const payload = finalizationPayload.parse({
+          version: 1,
+          generatedAt: accepted.generatedAt,
+          envelope: mapEnvelopeRow(envelope),
+          fields: completedFields,
+          pages: context.pages,
+          signers: (await listSignerRows(envelope.id, tx)).map(mapSignerRow),
+          auditEvents: await listAuditEventsForEnvelope(envelope.id, tx),
+          copyRecipients: await listCopyRecipientRows(envelope.id, tx),
+          sender,
+          images,
+          revision: providerSignature
+            ? {
+                key: providerSignature.revision.key,
+                sha256: providerSignature.revision.sha256,
+              }
+            : null,
+        });
+        await enqueueRecoveryJob(
+          {
+            kind: "finalize_envelope",
+            dedupeKey: `finalize/${envelope.id}`,
+            envelopeId: envelope.id,
+            userId: envelope.userId,
+            payload,
+          },
+          { database: tx },
+        );
+      }, database);
+      signingStatePersisted = true;
+      await deleteReplacedRevision(replacedRevisionKey, storageService);
+      return signingSubmitResponseSchema.parse({
+        envelopeId: context.envelope.id,
+        redirectPath: getSigningDoneRedirectPath(token, context.envelope.title),
+        submittedAt,
+      });
+    }
     const completedSigners = applyCurrentSignerCompletion(
       context.signers,
       currentSignerId,
@@ -2911,7 +3017,7 @@ export async function submitSigningForToken(
 
     try {
       finalArtifacts = await withTransaction(async (tx) => {
-        const owner = await lockSentEnvelope(context.envelope.id, tx);
+        await lockSentEnvelope(context.envelope.id, tx);
         await assertStillSignersTurn(context.envelope.id, currentSignerId, tx);
         await lockSignerForPresentedToken(tx, {
           envelopeId: context.envelope.id,
@@ -2952,71 +3058,7 @@ export async function submitSigningForToken(
           );
         }
 
-        for (const update of fieldUpdates.values()) {
-          const result = await tx.query(
-            `
-              UPDATE fields
-              SET
-                input_method = $1,
-                value = $2,
-                image_key = $3,
-                checked = $4,
-                submitted_at = $5,
-                updated_at = $6
-              WHERE id = $7
-                AND envelope_id = $8
-                AND signer_id = $9
-            `,
-            [
-              update.inputMethod,
-              update.value,
-              update.imageKey,
-              update.checked,
-              update.submittedAt,
-              submittedAt,
-              update.fieldId,
-              context.envelope.id,
-              currentSignerId,
-            ],
-          );
-
-          if (result.rowCount !== 1) {
-            throw new SigningMutationError(
-              "Unable to save one or more field values.",
-              500,
-            );
-          }
-        }
-
-        const signedSignerResult = await tx.query(
-          `
-            UPDATE signers
-            SET
-              status = 'signed',
-              signing_token_hash = NULL,
-              signing_token_expires_at = NULL,
-              signed_at = $1,
-              updated_at = $2
-            WHERE id = $3
-              AND envelope_id = $4
-              AND status = 'notified'
-              AND signing_token_hash = $5
-          `,
-          [
-            submittedAt,
-            submittedAt,
-            currentSignerId,
-            context.envelope.id,
-            presentedTokenHash,
-          ],
-        );
-
-        if (signedSignerResult.rowCount !== 1) {
-          throw new SigningMutationError(
-            "This signing link is no longer active.",
-            409,
-          );
-        }
+        await persistSignerFieldsAndAcceptance(tx);
 
         const completedEnvelopeResult = await tx.query(
           `
@@ -3079,77 +3121,41 @@ export async function submitSigningForToken(
           tx,
         );
 
-        if (durable) {
-          const sender = await getSenderRow(owner.userId, tx);
-          if (!sender)
-            throw new SigningMutationError(
-              "The completed envelope is unavailable.",
-              409,
-            );
-          emailJobs.push(
-            ...(await enqueueCompletionEmails({
-              attachments: {
-                recipientCertificate: artifacts.recipientCertificate.body,
-                signedPdf: artifacts.signedPdf.body,
-              },
-              copyRecipients,
-              database: tx,
-              envelopeId: context.envelope.id,
-              envelopeTitle: context.envelope.title,
-              sender,
-              signers: completedSigners,
-            })),
-          );
-        }
         return artifacts;
       }, database);
       signingStatePersisted = true;
       await deleteReplacedRevision(replacedRevisionKey, storageService);
     } catch (error) {
       if (finalArtifactsStored) {
-        if (durable) {
-          await removeUnclaimedEnvelopeCertificates(
-            {
-              envelopeId: context.envelope.id,
-              keys: storedArtifactKeys,
-              storageService,
-            },
-            database,
-          );
-        } else
-          await Promise.all(
-            storedArtifactKeys.map((key) =>
-              storageService.deleteObject(key).catch(() => undefined),
-            ),
-          );
+        await Promise.all(
+          storedArtifactKeys.map((key) =>
+            storageService.deleteObject(key).catch(() => undefined),
+          ),
+        );
       }
 
       throw error;
     }
 
-    if (durable) {
-      await tryDeliverWorkflowEmails(emailJobs, { database, emailService });
-    } else {
-      try {
-        await sendCompletionEmails({
-          attachments: {
-            recipientCertificate: finalArtifacts.recipientCertificate.body,
-            signedPdf: finalArtifacts.signedPdf.body,
-          },
-          copyRecipients,
-          database,
-          emailService: emailService!,
-          envelopeId: context.envelope.id,
-          envelopeTitle: context.envelope.title,
-          sender: context.sender,
-          signers: completedSigners,
-        });
-      } catch (error) {
-        console.error(
-          `Failed to send completion emails for envelope ${context.envelope.id}:`,
-          error,
-        );
-      }
+    try {
+      await sendCompletionEmails({
+        attachments: {
+          recipientCertificate: finalArtifacts.recipientCertificate.body,
+          signedPdf: finalArtifacts.signedPdf.body,
+        },
+        copyRecipients,
+        database,
+        emailService: emailService!,
+        envelopeId: context.envelope.id,
+        envelopeTitle: context.envelope.title,
+        sender: context.sender,
+        signers: completedSigners,
+      });
+    } catch (error) {
+      console.error(
+        `Failed to send completion emails for envelope ${context.envelope.id}:`,
+        error,
+      );
     }
 
     return signingSubmitResponseSchema.parse({

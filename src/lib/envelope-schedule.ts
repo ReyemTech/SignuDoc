@@ -96,7 +96,7 @@ async function listExpiredEnvelopesToNotify(
       LEFT JOIN signers s
         ON s.envelope_id = e.id
         AND s.status = 'notified'
-      WHERE e.status = 'sent'
+      WHERE e.status = 'sent' AND NOT e.finalization_pending
         AND e.expires_at IS NOT NULL
         AND e.expires_at <= $1
         AND e.expiry_notified_at IS NULL
@@ -131,7 +131,7 @@ async function isExpiryNoticeDue(
       SELECT id
       FROM envelopes
       WHERE id = $1
-        AND status = 'sent'
+        AND status = 'sent' AND NOT finalization_pending
         AND expires_at = $2
         AND expiry_notified_at IS NULL
     `,
@@ -158,7 +158,7 @@ async function noteExpiryNoticeSent(
         UPDATE envelopes
         SET expiry_notified_at = $1
         WHERE id = $2
-          AND status = 'sent'
+          AND status = 'sent' AND NOT finalization_pending
           AND expires_at = $3
           AND expiry_notified_at IS NULL
       `,
@@ -217,7 +217,7 @@ async function enqueueExpiryNotice(
         u.email AS "ownerEmail", u.name AS "ownerName",
         NULL AS "signerEmail", NULL AS "signerName"
       FROM envelopes e JOIN "user" u ON u.id = e.user_id
-      WHERE e.id = $1 AND e.status = 'sent' AND e.expires_at = $2
+      WHERE e.id = $1 AND e.status = 'sent' AND NOT e.finalization_pending AND e.expires_at = $2
         AND e.expiry_notified_at IS NULL
         AND e.expires_at <= floor(extract(epoch from clock_timestamp()))
       FOR NO KEY UPDATE OF e
@@ -319,7 +319,7 @@ async function listEnvelopesDueForReminder(
       JOIN signers s
         ON s.envelope_id = e.id
         AND s.status = 'notified'
-      WHERE e.status = 'sent'
+      WHERE e.status = 'sent' AND NOT e.finalization_pending
         AND e.reminder_interval_days IS NOT NULL
         AND (e.expires_at IS NULL OR e.expires_at > $1)
         AND GREATEST(

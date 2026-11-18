@@ -23,6 +23,7 @@ export {
 
 type CreateStorageServiceOptions = {
   env?: EnvSource;
+  signal?: AbortSignal;
 };
 
 export function buildContentDisposition(
@@ -43,13 +44,14 @@ export function buildContentDisposition(
 
 export function createStorageService({
   env = process.env,
+  signal,
 }: CreateStorageServiceOptions = {}): StorageService {
   switch (resolveStorageDriver(env)) {
     case "blob":
-      return createBlobStorageService({ env });
+      return createBlobStorageService({ env, signal });
     case "local":
-      return createLocalStorageService({ env });
+      return createLocalStorageService({ env, signal });
     case "s3":
-      return createS3StorageService({ env });
+      return createS3StorageService({ env, signal });
   }
 }

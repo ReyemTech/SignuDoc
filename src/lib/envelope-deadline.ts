@@ -45,11 +45,16 @@ export function deadlineFromDays(
 
 /** True for an envelope that is out for signature and past its deadline. */
 export function isEnvelopeExpired(
-  envelope: { expiresAt?: number | null; status: string },
+  envelope: {
+    expiresAt?: number | null;
+    status: string;
+    finalizationPending?: boolean;
+  },
   nowUnixTimestamp: number,
 ): boolean {
   return (
     envelope.status === "sent" &&
+    !envelope.finalizationPending &&
     typeof envelope.expiresAt === "number" &&
     envelope.expiresAt <= nowUnixTimestamp
   );

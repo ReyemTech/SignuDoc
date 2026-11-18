@@ -120,11 +120,15 @@ export async function runRecoveryJobs({
     email:
       handlers?.email ??
       ((job, options) => processEmailJob(job, { ...options, emailService })),
-    finalize_envelope: handlers?.finalize_envelope,
+    finalize_envelope:
+      handlers?.finalize_envelope ??
+      (async (job, options) => {
+        // Email-only calls can run without loading the signing/PDF module graph.
+        const { processFinalizationJob } = await import("./finalization.ts");
+        await processFinalizationJob(job, options);
+      }),
   } satisfies Partial<Record<RecoveryJobKind, RecoveryHandler>>;
-  const kinds: RecoveryJobKind[] = available.finalize_envelope
-    ? ["email", "finalize_envelope"]
-    : ["email"];
+  const kinds: RecoveryJobKind[] = ["email", "finalize_envelope"];
   const budget = createRecoveryBudget(maxDurationMs);
   try {
     const pool = database ?? getDb();

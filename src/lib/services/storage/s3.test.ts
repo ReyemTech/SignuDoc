@@ -510,3 +510,33 @@ test("S3 stops retrying a repeated conditional conflict", async (t) => {
   });
   assert.deepEqual(conditions, ["*", "*", "*", undefined]);
 });
+
+for (const operation of ["getObject", "putObject"] as const) {
+  test(`worker abort closes a stalled S3 ${operation} connection`, async (t) => {
+    setTestEnv(t, testCredentials);
+    const controller = new AbortController();
+    const closed = Promise.withResolvers<void>();
+    const env = await startTestServer(t, (_request, response) => {
+      response.on("close", () => closed.resolve());
+      if (operation === "getObject") {
+        response.writeHead(200, { "Content-Length": 9000 });
+        response.write("partial body");
+      }
+      setTimeout(() => controller.abort(), 40);
+      const fallback = setTimeout(() => response.end(), 500);
+      response.on("close", () => clearTimeout(fallback));
+    });
+    const storage = createStorageService({ env, signal: controller.signal });
+    const started = performance.now();
+    await assert.rejects(
+      operation === "getObject"
+        ? storage.getObject(inputKey)
+        : storage.putObject(input),
+    );
+    await closed.promise;
+    assert.ok(
+      performance.now() - started < 450,
+      "aborting must close the transport promptly",
+    );
+  });
+}

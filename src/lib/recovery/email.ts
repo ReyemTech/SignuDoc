@@ -203,6 +203,7 @@ export async function enqueueEmail(
 }
 
 type EnvelopeGuardRow = {
+  finalizationPending: boolean;
   status: (typeof envelopeStatuses)[number];
   expiresAt: number | null;
   expiryNotifiedAt: number | null;
@@ -260,7 +261,7 @@ async function emailGuardMatches(
 
   const envelope = await queryOne<EnvelopeGuardRow>(
     database,
-    `SELECT status, expires_at AS "expiresAt", expiry_notified_at AS "expiryNotifiedAt",
+    `SELECT status, finalization_pending AS "finalizationPending",expires_at AS "expiresAt", expiry_notified_at AS "expiryNotifiedAt",
         retention_warned_at AS "retentionWarnedAt", part11, ${DATABASE_SECONDS} AS now,
         COALESCE(completed_at, declined_at, voided_at, updated_at) AS "finishedAt",
         retention_warning_policy_generation AS "warningGeneration"
@@ -272,6 +273,7 @@ async function emailGuardMatches(
   if (
     acknowledgement?.kind === "expiry_notice" &&
     (envelope.status !== "sent" ||
+      envelope.finalizationPending ||
       envelope.expiresAt !== acknowledgement.expiresAt ||
       envelope.expiresAt > envelope.now ||
       envelope.expiryNotifiedAt !== null)
@@ -364,7 +366,7 @@ async function acknowledgeEmail(
     const recorded = await queryOne<{ notifiedAt: number }>(
       database,
       `UPDATE envelopes SET expiry_notified_at = ${DATABASE_SECONDS}
-        WHERE id = $1 AND status = 'sent' AND expires_at = $2 AND expiry_notified_at IS NULL
+        WHERE id = $1 AND status = 'sent' AND expires_at = $2 AND NOT finalization_pending AND expiry_notified_at IS NULL
         RETURNING expiry_notified_at AS "notifiedAt"`,
       [envelopeId, acknowledgement.expiresAt],
     );

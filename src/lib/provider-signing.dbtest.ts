@@ -14,6 +14,8 @@ import { replaceDbPoolForTests } from "./db/connection.ts";
 import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import { ELECTRONIC_RECORDS_DISCLOSURE_VERSION } from "./electronic-records-disclosure.ts";
 import {
+  changeEnvelopeDeadline,
+  changeEnvelopeReminders,
   EnvelopeMutationError,
   getEnvelopeDetailDataForUser,
   getReviewEnvelopeDataForUser,
@@ -29,6 +31,8 @@ import {
 } from "./provider-signing.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { runRecoveryJobs } from "./recovery/worker.ts";
+import { getSenderEnvelopeDownload } from "./downloads.ts";
+import { runEnvelopeSchedule } from "./envelope-schedule.ts";
 import { runRetentionSweep } from "./retention.ts";
 import { invalidateSettingsCache } from "./settings.ts";
 import { type EmailService } from "./services/email.ts";
@@ -1131,12 +1135,126 @@ test("durable completion commits recipient download links and stable mail intent
       storageService,
       emailService: failed,
     });
+    const accepted = await database.query(
+      `SELECT e.status, e.signed_pdf_key, s.status AS signer, s.signing_token_hash,
+       (SELECT count(*) FROM audit_events WHERE envelope_id=e.id AND event='signed') AS signatures,
+       (SELECT count(*) FROM audit_events WHERE envelope_id=e.id AND event='completed') AS completions
+       FROM envelopes e JOIN signers s ON s.envelope_id=e.id WHERE s.id=$1`,
+      [draft.casey.id],
+    );
+    assert.deepEqual(accepted.rows, [
+      {
+        status: "sent",
+        signed_pdf_key: null,
+        signer: "signed",
+        signing_token_hash: null,
+        signatures: 2,
+        completions: 0,
+      },
+    ]);
+    await assert.rejects(
+      submitSigningForToken(token, submissionFor(draft.casey), {
+        database,
+        storageService,
+      }),
+    );
+    const finalizer = (
+      await database.query(
+        "SELECT id FROM recovery_jobs WHERE envelope_id=$1 AND kind='finalize_envelope'",
+        [draft.envelopeId],
+      )
+    ).rows;
+    assert.equal(finalizer.length, 1);
+    // A rendering retry may outlive the signing deadline.
+    await database.query("UPDATE envelopes SET expires_at=1 WHERE id=$1", [
+      draft.envelopeId,
+    ]);
+    const pending = await getEnvelopeDetailDataForUser(
+      draft.userId,
+      draft.envelopeId,
+      database,
+    );
+    assert.equal(pending?.finalizationPending, true);
+    assert.equal(pending.deadline, null);
+    await assert.rejects(
+      changeEnvelopeDeadline(
+        draft.userId,
+        draft.envelopeId,
+        { expiresInDays: 7, senderEmail: "owner@example.test" },
+        { database },
+      ),
+    );
+    await assert.rejects(
+      changeEnvelopeReminders(draft.userId, draft.envelopeId, 1, { database }),
+    );
+    await assert.rejects(
+      voidSentEnvelope(
+        draft.userId,
+        draft.envelopeId,
+        { senderEmail: "owner@example.test", senderName: "Owner" },
+        { database },
+      ),
+    );
+    await assert.rejects(
+      getSenderEnvelopeDownload(draft.userId, draft.envelopeId, "signed", {
+        database,
+      }),
+      /preparing final documents/i,
+    );
+    await runEnvelopeSchedule({ database, emailService: failed });
+    assert.equal(
+      (
+        await database.query(
+          "SELECT id FROM recovery_jobs WHERE envelope_id=$1 AND dedupe_key LIKE 'expiry-notice/%'",
+          [draft.envelopeId],
+        )
+      ).rowCount,
+      0,
+    );
+    const staleNotice = await enqueueEmail(
+      {
+        dedupeKey: "stale-expiry/" + draft.envelopeId,
+        envelopeId: draft.envelopeId,
+        message: {
+          to: "owner@example.test",
+          subject: "Expired",
+          textBody: "Expired",
+          template: "expiry_notice",
+        },
+        acknowledgement: { kind: "expiry_notice", expiresAt: 1 },
+      },
+      { database },
+    );
+    await runRecoveryJobs({
+      database,
+      jobId: staleNotice.id,
+      emailService: failed,
+    });
+    assert.equal(
+      (
+        await database.query("SELECT state FROM recovery_jobs WHERE id=$1", [
+          staleNotice.id,
+        ])
+      ).rows[0].state,
+      "cancelled",
+    );
+    await database.query(
+      "INSERT INTO account_closure_requests(user_id,requested_at,export_expires_at,purge_after_at,updated_at) VALUES($1,1,1,1,1)",
+      [draft.userId],
+    );
+    const sweep = await runRetentionSweep({
+      database,
+      storageService,
+      emailService: failed,
+    });
+    assert.ok(sweep.accountPurgeFailures.includes(draft.userId));
+    await runRecoveryJobs({ database, jobId: finalizer[0].id });
     const jobs = await database.query<{
       dedupe_key: string;
       state: string;
       user_id: string;
     }>(
-      "SELECT dedupe_key, state, user_id FROM recovery_jobs WHERE envelope_id = $1 ORDER BY dedupe_key",
+      "SELECT dedupe_key, state, user_id FROM recovery_jobs WHERE envelope_id = $1 AND dedupe_key LIKE 'completion/%' ORDER BY dedupe_key",
       [draft.envelopeId],
     );
     const copy = (
@@ -1313,3 +1431,119 @@ test("durable decline stays accepted during an outage and audits only delivery",
     });
   }
 });
+
+for (const changed of [false, true]) {
+  test(`recover an accepted qualified signature with ${changed ? "a changed" : "its verified"} revision`, async () => {
+    const draft = await createDraft();
+    setEnv({
+      DURABLE_JOBS_ENABLED: "true",
+      BETTER_AUTH_SECRET: "fixture-secret-for-durable-workflow",
+      CRON_SECRET: "test-cron",
+    });
+    try {
+      await send(draft, "qualified");
+      await (
+        await signAtProvider(await linkFor(draft.riley.id), draft.riley)
+      ).finish();
+      const finalSession = await signAtProvider(
+        await linkFor(draft.casey.id),
+        draft.casey,
+      );
+      if (changed) {
+        await finalSession.finish();
+      } else {
+        // Lose the actual COMMIT reply. The callback's error handler may
+        // retire a signing session, but must preserve a committed revision.
+        let enqueued = false;
+        const lostAck = afterStatement(
+          database,
+          (sql) => {
+            if (sql.includes("INSERT INTO recovery_jobs")) enqueued = true;
+            return enqueued && sql === "COMMIT";
+          },
+          async () => {
+            enqueued = false;
+            throw new Error("lost provider acceptance acknowledgement");
+          },
+        );
+        await assert.rejects(
+          resumeProviderSigning(
+            finalSession.query.get("state")!,
+            finalSession.query,
+            {
+              database: lostAck,
+              storageService,
+              verifiedMethodsFor: () => [],
+            },
+          ),
+          /lost provider acceptance acknowledgement/,
+        );
+      }
+      const snapshot = await database.query(
+        `SELECT e.status,e.finalization_pending,e.revision_key,j.id,s.state,s.secret_data
+        FROM envelopes e JOIN recovery_jobs j ON j.envelope_id=e.id AND j.kind='finalize_envelope'
+        JOIN provider_signing_sessions s ON s.id=$2 WHERE e.id=$1`,
+        [draft.envelopeId, finalSession.query.get("state")],
+      );
+      assert.equal(snapshot.rowCount, 1);
+      const row = snapshot.rows[0];
+      assert.equal(row.status, "sent");
+      assert.equal(row.finalization_pending, true);
+      assert.equal(row.state, "completed");
+      assert.equal(row.secret_data, "");
+      await assert.rejects(finalSession.finish(), ProviderSigningError);
+      if (changed)
+        await storageService.putObject({
+          key: row.revision_key,
+          contentType: "application/pdf",
+          body: Uint8Array.of(1),
+        });
+      const run = await runRecoveryJobs({ database, jobId: row.id });
+      assert.equal(run.failed, Number(changed));
+      const terminal = (
+        await database.query(
+          "SELECT j.state,j.last_error_code,e.signed_pdf_key FROM recovery_jobs j JOIN envelopes e ON e.id=j.envelope_id WHERE j.id=$1",
+          [row.id],
+        )
+      ).rows[0];
+      if (changed) {
+        assert.deepEqual(terminal, {
+          state: "needs_attention",
+          last_error_code: "finalization_artifact_mismatch",
+          signed_pdf_key: null,
+        });
+        await database.query(
+          "DELETE FROM pending_file_deletions WHERE envelope_id=$1",
+          [draft.envelopeId],
+        );
+      } else {
+        assert.equal(terminal.state, "succeeded");
+        const pdf = (await storageService.getObject(terminal.signed_pdf_key))
+          .body;
+        const signatures = findSignatures(pdf).filter(
+          (signature) => signature.subFilter === "ETSI.CAdES.detached",
+        );
+        assert.equal(signatures.length, 2);
+        for (const signature of signatures) {
+          const [, first, rest, length] = signature.byteRange;
+          const digest = createHash("sha256")
+            .update(pdf.subarray(0, first))
+            .update(pdf.subarray(rest, rest + length))
+            .digest();
+          assert.equal(
+            checkSignerSignature(signature.contents, digest, {
+              level: "qualified",
+            }).qualified,
+            true,
+          );
+        }
+      }
+    } finally {
+      setEnv({
+        DURABLE_JOBS_ENABLED: undefined,
+        BETTER_AUTH_SECRET: undefined,
+        CRON_SECRET: undefined,
+      });
+    }
+  });
+}

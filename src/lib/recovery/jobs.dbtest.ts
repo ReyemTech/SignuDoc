@@ -274,20 +274,26 @@ test("wrong keys and ciphertext modifications quarantine the job without exposin
   }
 });
 
-test("an unsupported finalization job waits for a worker with that handler", async () => {
+test("the built-in finalization worker quarantines an invalid snapshot", async () => {
   const { id } = await enqueueRecoveryJob(
     { ...input(), kind: "finalize_envelope" },
     { database, env },
   );
   assert.equal(
     (await runRecoveryJobs({ database, env, jobId: id })).processed,
-    0,
+    1,
   );
-  const waiting = await database.query(
-    "SELECT state, attempts FROM recovery_jobs WHERE id = $1",
+  const invalid = await database.query(
+    "SELECT state, attempts, last_error_code FROM recovery_jobs WHERE id = $1",
     [id],
   );
-  assert.deepEqual(waiting.rows, [{ state: "pending", attempts: 0 }]);
+  assert.deepEqual(invalid.rows, [
+    {
+      state: "needs_attention",
+      attempts: 1,
+      last_error_code: "payload_invalid",
+    },
+  ]);
 });
 
 test("link expiry clears a pending payload even while retry backoff is in effect", async () => {

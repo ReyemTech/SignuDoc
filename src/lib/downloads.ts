@@ -238,7 +238,7 @@ async function getEnvelopeByIdForUser(
         id,
         user_id AS "userId",
         title,
-        status,
+        status,finalization_pending AS "finalizationPending",
         source_pdf_key AS "sourcePdfKey",
         source_pdf_filename AS "sourcePdfFilename",
         source_pdf_size_bytes AS "sourcePdfSizeBytes",
@@ -762,6 +762,12 @@ export async function getSenderEnvelopeDownload(
   if (!envelope) {
     throw new DownloadAccessError("Envelope not found.", 404);
   }
+
+  if (envelope.finalizationPending)
+    throw new DownloadAccessError(
+      "Preparing final documents. Your downloads will be available when sealing finishes.",
+      409,
+    );
 
   if (parsedFileType === "signed") {
     return buildSignedPdfDownload(envelope, database, storageService);

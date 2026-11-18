@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { generateKeyPairSync } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -12,6 +13,7 @@ import forge from "node-forge";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 
 import {
+  requestDocumentTimestamp,
   buildCadesSignature,
   createSelfSignedSealIdentity,
   saveSealedPdf,
@@ -318,4 +320,32 @@ test("a PKCS#12 bundle from a certificate authority can be used", () => {
   assert.equal(parsed.certificateChainPem.length, 1);
   assert.match(parsed.privateKeyPem, /PRIVATE KEY/);
   assert.throws(() => sealIdentityFromPkcs12(bytes, "wrong"));
+});
+
+test("a worker abort closes a stalled timestamp reply body", async (t) => {
+  const controller = new AbortController();
+  const closed = Promise.withResolvers<void>();
+  const server = createServer((_request, response) => {
+    response.on("close", () => closed.resolve());
+    response.writeHead(200, { "content-type": "application/timestamp-reply" });
+    response.write(Buffer.of(0x30));
+    setTimeout(() => controller.abort(), 30);
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  t.after(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  const address = server.address();
+  assert.ok(address && typeof address === "object");
+  await assert.rejects(
+    requestDocumentTimestamp(
+      Buffer.alloc(32),
+      `http://127.0.0.1:${address.port}`,
+      controller.signal,
+    ),
+  );
+  await closed.promise;
+  assert.ok(controller.signal.aborted);
 });

@@ -29,6 +29,7 @@ const METADATA_SUFFIX = ".meta.json";
 
 type CreateLocalStorageServiceOptions = {
   env?: EnvSource;
+  signal?: AbortSignal;
   rootDir?: string;
 };
 
@@ -49,11 +50,13 @@ function isMissingFileError(error: unknown): boolean {
 async function writeFileAtomically(
   filePath: string,
   data: Uint8Array | string,
+  signal?: AbortSignal,
 ) {
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
 
   try {
-    await writeFile(temporaryPath, data);
+    await writeFile(temporaryPath, data, { signal });
+    signal?.throwIfAborted();
     await rename(temporaryPath, filePath);
   } catch (error) {
     await rm(temporaryPath, { force: true });
@@ -65,11 +68,16 @@ async function writeFileAtomically(
 // Writes the file only if there is none. A hard link cannot replace a file
 // that is there, and the file it makes is whole from its first moment, so of
 // two writers that arrive together exactly one is kept.
-async function writeFileIfAbsent(filePath: string, data: Uint8Array | string) {
+async function writeFileIfAbsent(
+  filePath: string,
+  data: Uint8Array | string,
+  signal?: AbortSignal,
+) {
   const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
 
   try {
-    await writeFile(temporaryPath, data);
+    await writeFile(temporaryPath, data, { signal });
+    signal?.throwIfAborted();
     await link(temporaryPath, filePath);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
@@ -82,6 +90,7 @@ async function writeFileIfAbsent(filePath: string, data: Uint8Array | string) {
 
 export function createLocalStorageService({
   env = process.env,
+  signal,
   rootDir,
 }: CreateLocalStorageServiceOptions = {}): StorageService {
   if (env.VERCEL === "1") {
@@ -99,6 +108,7 @@ export function createLocalStorageService({
   );
 
   function resolveObjectPath(key: string) {
+    signal?.throwIfAborted();
     const normalizedKey = normalizeStorageKey(key);
     const objectPath = path.join(
       /*turbopackIgnore: true*/ resolvedRootDir,
@@ -148,7 +158,7 @@ export function createLocalStorageService({
 
       try {
         const [body, metadata] = await Promise.all([
-          readFile(objectPath),
+          readFile(objectPath, { signal }),
           readMetadata(objectPath),
         ]);
 
@@ -183,7 +193,7 @@ export function createLocalStorageService({
         contentType: metadata.contentType,
         key: normalizedKey,
         stream: Readable.toWeb(
-          createReadStream(objectPath),
+          createReadStream(objectPath, { signal }),
         ) as ReadableStream<Uint8Array>,
       };
     },
@@ -210,6 +220,10 @@ export function createLocalStorageService({
       };
     },
     async putObject(input) {
+      const writeSignal =
+        input.signal && signal
+          ? AbortSignal.any([signal, input.signal])
+          : (input.signal ?? signal);
       const { normalizedKey, objectPath } = resolveObjectPath(input.key);
 
       const write = input.keepExisting
@@ -224,8 +238,9 @@ export function createLocalStorageService({
         JSON.stringify({
           contentType: input.contentType,
         } satisfies LocalObjectMetadata),
+        writeSignal,
       );
-      await write(objectPath, input.body);
+      await write(objectPath, input.body, writeSignal);
 
       return {
         bucketName: LOCAL_BUCKET_NAME,

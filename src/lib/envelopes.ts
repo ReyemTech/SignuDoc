@@ -415,6 +415,7 @@ export type EnvelopeDetailDeadline = {
 };
 
 export type EnvelopeDetailData = {
+  finalizationPending?: boolean;
   /** People who get a copy of the finished document without signing. */
   copyRecipients: readonly CopyRecipientRecord[];
   createdAtLabel: string;
@@ -1166,6 +1167,7 @@ async function getEnvelopeByIdForUser(
         declined_at AS "declinedAt",
         voided_at AS "voidedAt",
         expires_at AS "expiresAt",
+        finalization_pending AS "finalizationPending",
         reminder_interval_days AS "reminderIntervalDays",
         part11,
         signature_level AS "signatureLevel",
@@ -1427,6 +1429,7 @@ function buildDashboardContextLine(
   signers: readonly PersistedSignerRecord[],
   fields: readonly PersistedFieldRecord[],
 ): string {
+  if (envelope.finalizationPending) return "All signatures recorded";
   if (envelope.status === "completed") {
     const sentTo = signers.map((signer) => signer.email).join(", ");
     return sentTo.length > 0 ? `Sent to: ${sentTo}` : "Sent to: —";
@@ -1470,6 +1473,7 @@ function buildDashboardStatusLabel(
   envelope: EnvelopeRecord,
   signers: readonly PersistedSignerRecord[],
 ): string {
+  if (envelope.finalizationPending) return "Preparing final documents";
   if (isEnvelopeExpired(envelope, Math.floor(Date.now() / 1000))) {
     return "Expired";
   }
@@ -1844,6 +1848,7 @@ export async function listEnvelopesForUser(
         declined_at AS "declinedAt",
         voided_at AS "voidedAt",
         expires_at AS "expiresAt",
+        finalization_pending AS "finalizationPending",
         reminder_interval_days AS "reminderIntervalDays",
         part11,
         signature_level AS "signatureLevel",
@@ -1978,8 +1983,9 @@ export async function getEnvelopeDetailDataForUser(
   return {
     copyRecipients,
     createdAtLabel: formatLongDate(envelope.createdAt),
+    finalizationPending: Boolean(envelope.finalizationPending),
     deadline:
-      envelope.status === "sent"
+      envelope.status === "sent" && !envelope.finalizationPending
         ? {
             expired,
             expiresAtLabel:
@@ -2817,12 +2823,13 @@ export async function changeEnvelopeDeadline(
 
   await withTransaction(async (tx) => {
     const current = await queryOne<{
+      finalizationPending: boolean;
       expiresAt: number | null;
       status: EnvelopeRecord["status"];
     }>(
       tx,
       `
-        SELECT expires_at AS "expiresAt", status
+        SELECT expires_at AS "expiresAt", finalization_pending AS "finalizationPending", status
         FROM envelopes
         WHERE id = $1 AND user_id = $2
         -- The lock an UPDATE takes, not FOR UPDATE: storing an audit event
@@ -2837,7 +2844,7 @@ export async function changeEnvelopeDeadline(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (current.status !== "sent") {
+    if (current.status !== "sent" || current.finalizationPending) {
       throw new EnvelopeMutationError(
         "Only an envelope that is out for signature has a deadline to change.",
         409,
@@ -2930,6 +2937,7 @@ export async function correctSentEnvelopeSigner(
 
   const response = await withTransaction(async (tx) => {
     const envelope = await queryOne<{
+      finalizationPending: boolean;
       expiresAt: number | null;
       part11: boolean;
       status: EnvelopeRecord["status"];
@@ -2940,7 +2948,7 @@ export async function correctSentEnvelopeSigner(
       tx,
       `
         SELECT
-          expires_at AS "expiresAt",
+          expires_at AS "expiresAt", finalization_pending AS "finalizationPending",
           part11,
           status,
           title,
@@ -2957,7 +2965,7 @@ export async function correctSentEnvelopeSigner(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (envelope.status !== "sent") {
+    if (envelope.status !== "sent" || envelope.finalizationPending) {
       throw new EnvelopeMutationError(
         SENT_ENVELOPE_SIGNER_CORRECTION_MESSAGE,
         409,
@@ -3279,7 +3287,7 @@ export async function changeEnvelopeReminders(
     `
       UPDATE envelopes
       SET reminder_interval_days = $1, updated_at = $2
-      WHERE id = $3 AND user_id = $4 AND status = 'sent'
+      WHERE id = $3 AND user_id = $4 AND status = 'sent' AND NOT finalization_pending
     `,
     [reminderIntervalDays, nowUnixTimestamp, envelopeId, userId],
   );
@@ -3313,7 +3321,7 @@ export async function voidSentEnvelope(
     throw new EnvelopeMutationError("Envelope not found.", 404);
   }
 
-  if (envelope.status !== "sent") {
+  if (envelope.status !== "sent" || envelope.finalizationPending) {
     throw new EnvelopeMutationError("Only sent envelopes can be voided.", 409);
   }
 
@@ -3412,10 +3420,13 @@ export async function voidSentEnvelope(
     // second void, a decline or the last signature at the same time waits
     // here, then stops below: it never writes over, or deletes, the files
     // the first one saved.
-    const locked = await queryOne<{ status: EnvelopeRecord["status"] }>(
+    const locked = await queryOne<{
+      status: EnvelopeRecord["status"];
+      finalizationPending: boolean;
+    }>(
       tx,
       `
-        SELECT status
+        SELECT status, finalization_pending AS "finalizationPending"
         FROM envelopes
         WHERE id = $1 AND user_id = $2
         -- The lock an UPDATE takes, not FOR UPDATE: storing an audit event
@@ -3429,7 +3440,7 @@ export async function voidSentEnvelope(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (locked.status !== "sent") {
+    if (locked.status !== "sent" || locked.finalizationPending) {
       throw new EnvelopeMutationError(
         "Only sent envelopes can be voided.",
         409,
