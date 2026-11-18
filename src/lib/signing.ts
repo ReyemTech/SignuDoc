@@ -343,8 +343,8 @@ function normalizeSenderName(sender: SenderRow): string {
   return sender.name?.trim() ? sender.name : sender.email;
 }
 
-function getEnvelopeUrl(envelopeId: string): string {
-  const appUrl = requireConfigValue("app", "APP_URL", getEnv().appUrl);
+function getEnvelopeUrl(envelopeId: string, env?: EnvSource): string {
+  const appUrl = requireConfigValue("app", "APP_URL", getEnv(env).appUrl);
 
   return new URL(`/envelopes/${envelopeId}`, appUrl).toString();
 }
@@ -355,11 +355,12 @@ const RECIPIENT_DOWNLOAD_LINK_TTL_DAYS =
 function buildCompletionSenderEmail(input: {
   branding: Branding;
   envelopeId: string;
+  env?: EnvSource;
   envelopeTitle: string;
   senderEmail: string;
   senderName: string;
 }) {
-  const completedUrl = getEnvelopeUrl(input.envelopeId);
+  const completedUrl = getEnvelopeUrl(input.envelopeId, input.env);
   const subject = `"${input.envelopeTitle}" is fully signed`;
   const textBody = [
     `Hi ${input.senderName},`,
@@ -1231,10 +1232,12 @@ async function prepareRecipientCompletionEmail(
 function completionSenderEmail(
   input: CompletionEmailInput,
   branding: Branding,
+  env?: EnvSource,
 ) {
   return buildCompletionSenderEmail({
     branding,
     envelopeId: input.envelopeId,
+    env,
     envelopeTitle: input.envelopeTitle,
     senderEmail: input.sender.email,
     senderName: normalizeSenderName(input.sender),
@@ -1266,7 +1269,7 @@ export async function enqueueCompletionEmails(
   };
   const senderJob = await enqueueEmail(
     {
-      message: completionSenderEmail(input, branding),
+      message: completionSenderEmail(input, branding, env),
       dedupeKey: `completion/${envelopeId}/sender`,
       envelopeId,
       userId: owner.userId,

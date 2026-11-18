@@ -6,7 +6,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 
 import { requestAccountClosure } from "../account.ts";
-import { type DbPool } from "../db/connection.ts";
+import { type DbPool, withTransaction } from "../db/connection.ts";
 import { afterStatement, openTestDatabase } from "../db/test-database.ts";
 import { sendFreshDownloadLinks } from "../download-renewal.ts";
 import { createRecipientDownloadLink } from "../downloads.ts";
@@ -26,7 +26,11 @@ import {
   type StorageService,
 } from "../services/storage.ts";
 import { readStoredSettings, saveSettings } from "../settings.ts";
-import { getSigningPayloadForToken, sendSignerEmailCode } from "../signing.ts";
+import {
+  enqueueCompletionEmails,
+  getSigningPayloadForToken,
+  sendSignerEmailCode,
+} from "../signing.ts";
 import { enqueueEmail } from "./email.ts";
 import { runRecoveryJobs } from "./worker.ts";
 
@@ -525,6 +529,40 @@ test("durable Part 11 lock rolls back with its alert and cancels delivery to a f
   assert.ok(
     success.sent.every(
       ({ message }) => message.to !== `${administrator}@example.test`,
+    ),
+  );
+});
+
+test("the completion producer freezes the sender dashboard URL from its supplied environment", async () => {
+  const f = await fixture({ status: "completed" });
+  const delivery = mail();
+  const testEnv = { ...env, APP_URL: "https://completion.example.test" };
+  const [jobId] = await withTransaction(
+    (tx) =>
+      enqueueCompletionEmails({
+        attachments: {
+          recipientCertificate: new Uint8Array(),
+          signedPdf: new Uint8Array(),
+        },
+        copyRecipients: [],
+        database: tx,
+        env: testEnv,
+        envelopeId: f.envelopeId,
+        envelopeTitle: "Fixture",
+        sender: { email: `${f.userId}@example.test`, name: "Fixture Owner" },
+        signers: [],
+      }),
+    database,
+  );
+  await runRecoveryJobs({
+    database,
+    env: testEnv,
+    jobId,
+    emailService: delivery.emailService,
+  });
+  assert.ok(
+    delivery.sent[0]?.message.textBody.includes(
+      `https://completion.example.test/envelopes/${f.envelopeId}`,
     ),
   );
 });
