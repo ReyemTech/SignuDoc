@@ -1,0 +1,144 @@
+name: Publish SignuDoc packages
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-signudoc-packages
+  queue: max
+
+jobs:
+  publish:
+    if: github.repository == 'ReyemTech/SignuDoc' && (github.event_name != 'push' || !github.event.deleted)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      packages: write
+    env:
+      APP_IMAGE: ghcr.io/reyemtech/signudoc
+      MIGRATION_IMAGE: ghcr.io/reyemtech/signudoc-migrate
+      CHART_REGISTRY: oci://ghcr.io/reyemtech/charts
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version-file: .nvmrc
+      - uses: azure/setup-helm@1a275c3b69536ee54be43f2070a358922e12c8d4 # v4.3.1
+        with:
+          version: v4.2.3
+      - name: Validate and package the chart
+        run: |
+          node charts/signudoc/tests/validate.mjs
+          commit=$(git rev-parse HEAD)
+          version=$(bash deploy/reyemtech/package-chart.sh "$commit" "$GITHUB_REF_TYPE" "$GITHUB_REF_NAME" "$RUNNER_TEMP")
+          archive="$RUNNER_TEMP/signudoc-$version.tgz"
+          helm lint "$archive" -f deploy/reyemtech/workload/values.yaml
+          helm template signudoc "$archive" -f deploy/reyemtech/workload/values.yaml >/dev/null
+          {
+            echo "COMMIT=$commit"
+            echo "CHART_VERSION=$version"
+            echo "CHART_ARCHIVE=$archive"
+          } >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Log Helm in to GHCR
+        env:
+          GHCR_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GHCR_TOKEN" | helm registry login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Check for existing package versions
+        id: existing
+        run: |
+          check_tag() {
+            local name=$1 ref=$2 result
+            if result=$(docker buildx imagetools inspect "$ref" --raw 2>&1); then
+              echo "$name=true" >> "$GITHUB_OUTPUT"
+            elif [[ $result == *'not found'* || $result == *'manifest unknown'* || $result == *'name unknown'* || $result == *'denied: denied'* ]]; then
+              echo "$name=false" >> "$GITHUB_OUTPUT"
+            else
+              printf 'Could not check %s: %s\n' "$ref" "$result" >&2
+              return 1
+            fi
+          }
+          chart_ref="${CHART_REGISTRY#oci://}/signudoc:$CHART_VERSION"
+          check_tag chart "$chart_ref"
+          if grep -qx 'chart=true' "$GITHUB_OUTPUT"; then
+            # Fail before pushing any images if this chart version points elsewhere.
+            existing=$(mktemp -d)
+            helm pull "$CHART_REGISTRY/signudoc" --version "$CHART_VERSION" --destination "$existing"
+            helm show values "$CHART_ARCHIVE" > "$existing/expected-values.yaml"
+            helm show values "$existing/signudoc-$CHART_VERSION.tgz" > "$existing/published-values.yaml"
+            diff -u "$existing/expected-values.yaml" "$existing/published-values.yaml"
+          fi
+          check_tag app "$APP_IMAGE:$COMMIT"
+          check_tag migration "$MIGRATION_IMAGE:$COMMIT"
+      - name: Publish the app image
+        if: steps.existing.outputs.app == 'false'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: runner
+          platforms: linux/amd64
+          build-args: NEXT_DEPLOYMENT_ID=${{ env.COMMIT }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+          tags: ${{ env.APP_IMAGE }}:${{ env.COMMIT }}
+          provenance: mode=max
+          sbom: true
+          push: true
+      - name: Publish the migration image
+        if: steps.existing.outputs.migration == 'false'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          target: migrate
+          platforms: linux/amd64
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ env.COMMIT }}
+          tags: ${{ env.MIGRATION_IMAGE }}:${{ env.COMMIT }}
+          provenance: mode=max
+          sbom: true
+          push: true
+      - name: Verify published images
+        run: |
+          for image in "$APP_IMAGE" "$MIGRATION_IMAGE"; do
+            manifest=$(docker buildx imagetools inspect "$image:$COMMIT" --format '{{json .Manifest}}')
+            digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$manifest")
+            platform_digest=$(jq -er '.manifests[] | select(.platform.os == "linux" and .platform.architecture == "amd64") | .digest' <<< "$manifest")
+            docker buildx imagetools inspect "$image@$platform_digest" --format '{{json .Image}}' |
+              jq -e --arg commit "$COMMIT" '.config.Labels["org.opencontainers.image.revision"] == $commit'
+            echo "$image:$COMMIT ($image@$digest)" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
+      - name: Publish the OCI chart
+        if: steps.existing.outputs.chart == 'false'
+        run: helm push "$CHART_ARCHIVE" "$CHART_REGISTRY"
+      - name: Verify the published OCI chart
+        run: |
+          verified=$(mktemp -d)
+          chart_ref="$CHART_REGISTRY/signudoc"
+          helm pull "$chart_ref" --version "$CHART_VERSION" --destination "$verified"
+          pulled="$verified/signudoc-$CHART_VERSION.tgz"
+          helm show values "$pulled" | yq -o=json '.' |
+            jq -e --arg app "$APP_IMAGE" --arg migration "$MIGRATION_IMAGE" --arg commit "$COMMIT" \
+              '.image.repository == $app and .migration.image.repository == $migration and .image.tag == $commit and .migration.image.tag == $commit'
+          test "$(helm show chart "$pulled" | yq -er '.version')" = "$CHART_VERSION"
+          manifest=$(docker buildx imagetools inspect "${chart_ref#oci://}:$CHART_VERSION" --format '{{json .Manifest}}')
+          digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$manifest")
+          printf '%s --version %s (%s)\n' "$chart_ref" "$CHART_VERSION" "$digest" | tee -a "$GITHUB_STEP_SUMMARY"

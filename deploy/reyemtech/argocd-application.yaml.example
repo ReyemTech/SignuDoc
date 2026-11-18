@@ -1,0 +1,25 @@
+# Copy into private GitOps and fill in the project, repository, commit and version.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: signudoc
+  namespace: argocd
+spec:
+  project: replace-with-existing-project
+  sources:
+    - repoURL: ghcr.io/reyemtech/charts
+      chart: signudoc
+      targetRevision: REPLACE_WITH_PUBLISHED_CHART_VERSION
+      helm:
+        releaseName: signudoc
+        valueFiles:
+          - $values/deploy/reyemtech/workload/values.yaml
+    - repoURL: https://git.example.com/org/gitops.git
+      targetRevision: REPLACE_WITH_GIT_COMMIT
+      ref: values
+      path: deploy/reyemtech/workload
+      directory:
+        include: pdb.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: signudoc

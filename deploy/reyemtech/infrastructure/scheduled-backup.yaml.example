@@ -1,0 +1,13 @@
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: signudoc-db-daily
+  namespace: signudoc
+spec:
+  schedule: "0 30 4 * * *" # CNPG schedules include seconds.
+  suspend: true
+  immediate: false
+  backupOwnerReference: self
+  cluster:
+    name: signudoc-db
+  method: barmanObjectStore

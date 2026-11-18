@@ -1,0 +1,64 @@
+# Use with the fork's published chart, whose defaults pin both image tags.
+appUrl: https://signudoc.example.com
+existingSecret: signudoc-env
+imagePullSecrets:
+  - name: signudoc-registry
+
+replicaCount: 2
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: signudoc
+            app.kubernetes.io/instance: signudoc
+        topologyKey: kubernetes.io/hostname
+
+storage:
+  driver: s3
+config:
+  S3_BUCKET: replace-with-us-document-bucket
+  S3_REGION: us-east-1
+  S3_ENDPOINT: https://s3.example.com
+  S3_FORCE_PATH_STYLE: "true"
+  EMAIL_DRIVER: resend
+  RESEND_FROM_EMAIL: signudoc@example.com
+  RESEND_REGION: us-east-1
+
+extraEnv:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: signudoc-db-app
+        key: uri
+  - name: PGSSLMODE
+    value: verify-full
+  - name: NODE_EXTRA_CA_CERTS
+    value: /etc/signudoc/postgres-ca/ca.crt
+extraVolumes:
+  - name: postgres-ca
+    secret:
+      secretName: signudoc-db-ca
+      items:
+        - key: ca.crt
+          path: ca.crt
+extraVolumeMounts:
+  - name: postgres-ca
+    mountPath: /etc/signudoc/postgres-ca
+    readOnly: true
+
+migration:
+  mode: argocd
+cron:
+  retention:
+    enabled: true
+
+ingress:
+  enabled: false
+  className: traefik
+  host: signudoc.example.com
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-http
+  tls:
+    - hosts: [signudoc.example.com]
+      secretName: signudoc-tls
