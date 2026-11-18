@@ -496,14 +496,6 @@ export async function processEmailJob(
     throw new RecoveryJobError("payload_invalid", true);
   }
   const message = { ...payload.message, attachments };
-  const status = await getEmailDispatchStatus(job, database);
-  if (status === "stale") return;
-  if (status === "expired") {
-    await cancelRecoveryJob(job, { database, code: "expired" });
-    return;
-  }
-  if (status === "retry_window_elapsed")
-    throw new RecoveryJobError(status, true);
   if (!(await emailGuardMatches(job, payload, database))) {
     // A signer deadline may have moved since the read. Decide whether to
     // retire the token under the same envelope-first order as the edit.
@@ -519,14 +511,23 @@ export async function processEmailJob(
         await cancelRecoveryJob(job, { database: tx, code: "guard_changed" });
         return false;
       }, database);
-      if (!current || (await getEmailDispatchStatus(job, database)) !== "ready")
-        return;
+      if (!current) return;
     } else {
       await cancelRecoveryJob(job, { database, code: "guard_changed" });
       return;
     }
   }
 
+  // A domain guard may wait on PostgreSQL. Check the live lease and
+  // dispatch window after every successful guard path.
+  const status = await getEmailDispatchStatus(job, database);
+  if (status === "stale") return;
+  if (status === "expired") {
+    await cancelRecoveryJob(job, { database, code: "expired" });
+    return;
+  }
+  if (status === "retry_window_elapsed")
+    throw new RecoveryJobError(status, true);
   const service = emailService ?? createRecoveryEmailService(env);
   if (signal?.aborted) throw new RecoveryJobError("deadline_exceeded");
 

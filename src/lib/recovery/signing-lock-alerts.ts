@@ -13,6 +13,8 @@ import {
   createRecoveryBudget,
 } from "./worker-database.ts";
 
+const RECONCILIATION_BUDGET_MS = 1000;
+
 export function buildSigningLockAlert(
   person: { email: string; name: string },
   productName: string,
@@ -54,13 +56,13 @@ async function reconcileSigningLockAlert(
     const user = await queryOne<{ name: string; lockedAt: number | null }>(
       tx,
       `SELECT name, signing_locked_at AS "lockedAt" FROM "user"
-        WHERE id = $1 FOR NO KEY UPDATE`,
+        WHERE id = $1 FOR NO KEY UPDATE NOWAIT`,
       [audit.userId],
     );
     const pending = await queryOne<{ id: string }>(
       tx,
       `SELECT id FROM system_audit_events WHERE id = $1
-        AND ${PENDING_SIGNING_LOCK_ALERT} FOR UPDATE`,
+        AND ${PENDING_SIGNING_LOCK_ALERT} FOR UPDATE NOWAIT`,
       [audit.id],
     );
     if (!pending) return [];
@@ -120,7 +122,7 @@ async function reconcileSigningLockAlert(
 }
 
 /** Uses the caller's scoped executor during a scheduled recovery run. */
-export async function reconcileSigningLockAlerts({
+async function reconcileSigningLockAlerts({
   auditId,
   database,
   env = process.env,
@@ -149,8 +151,15 @@ export async function reconcileSigningLockAlerts({
     if (signal.aborted) break;
     try {
       jobs.push(...(await reconcileSigningLockAlert(audit, database, env)));
-    } catch {
+    } catch (error) {
       if (signal.aborted) break;
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "55P03"
+      )
+        continue;
       console.error("[recovery] Signing lock alert reconciliation deferred.");
       if (!auditId) {
         await database.query(
@@ -164,12 +173,47 @@ export async function reconcileSigningLockAlerts({
   return jobs;
 }
 
+/** Reserves most of the drain for claiming ready jobs. */
+export async function reconcileSigningLockAlertsBeforeClaims({
+  database,
+  env,
+  limit,
+  runBudget,
+}: {
+  database: DbPool;
+  env: EnvSource;
+  limit: number;
+  runBudget: ReturnType<typeof createRecoveryBudget>;
+}): Promise<void> {
+  const allowance = Math.min(
+    RECONCILIATION_BUDGET_MS,
+    Math.floor(runBudget.remainingMs() / 4),
+  );
+  if (allowance < 1) return;
+
+  const budget = createRecoveryBudget(allowance);
+  runBudget.signal.addEventListener("abort", budget.exhaust, { once: true });
+  try {
+    await reconcileSigningLockAlerts({
+      database: createBoundedRecoveryDatabase(database, budget),
+      env,
+      limit,
+      signal: budget.signal,
+    });
+  } catch (error) {
+    if (!budget.expired()) throw error;
+  } finally {
+    runBudget.signal.removeEventListener("abort", budget.exhaust);
+    budget.dispose();
+  }
+}
+
 /** Accelerates one committed lock without delaying unrelated credential checks. */
 export async function tryReconcileSigningLockAlert(
   auditId: string,
   database: DbPool,
 ) {
-  const budget = createRecoveryBudget(1000);
+  const budget = createRecoveryBudget(RECONCILIATION_BUDGET_MS);
   try {
     return await reconcileSigningLockAlerts({
       auditId,

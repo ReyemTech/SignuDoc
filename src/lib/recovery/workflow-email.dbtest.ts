@@ -819,3 +819,90 @@ test("account purge retires an unreconciled Part 11 alert without recreating cip
       .every(({ message }) => message.template !== "signing_lock_alert"),
   );
 });
+
+for (const lock of ["owner row", "owner table"] as const) {
+  test(`a contended alert ${lock} leaves time for unrelated ready email in the same drain`, async () => {
+    const person = await user();
+    const admin = await user();
+    const recipient = await user();
+    await database.query(`UPDATE "user" SET role = 'admin' WHERE id = $1`, [
+      admin,
+    ]);
+    await database.query(
+      'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+      [person, clock()],
+    );
+    const provider = mail();
+    const offline = afterStatement(
+      database,
+      (sql) => sql.includes("INSERT INTO recovery_jobs"),
+      async () => {
+        throw new Error("fixture queue insertion unavailable");
+      },
+    );
+    await checkSigningCredentials(
+      { userId: person, email: `${person}@example.test`, password: "wrong" },
+      { database: offline, emailService: provider.emailService },
+    );
+    const audit = await database.query<{ id: string }>(
+      "SELECT id FROM system_audit_events WHERE target_user_id = $1 AND event = 'signing_locked'",
+      [person],
+    );
+    assert.equal(audit.rowCount, 1);
+
+    const address = `${recipient}@example.test`;
+    const { id: readyId } = await enqueueEmail(
+      {
+        message: {
+          subject: "Independent mail",
+          template: "email_verification",
+          textBody: "This account has ready mail.",
+          to: address,
+        },
+        userId: recipient,
+        dedupeKey: `fixture-ready/${recipient}`,
+      },
+      { database },
+    );
+    const holder = await database.connect();
+    try {
+      await holder.query("BEGIN");
+      if (lock === "owner row") {
+        await holder.query('SELECT id FROM "user" WHERE id = $1 FOR UPDATE', [
+          person,
+        ]);
+      } else {
+        // Ordinary user lookups use ACCESS SHARE. Reconciliation's row lock
+        // also needs ROW SHARE, which this table lock holds back.
+        await holder.query('LOCK TABLE "user" IN EXCLUSIVE MODE');
+      }
+
+      const summary = await runRecoveryJobs({
+        database,
+        limit: 1,
+        maxDurationMs: 600,
+        emailService: provider.emailService,
+      });
+
+      assert.equal(summary.budgetExhausted, false);
+      assert.equal(summary.processed, 1);
+      assert.deepEqual(
+        provider.sent.map((entry) => entry.message.to),
+        [address],
+      );
+      const job = await database.query(
+        "SELECT state FROM recovery_jobs WHERE id = $1",
+        [readyId],
+      );
+      assert.deepEqual(job.rows, [{ state: "succeeded" }]);
+      assert.equal(
+        (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+        1,
+      );
+    } finally {
+      await holder.query("ROLLBACK");
+      holder.release();
+      await runRecoveryJobs({ database, emailService: provider.emailService });
+    }
+  });
+}

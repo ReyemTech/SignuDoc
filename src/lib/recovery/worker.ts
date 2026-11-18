@@ -3,7 +3,7 @@ import { type EmailService } from "../services/email.ts";
 import { type EnvSource } from "../utils/env.ts";
 import { assertRecoveryConfigured, isDurableJobsEnabled } from "./config.ts";
 import { processEmailJob } from "./email.ts";
-import { reconcileSigningLockAlerts } from "./signing-lock-alerts.ts";
+import { reconcileSigningLockAlertsBeforeClaims } from "./signing-lock-alerts.ts";
 import {
   claimRecoveryJob,
   failRecoveryJob,
@@ -127,13 +127,14 @@ export async function runRecoveryJobs({
     : ["email"];
   const budget = createRecoveryBudget(maxDurationMs);
   try {
-    const db = createBoundedRecoveryDatabase(database ?? getDb(), budget);
+    const pool = database ?? getDb();
+    const db = createBoundedRecoveryDatabase(pool, budget);
     if (!jobId) {
-      await reconcileSigningLockAlerts({
-        database: db,
+      await reconcileSigningLockAlertsBeforeClaims({
+        database: pool,
         env,
         limit: Math.min(limit, 20),
-        signal: budget.signal,
+        runBudget: budget,
       });
     }
     while (summary.processed < limit && !budget.expired()) {

@@ -10,7 +10,7 @@ import { after, before, test } from "node:test";
 import { Resend } from "resend";
 
 import { type DbPool, withTransaction } from "../db/connection.ts";
-import { openTestDatabase } from "../db/test-database.ts";
+import { afterStatement, openTestDatabase } from "../db/test-database.ts";
 import { verifyAuditChain } from "../services/audit.ts";
 import {
   createEmailService,
@@ -605,4 +605,57 @@ test("the deadline stops a blocked acknowledgement and a replacement reuses the 
     await run?.catch(() => undefined);
     blocker.release();
   }
+});
+
+test("a successful guard crossing the retry cutoff cannot reach the provider", async () => {
+  const { id } = await enqueueEmail(
+    {
+      message,
+      dedupeKey: dedupeKey(),
+      envelopeId,
+      userId,
+      guard: { kind: "envelope_status", allowedStatuses: ["completed"] },
+    },
+    { database, env, addresses },
+  );
+  let guardReads = 0;
+  const delayed = afterStatement(
+    database,
+    (sql, values) =>
+      sql.includes(
+        'retention_warning_policy_generation AS "warningGeneration"',
+      ) && values[0] === envelopeId,
+    async () => {
+      guardReads += 1;
+      await database.query(
+        `UPDATE recovery_jobs SET first_attempt_at = clock_timestamp() - interval '23 hours' + interval '50 milliseconds'
+          WHERE id = $1`,
+        [id],
+      );
+      await database.query("SELECT pg_sleep(0.075)");
+    },
+  );
+  let sends = 0;
+  await runRecoveryJobs({
+    database: delayed,
+    env,
+    jobId: id,
+    emailService: {
+      ...sendNever,
+      async send(message) {
+        sends += 1;
+        return { accepted: [message.to], rejected: [], messageId: "fixture" };
+      },
+    },
+  });
+
+  assert.equal(guardReads, 1);
+  assert.equal(sends, 0);
+  const job = await database.query(
+    "SELECT state, last_error_code FROM recovery_jobs WHERE id = $1",
+    [id],
+  );
+  assert.deepEqual(job.rows, [
+    { state: "needs_attention", last_error_code: "retry_window_elapsed" },
+  ]);
 });
