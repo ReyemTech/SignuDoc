@@ -1,3 +1,4 @@
+import { type EnvSource } from "./utils/env.ts";
 import {
   type DbExecutor,
   getDb,
@@ -237,7 +238,7 @@ async function getEnvelopeByIdForUser(
         id,
         user_id AS "userId",
         title,
-        status,
+        status,finalization_pending AS "finalizationPending",
         source_pdf_key AS "sourcePdfKey",
         source_pdf_filename AS "sourcePdfFilename",
         source_pdf_size_bytes AS "sourcePdfSizeBytes",
@@ -425,14 +426,16 @@ export async function createRecipientDownloadLink(
   },
   {
     database = getDb(),
+    env,
   }: {
     database?: DbExecutor;
+    env?: EnvSource;
   } = {},
 ): Promise<IssuedDownloadLink> {
-  const issuedLink = await issueRecipientDownloadLink({
-    fileType,
-    issuedAt,
-  });
+  const issuedLink = await issueRecipientDownloadLink(
+    { fileType, issuedAt },
+    { env },
+  );
 
   await storeRecipientDownloadToken(
     {
@@ -760,6 +763,12 @@ export async function getSenderEnvelopeDownload(
     throw new DownloadAccessError("Envelope not found.", 404);
   }
 
+  if (envelope.finalizationPending)
+    throw new DownloadAccessError(
+      "Preparing final documents. Your downloads will be available when sealing finishes.",
+      409,
+    );
+
   if (parsedFileType === "signed") {
     return buildSignedPdfDownload(envelope, database, storageService);
   }
@@ -922,6 +931,13 @@ async function replaceRecipientDownloadLinks(
   return { evidenceLink, previousTokens, signedLink };
 }
 
+export type RenewalEmailData = {
+  envelope: EnvelopeRecord;
+  evidenceUrl: string;
+  signedUrl: string | null;
+  signer: SignerRecord;
+};
+
 /**
  * Someone holding an expired download link asks for a new one. The new links
  * go only to the signer's own address on record, never anywhere the request
@@ -932,15 +948,24 @@ export async function renewRecipientDownloadLinks(
   {
     database = getDb(),
     sendLinks,
-  }: {
-    database?: DbExecutor;
-    sendLinks: (input: {
-      envelope: EnvelopeRecord;
-      evidenceUrl: string;
-      signedUrl: string | null;
-      signer: SignerRecord;
-    }) => Promise<void>;
-  },
+    enqueueLinks,
+  }: { database?: DbExecutor } & (
+    | {
+        sendLinks: (input: RenewalEmailData) => Promise<void>;
+        enqueueLinks?: never;
+      }
+    | {
+        sendLinks?: never;
+        enqueueLinks: (
+          input: RenewalEmailData & {
+            database: DbExecutor;
+            evidenceLink: IssuedDownloadLink;
+            presentedTokenHash: string;
+            signedLink: IssuedDownloadLink | null;
+          },
+        ) => Promise<void>;
+      }
+  ),
 ): Promise<RenewedDownloadLinks> {
   const presentedTokenHash = hashOpaqueToken(token);
   const tokenRow = await getRecipientDownloadTokenByHash(
@@ -975,6 +1000,41 @@ export async function renewRecipientDownloadLinks(
       { envelope, presentedTokenHash, signerId },
       tx,
     );
+  if (enqueueLinks) {
+    const replaceAndQueue = async (tx: DbExecutor) => {
+      // Order this like completion and its acknowledgement: envelope, then
+      // download tokens, then jobs.
+      const current = await queryOne<{ userId: string }>(
+        tx,
+        `
+        SELECT user_id AS "userId" FROM envelopes
+        WHERE id = $1 AND status = $2 FOR NO KEY UPDATE
+      `,
+        [envelope.id, envelope.status],
+      );
+      if (!current) {
+        throw new DownloadAccessError(
+          "This download link is invalid or has expired.",
+          410,
+        );
+      }
+      const { evidenceLink, signedLink } = await replaceLinks(tx);
+      await enqueueLinks({
+        database: tx,
+        envelope: { ...envelope, userId: current.userId },
+        evidenceLink,
+        evidenceUrl: evidenceLink.url,
+        presentedTokenHash,
+        signedLink,
+        signedUrl: signedLink?.url ?? null,
+        signer,
+      });
+    };
+    if (isPool(database)) await withTransaction(replaceAndQueue, database);
+    else await replaceAndQueue(database);
+    return { maskedEmail: maskEmail(signer.email) };
+  }
+
   // The new links are stored in a transaction of their own, which ends
   // before the email is sent: a database connection is not held while the
   // mail provider answers.

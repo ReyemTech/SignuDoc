@@ -1,7 +1,6 @@
-import { rm } from "node:fs/promises";
-
 import pg from "pg";
 
+import { clearFixtureDirectory } from "./support/fixture-directory";
 import { e2eDataDir, e2eDatabaseUrl } from "../playwright.config";
 
 function assertDisposableDatabase(connectionString: string) {
@@ -44,6 +43,7 @@ async function ensureDatabaseExists(connectionString: string) {
 
 export default async function globalSetup() {
   assertDisposableDatabase(e2eDatabaseUrl);
+  await clearFixtureDirectory(e2eDataDir);
   await ensureDatabaseExists(e2eDatabaseUrl);
 
   const client = new pg.Client({ connectionString: e2eDatabaseUrl });
@@ -64,6 +64,4 @@ export default async function globalSetup() {
   const { runMigrations } = await import("../db/migrate.mjs");
 
   await runMigrations({ connectionString: e2eDatabaseUrl });
-
-  await rm(e2eDataDir, { force: true, recursive: true });
 }

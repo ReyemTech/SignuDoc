@@ -2,6 +2,10 @@ function noFailures(errors) {
   return Array.isArray(errors) && errors.length === 0;
 }
 
+function isCount(value) {
+  return Number.isSafeInteger(value) && value >= 0;
+}
+
 function isCompletedSummary(path, summary) {
   if (
     !summary ||
@@ -10,6 +14,24 @@ function isCompletedSummary(path, summary) {
     summary.schedule?.stoppedEarly === true
   ) {
     return false;
+  }
+
+  if (path === "/api/internal/recovery") {
+    const health = summary.health;
+    return (
+      summary.status === "ran" &&
+      summary.enabled === true &&
+      isCount(summary.processed) &&
+      summary.processed <= 20 &&
+      summary.failed === 0 &&
+      summary.budgetExhausted === false &&
+      ["pending", "running", "succeeded", "needs_attention", "cancelled"].every(
+        (state) => isCount(health?.counts?.[state]),
+      ) &&
+      health.counts.needs_attention === 0 &&
+      noFailures(health.attention) &&
+      health.pendingSigningLockAlerts === 0
+    );
   }
 
   if (path === "/api/internal/backup") {

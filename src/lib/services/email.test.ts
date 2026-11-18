@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 
 import type { Resend } from "resend";
 
@@ -129,4 +132,32 @@ test("a batch turned away for rate is sent again too", async () => {
 
   assert.equal(deliveries[0]?.messageId, "email_1");
   assert.equal(requests(), 2);
+});
+
+test("parallel capture sends reuse the same id and reject a changed payload", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "signudoc-capture-"));
+  try {
+    const service = createEmailService({
+      env: { EMAIL_DRIVER: "capture", EMAIL_CAPTURE_DIR: directory },
+      resolveAddresses: async () => ({
+        senderAddress: "sender@example.test",
+        supportAddress: null,
+      }),
+    });
+    const options = { idempotencyKey: "fixture/event" };
+    const [first, second] = await Promise.all([
+      service.send(MESSAGE, options),
+      service.send(MESSAGE, options),
+    ]);
+    assert.equal(first.messageId, second.messageId);
+    assert.equal((await readdir(directory)).length, 1);
+    await assert.rejects(
+      service.send({ ...MESSAGE, textBody: "different" }, options),
+      /idempotency/i,
+    );
+    assert.equal((await service.sendBatch([MESSAGE, MESSAGE])).length, 2);
+    assert.equal((await readdir(directory)).length, 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

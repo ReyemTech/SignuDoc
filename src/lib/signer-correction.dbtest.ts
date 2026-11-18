@@ -1,3 +1,4 @@
+import { runRecoveryJobs } from "./recovery/worker.ts";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -324,9 +325,11 @@ function submitDrawn(
   token: string,
   fieldId: string,
   {
+    database: submissionDatabase = database,
     emailService = recordingEmailService().service,
     storageService = stubStorage(),
   }: {
+    database?: pg.Pool;
     emailService?: EmailService;
     storageService?: StorageService;
   } = {},
@@ -344,7 +347,7 @@ function submitDrawn(
         },
       ],
     },
-    { database, emailService, storageService },
+    { database: submissionDatabase, emailService, storageService },
   );
 }
 
@@ -1637,3 +1640,164 @@ test("the corrected recipient's first view is recorded", async () => {
     [signer.email, "riley.viewer@example.test"],
   );
 });
+
+async function withDurableMail(run: () => Promise<void>) {
+  const keys = {
+    DURABLE_JOBS_ENABLED: "true",
+    BETTER_AUTH_SECRET: "fixture-secret-for-durable-workflow",
+    CRON_SECRET: "test-cron",
+  };
+  const original = Object.fromEntries(
+    Object.keys(keys).map((key) => [key, process.env[key]]),
+  );
+  Object.assign(process.env, keys);
+  try {
+    await run();
+  } finally {
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test("durable next invitation rolls back with the signature and survives provider outage after commit", () =>
+  withDurableMail(async () => {
+    const { userId } = await createOwner();
+    const envelopeId = await createEnvelope({ userId });
+    const first = await createSigner({ envelopeId });
+    const next = await createSigner({
+      envelopeId,
+      signOrder: 2,
+      status: "pending",
+    });
+    const field = await addSignatureField(envelopeId, first.signerId);
+    await consent(first.token!);
+    const fail = recordingEmailService(
+      new Error("local provider unavailable"),
+    ).service;
+    const failingDatabase = afterStatement(
+      database,
+      (sql) => sql.includes("INSERT INTO recovery_jobs"),
+      async () => {
+        assert.equal((await readSigner(first.signerId)).status, "notified");
+        assert.equal((await readSigner(next.signerId)).status, "pending");
+        throw new Error("forced enqueue transaction rollback");
+      },
+    );
+    await assert.rejects(
+      submitDrawn(first.token!, field, {
+        database: failingDatabase,
+        emailService: fail,
+      }),
+      /forced enqueue transaction rollback/,
+    );
+    await getSigningPayloadForToken(first.token!, { database });
+    assert.equal((await readSigner(next.signerId)).status, "pending");
+    assert.equal(
+      (
+        await database.query(
+          "SELECT id FROM recovery_jobs WHERE envelope_id = $1",
+          [envelopeId],
+        )
+      ).rowCount,
+      0,
+    );
+
+    await submitDrawn(first.token!, field, { emailService: fail });
+    assert.equal((await readSigner(first.signerId)).status, "signed");
+    const activeSigner = await readSigner(next.signerId);
+    assert.equal(activeSigner.status, "notified");
+    assert.ok(activeSigner.signing_token_hash);
+    const jobs = await database.query(
+      "SELECT id, state FROM recovery_jobs WHERE envelope_id = $1",
+      [envelopeId],
+    );
+    assert.equal(jobs.rows[0]?.state, "pending");
+    assert.ok(
+      !(await auditEvents(envelopeId)).some((row) => row === "email_sent"),
+    );
+  }));
+
+test("durable corrections keep the committed identity through outage and cancel the earlier invitation", () =>
+  withDurableMail(async () => {
+    const { userId } = await createOwner();
+    const envelopeId = await createEnvelope({ userId });
+    const signer = await createSigner({ envelopeId });
+    const fail = recordingEmailService(
+      new Error("local provider unavailable"),
+    ).service;
+    const input = { email: "updated@example.test" };
+    const failingDatabase = afterStatement(
+      database,
+      (sql) => sql.includes("INSERT INTO recovery_jobs"),
+      async () => {
+        assert.equal((await readSigner(signer.signerId)).email, signer.email);
+        throw new Error("forced enqueue transaction rollback");
+      },
+    );
+    await assert.rejects(
+      correctSentEnvelopeSigner(
+        userId,
+        envelopeId,
+        signer.signerId,
+        input,
+        { senderName: "Sam Sender", senderEmail: "sam@example.test" },
+        { database: failingDatabase, emailService: fail },
+      ),
+      /forced enqueue transaction rollback/,
+    );
+    await getSigningPayloadForToken(signer.token!, { database });
+    assert.equal(
+      (
+        await database.query(
+          "SELECT id FROM recovery_jobs WHERE envelope_id = $1",
+          [envelopeId],
+        )
+      ).rowCount,
+      0,
+    );
+
+    const { invitationSent } = await correct(
+      userId,
+      envelopeId,
+      signer.signerId,
+      input,
+      fail,
+    );
+    assert.equal(invitationSent, false);
+    assert.equal((await readSigner(signer.signerId)).email, input.email);
+    const firstJob = (
+      await database.query(
+        "SELECT id FROM recovery_jobs WHERE envelope_id = $1",
+        [envelopeId],
+      )
+    ).rows[0]?.id;
+    assert.ok(firstJob);
+    const { sent, service } = recordingEmailService();
+    await correct(
+      userId,
+      envelopeId,
+      signer.signerId,
+      { email: "final@example.test" },
+      service,
+    );
+    await database.query(
+      "UPDATE recovery_jobs SET available_at = clock_timestamp() WHERE id = $1",
+      [firstJob],
+    );
+    await runRecoveryJobs({ database, jobId: firstJob, emailService: service });
+    assert.deepEqual(
+      sent.map((message) => message.to),
+      ["final@example.test"],
+    );
+    assert.deepEqual(
+      (
+        await database.query(
+          "SELECT state, payload_ciphertext FROM recovery_jobs WHERE id = $1",
+          [firstJob],
+        )
+      ).rows,
+      [{ state: "cancelled", payload_ciphertext: null }],
+    );
+  }));

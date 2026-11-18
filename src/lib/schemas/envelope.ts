@@ -95,7 +95,8 @@ export const manualNudgeResponseSchema = z.object({
   envelopeId: idSchema,
   nextAvailableAt: unixTimestampSchema,
   nextAvailableAtLabel: z.string().trim().min(1),
-  sentAt: unixTimestampSchema,
+  sentAt: unixTimestampSchema.nullable(),
+  requestedAt: unixTimestampSchema.optional(),
   signerId: idSchema,
   signerName: z.string().trim().min(1).max(160),
 });
@@ -137,6 +138,7 @@ export const signatureLevelSchema = z.enum(["simple", "advanced", "qualified"]);
 export type EnvelopeSignatureLevel = z.infer<typeof signatureLevelSchema>;
 
 export const envelopeRecordSchema = z.object({
+  finalizationPending: z.boolean().optional(),
   id: idSchema,
   userId: idSchema,
   title: envelopeTitleSchema,

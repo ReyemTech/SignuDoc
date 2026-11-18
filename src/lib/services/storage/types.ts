@@ -48,6 +48,8 @@ export interface StorageService {
      * there.
      */
     keepExisting?: boolean;
+    /** Cancels this write, including any retry, at the caller's deadline. */
+    signal?: AbortSignal;
   }): Promise<StorageObjectRef>;
 }
 

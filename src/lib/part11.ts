@@ -1,3 +1,9 @@
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import {
+  buildSigningLockAlert,
+  tryReconcileSigningLockAlert,
+} from "./recovery/signing-lock-alerts.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbExecutor,
   type DbPool,
@@ -348,6 +354,7 @@ export async function checkSigningCredentials(
     verifyPassword?: PasswordVerifier;
   } = {},
 ): Promise<SigningPasswordResult> {
+  const durable = isDurableJobsEnabled();
   const outcome = await withTransaction(async (tx) => {
     const account = await queryOne<{
       email: string;
@@ -431,14 +438,17 @@ export async function checkSigningCredentials(
       `,
       [failedAttempts, locked ? now : null, input.userId],
     );
-    await recordSystemAuditEvent(
+    const event = await recordSystemAuditEvent(
       {
         actorEmail: account.email,
         actorUserId: input.userId,
         createdAt: now,
         event: locked ? "signing_locked" : "reauthentication_failed",
         ipAddress: input.ipAddress ?? null,
-        metadata: { failedAttempts },
+        metadata: {
+          failedAttempts,
+          ...(durable && locked ? { durableAlert: true } : {}),
+        },
         targetUserId: input.userId,
         userAgent: input.userAgent ?? null,
       },
@@ -447,13 +457,22 @@ export async function checkSigningCredentials(
 
     return {
       account,
+      lockAuditId: durable && locked ? event.id : undefined,
       attemptsLeft: Math.max(0, MAX_SIGNING_PASSWORD_ATTEMPTS - failedAttempts),
       locked,
       ok: false as const,
     };
   }, database);
 
-  if (
+  if (durable) {
+    if ("lockAuditId" in outcome && outcome.lockAuditId) {
+      const jobs = await tryReconcileSigningLockAlert(
+        outcome.lockAuditId,
+        database,
+      );
+      await tryDeliverWorkflowEmails(jobs, { database, emailService });
+    }
+  } else if (
     !outcome.ok &&
     "account" in outcome &&
     outcome.account &&
@@ -497,22 +516,17 @@ async function alertAdministrators(
       .then((branding) => branding.productName)
       .catch(() => SIGNUDOC_NAME);
     const service = emailService ?? createEmailService();
-    const textBody = [
-      `${person.name} <${person.email}> gave the wrong password ${MAX_SIGNING_PASSWORD_ATTEMPTS} times in a row while signing on ${productName}.`,
-      "",
-      "Their account can no longer sign until an administrator unlocks it under Settings, People.",
-      "If this was not them, someone may be trying to sign in their name. Check with them before unlocking.",
-    ].join("\n");
-
     // One failed delivery must not keep the alert from the others.
     for (const admin of admins) {
       try {
-        await service.send({
-          subject: `Signing locked for ${person.name}`,
-          template: "signing_lock_alert",
-          textBody,
-          to: admin.email,
-        });
+        await service.send(
+          buildSigningLockAlert(
+            person,
+            productName,
+            admin.email,
+            MAX_SIGNING_PASSWORD_ATTEMPTS,
+          ),
+        );
       } catch (error) {
         console.error("Failed to send a signing lock alert:", error);
       }

@@ -203,15 +203,17 @@ export function EnvelopeDetailShell({
     timeline: record.timeline,
     title: record.title,
   };
-  const deadline = activeRecord.status === "sent" ? record.deadline : null;
+  const awaitingSignatures =
+    activeRecord.status === "sent" && !record.finalizationPending;
+  const deadline = awaitingSignatures ? record.deadline : null;
   const isExpired = Boolean(deadline?.expired);
   const manualReminderState = record.manualReminder ?? null;
   const reminderLimited =
-    activeRecord.status === "sent" &&
+    awaitingSignatures &&
     manualReminderState !== null &&
     !manualReminderState.canSend;
   const reminderHelperText =
-    activeRecord.status === "sent" && manualReminderState?.nextAvailableAtLabel
+    awaitingSignatures && manualReminderState?.nextAvailableAtLabel
       ? `You can send another reminder after ${manualReminderState.nextAvailableAtLabel}.`
       : null;
   const deadlineText = !deadline
@@ -226,10 +228,9 @@ export function EnvelopeDetailShell({
     reminderIntervalDays === null
       ? "Automatic reminders are off."
       : `Automatic reminders: ${formatReminderInterval(reminderIntervalDays).toLowerCase()}.`;
-  const activeSigner =
-    activeRecord.status === "sent"
-      ? activeRecord.signers.find((signer) => signer.status === "waiting")
-      : null;
+  const activeSigner = awaitingSignatures
+    ? activeRecord.signers.find((signer) => signer.status === "waiting")
+    : null;
 
   function handleDownload(fileType: DownloadFileType) {
     // This starts a file download from an API route, not a page navigation.
@@ -520,7 +521,11 @@ export function EnvelopeDetailShell({
                       : statusPillClasses[activeRecord.status]
                   }`}
                 >
-                  {isExpired ? "Expired" : statusLabelMap[activeRecord.status]}
+                  {record.finalizationPending
+                    ? "Preparing final documents"
+                    : isExpired
+                      ? "Expired"
+                      : statusLabelMap[activeRecord.status]}
                 </span>
                 <p className="text-sm text-(--secondary)">
                   Created {activeRecord.createdAtLabel}
@@ -549,7 +554,7 @@ export function EnvelopeDetailShell({
               </>
             ) : null}
 
-            {activeRecord.status === "sent" ? (
+            {awaitingSignatures ? (
               <>
                 <ShellButton
                   onClick={() => setActiveModal("void-envelope")}
@@ -796,7 +801,7 @@ export function EnvelopeDetailShell({
                               {signer.statusDateLabel}
                             </p>
                           ) : null}
-                          {activeRecord.status === "sent" &&
+                          {awaitingSignatures &&
                           !record.part11 &&
                           (signer.status === "waiting" ||
                             signer.status === "pending") ? (

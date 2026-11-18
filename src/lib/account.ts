@@ -1,3 +1,7 @@
+import { emailSubject } from "./services/email-subject.ts";
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   accountClosureConfirmationPhrase,
   accountClosureRequestSchema,
@@ -9,6 +13,8 @@ import {
 } from "./schemas/auth.ts";
 import {
   type DbExecutor,
+  type DbPool,
+  withTransaction,
   getDb,
   queryMany,
   queryOne,
@@ -16,10 +22,16 @@ import {
 import {
   ACCOUNT_CLOSURE_EXPORT_WINDOW_DAYS,
   scheduleAccountClosure,
+  type ScheduledAccountClosure,
 } from "./retention.ts";
 import { resolvePublicSupportAddress } from "./public-contact.ts";
-import { createEmailService } from "./services/email.ts";
+import {
+  createEmailService,
+  resolveEmailAddresses,
+  type EmailService,
+} from "./services/email.ts";
 import { recordSystemAuditEvent } from "./services/system-audit.ts";
+import { ServiceConfigurationError } from "./services/service-config.ts";
 import { getBranding } from "./settings.ts";
 import { type EnvSource } from "./utils/env.ts";
 
@@ -37,6 +49,7 @@ type EnvelopeCountRow = {
 type RequestAccountClosureOptions = {
   database?: DbExecutor;
   env?: EnvSource;
+  emailService?: EmailService;
 };
 
 type AccountClosureRequestResult = {
@@ -217,75 +230,161 @@ async function formatEnvelopeCounts(
   );
 }
 
-
 function formatRetentionDeadline(timestamp: number): string {
   return new Date(timestamp * 1000).toISOString().replace(".000Z", " UTC");
+}
+
+async function buildAccountClosureEmail(
+  account: SenderAccountRow,
+  closureSchedule: ScheduledAccountClosure,
+  supportAddress: string,
+  productName: string,
+  database: DbExecutor,
+) {
+  const userId = account.id;
+  const submittedAt = formatRetentionDeadline(closureSchedule.requestedAt);
+  const exportExpiresAt = formatRetentionDeadline(
+    closureSchedule.exportExpiresAt,
+  );
+  const purgeAfterAt = formatRetentionDeadline(closureSchedule.purgeAfterAt);
+  return {
+    replyTo: account.email,
+    subject: emailSubject`Account closure request — ${account.name}`,
+    template: "account_closure_request",
+    textBody: [
+      `A sender requested account closure from the ${productName} settings page.`,
+      "",
+      `Sender: ${account.name} <${account.email}>`,
+      `User ID: ${userId}`,
+      `Submitted at: ${submittedAt}`,
+      `Export window: ${ACCOUNT_CLOSURE_EXPORT_WINDOW_DAYS} days`,
+      `Export window ends: ${exportExpiresAt}`,
+      `Automatic purge eligible at: ${purgeAfterAt}`,
+      "",
+      "Envelope counts:",
+      ...(await formatEnvelopeCounts(userId, database)),
+      "",
+      "This request came through the guarded in-app danger-zone flow.",
+    ].join("\n"),
+    to: supportAddress,
+  } as const;
+}
+
+function accountClosureAudit(
+  account: SenderAccountRow,
+  closureSchedule: ScheduledAccountClosure,
+  database: DbExecutor,
+) {
+  return recordSystemAuditEvent(
+    {
+      actorEmail: account.email,
+      actorUserId: account.id,
+      event: "account_closure_requested",
+      metadata: { purgeAfterAt: closureSchedule.purgeAfterAt },
+      targetUserId: account.id,
+    },
+    database,
+  );
+}
+
+function accountClosureResponse(
+  closureSchedule: ScheduledAccountClosure,
+): AccountClosureRequestResult {
+  return {
+    alreadyQueued: closureSchedule.alreadyQueued,
+    exportExpiresAt: closureSchedule.exportExpiresAt,
+    purgeAfterAt: closureSchedule.purgeAfterAt,
+    submittedAt: closureSchedule.requestedAt,
+  };
 }
 
 export async function requestAccountClosure(
   userId: string,
   input: unknown,
-  { database = getDb(), env = process.env }: RequestAccountClosureOptions = {},
+  {
+    database = getDb(),
+    env = process.env,
+    emailService,
+  }: RequestAccountClosureOptions = {},
 ): Promise<AccountClosureRequestResult> {
   buildClosureValidationError(input);
 
-  const account = await getSenderAccountRow(userId, database);
+  if (isDurableJobsEnabled(env)) {
+    const close = async (tx: DbExecutor) => {
+      const account = await queryOne<SenderAccountRow>(
+        tx,
+        'SELECT id, email, name FROM "user" WHERE id = $1 FOR NO KEY UPDATE',
+        [userId],
+      );
+      if (!account) throw new AccountMutationError("Account not found.", 404);
+      const closureSchedule = await scheduleAccountClosure(userId, tx);
+      if (closureSchedule.alreadyQueued) return { closureSchedule };
+      await accountClosureAudit(account, closureSchedule, tx);
 
+      const addresses = await resolveEmailAddresses(env, tx);
+      if (!addresses.supportAddress) {
+        throw new ServiceConfigurationError("email", ["SUPPORT_EMAIL"]);
+      }
+      const { productName } = await getBranding(env, tx);
+      const { id } = await enqueueEmail(
+        {
+          message: await buildAccountClosureEmail(
+            account,
+            closureSchedule,
+            addresses.supportAddress,
+            productName,
+            tx,
+          ),
+          dedupeKey: `account-closure/${userId}/${closureSchedule.requestedAt}`,
+          userId,
+          expiresAt: closureSchedule.purgeAfterAt,
+        },
+        { database: tx, env, addresses },
+      );
+      return { closureSchedule, jobId: id };
+    };
+    if ("connect" in database && "totalCount" in database) {
+      const pool = database as DbPool;
+      const { closureSchedule, jobId } = await withTransaction(close, pool);
+      if (jobId)
+        await tryDeliverWorkflowEmails([jobId], {
+          database: pool,
+          emailService,
+          env,
+        });
+      return accountClosureResponse(closureSchedule);
+    }
+    return accountClosureResponse((await close(database)).closureSchedule);
+  }
+
+  const account = await getSenderAccountRow(userId, database);
   if (!account) {
     throw new AccountMutationError("Account not found.", 404);
   }
 
   const closureSchedule = await scheduleAccountClosure(userId, database);
-
   if (!closureSchedule.alreadyQueued) {
-    await recordSystemAuditEvent(
-      {
-        actorEmail: account.email,
-        actorUserId: userId,
-        event: "account_closure_requested",
-        metadata: { purgeAfterAt: closureSchedule.purgeAfterAt },
-        targetUserId: userId,
+    await accountClosureAudit(account, closureSchedule, database).catch(
+      (error: unknown) => {
+        console.error(
+          `Failed to record the account closure request for user ${userId}:`,
+          error,
+        );
       },
-      database,
-    ).catch((error: unknown) => {
-      console.error(
-        `Failed to record the account closure request for user ${userId}:`,
-        error,
-      );
-    });
-
-    const submittedAt = formatRetentionDeadline(closureSchedule.requestedAt);
-    const exportExpiresAt = formatRetentionDeadline(
-      closureSchedule.exportExpiresAt,
     );
-    const purgeAfterAt = formatRetentionDeadline(closureSchedule.purgeAfterAt);
-
     try {
-      const emailService = createEmailService({ env });
+      const service = emailService ?? createEmailService({ env });
       const supportAddress = await resolvePublicSupportAddress(env);
       const { productName } = await getBranding(env);
-
-      await emailService.send({
-        replyTo: account.email,
-        subject: `Account closure request — ${account.name}`,
-        template: "account_closure_request",
-        textBody: [
-          `A sender requested account closure from the ${productName} settings page.`,
-          "",
-          `Sender: ${account.name} <${account.email}>`,
-          `User ID: ${userId}`,
-          `Submitted at: ${submittedAt}`,
-          `Export window: ${ACCOUNT_CLOSURE_EXPORT_WINDOW_DAYS} days`,
-          `Export window ends: ${exportExpiresAt}`,
-          `Automatic purge eligible at: ${purgeAfterAt}`,
-          "",
-          "Envelope counts:",
-          ...(await formatEnvelopeCounts(userId, database)),
-          "",
-          "This request came through the guarded in-app danger-zone flow.",
-        ].join("\n"),
-        to: supportAddress,
-      });
+      await service.send(
+        await buildAccountClosureEmail(
+          account,
+          closureSchedule,
+          supportAddress,
+          productName,
+          database,
+        ),
+      );
     } catch (error) {
       console.error(
         `Failed to send account closure email for user ${userId}:`,
@@ -293,11 +392,5 @@ export async function requestAccountClosure(
       );
     }
   }
-
-  return {
-    alreadyQueued: closureSchedule.alreadyQueued,
-    exportExpiresAt: closureSchedule.exportExpiresAt,
-    purgeAfterAt: closureSchedule.purgeAfterAt,
-    submittedAt: closureSchedule.requestedAt,
-  };
+  return accountClosureResponse(closureSchedule);
 }

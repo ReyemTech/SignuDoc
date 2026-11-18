@@ -1,6 +1,14 @@
+import { emailSubject } from "./services/email-subject.ts";
+import { PDFDocument } from "pdf-lib";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueRecoveryJob } from "./recovery/jobs.ts";
+import { finalizationPayload } from "./recovery/finalization-payload.ts";
+import { sha256Hex } from "./services/pdf-seal.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
 import { removeUnclaimedEnvelopeCertificates } from "./certificate-cleanup.ts";
 import {
@@ -59,8 +67,10 @@ import {
 import {
   createEmailService,
   fitsAsAttachments,
+  resolveEmailAddresses,
   type EmailAttachment,
   type EmailService,
+  type TransactionalEmailMessage,
 } from "./services/email.ts";
 import { withUserEmailLegalFooter } from "./services/email-legal-footer.ts";
 import { hashOpaqueToken } from "./services/opaque-tokens.ts";
@@ -90,7 +100,7 @@ import {
   RECIPIENT_DOWNLOAD_LINK_TTL_SECONDS,
   type FieldType,
 } from "./types/domain.ts";
-import { getEnv } from "./utils/env.ts";
+import { getEnv, type EnvSource } from "./utils/env.ts";
 import { escapeHtml } from "./utils/html.ts";
 import {
   isEnvelopeExpired,
@@ -338,8 +348,8 @@ function normalizeSenderName(sender: SenderRow): string {
   return sender.name?.trim() ? sender.name : sender.email;
 }
 
-function getEnvelopeUrl(envelopeId: string): string {
-  const appUrl = requireConfigValue("app", "APP_URL", getEnv().appUrl);
+function getEnvelopeUrl(envelopeId: string, env?: EnvSource): string {
+  const appUrl = requireConfigValue("app", "APP_URL", getEnv(env).appUrl);
 
   return new URL(`/envelopes/${envelopeId}`, appUrl).toString();
 }
@@ -350,12 +360,13 @@ const RECIPIENT_DOWNLOAD_LINK_TTL_DAYS =
 function buildCompletionSenderEmail(input: {
   branding: Branding;
   envelopeId: string;
+  env?: EnvSource;
   envelopeTitle: string;
   senderEmail: string;
   senderName: string;
 }) {
-  const completedUrl = getEnvelopeUrl(input.envelopeId);
-  const subject = `"${input.envelopeTitle}" is fully signed`;
+  const completedUrl = getEnvelopeUrl(input.envelopeId, input.env);
+  const subject = emailSubject`"${input.envelopeTitle}" is fully signed`;
   const textBody = [
     `Hi ${input.senderName},`,
     "",
@@ -399,7 +410,7 @@ function buildDeclineNotificationEmail(input: {
   signerName: string;
 }) {
   const envelopeUrl = getEnvelopeUrl(input.envelopeId);
-  const subject = `"${input.envelopeTitle}" was declined by ${input.signerName}`;
+  const subject = emailSubject`"${input.envelopeTitle}" was declined by ${input.signerName}`;
   const reasonLine = input.declineReason?.trim()
     ? `Reason provided: ${input.declineReason.trim()}`
     : null;
@@ -450,7 +461,7 @@ function buildCompletionSignerEmail(input: {
   signerName: string;
   signedDownloadUrl: string;
 }) {
-  const subject = `"${input.envelopeTitle}" is fully signed`;
+  const subject = emailSubject`"${input.envelopeTitle}" is fully signed`;
   const textBody = [
     `Hi ${input.signerName},`,
     "",
@@ -749,23 +760,25 @@ async function getSenderRow(
 async function lockSentEnvelope(
   envelopeId: string,
   tx: DbExecutor,
-): Promise<void> {
-  const locked = await tx.query(
+): Promise<{ userId: string }> {
+  const locked = await queryOne<{ userId: string }>(
+    tx,
     `
-      SELECT id FROM envelopes
+      SELECT user_id AS "userId" FROM envelopes
       WHERE id = $1 AND status = 'sent'
       FOR NO KEY UPDATE
     `,
     [envelopeId],
   );
 
-  if (locked.rowCount !== 1) {
+  if (!locked) {
     // Voided, declined or deleted since the page was opened.
     throw new SigningMutationError(
       "This signing link is no longer active.",
       409,
     );
   }
+  return locked;
 }
 
 /**
@@ -1124,23 +1137,24 @@ function applyCurrentSignerDecline(
   });
 }
 
-async function sendCompletionEmails(input: {
+type CompletionEmailInput = {
   attachments: {
     recipientCertificate: Uint8Array;
     signedPdf: Uint8Array;
   };
   copyRecipients: readonly CopyRecipientRecord[];
   database?: DbExecutor;
-  emailService: EmailService;
   envelopeId: string;
   envelopeTitle: string;
   sender: SenderRow;
   signers: Array<ReturnType<typeof signerRecordSchema.parse>>;
-}) {
+};
+
+function completionAttachments(input: CompletionEmailInput): EmailAttachment[] {
   const fileNameStem =
     sanitizeFileNameSegment(input.envelopeTitle) ||
     `envelope-${input.envelopeId}`;
-  const attachments: EmailAttachment[] = [
+  const attachments = [
     {
       content: input.attachments.signedPdf,
       contentType: "application/pdf",
@@ -1152,83 +1166,174 @@ async function sendCompletionEmails(input: {
       filename: `${fileNameStem} - certificate.pdf`,
     },
   ];
-  const attach = fitsAsAttachments(attachments);
-  const senderName = normalizeSenderName(input.sender);
-  const issuedAt = Math.floor(Date.now() / 1000);
-  const branding = await getBranding();
-  // Signers first, then the people who only get a copy: the place in this
-  // list is part of each message's idempotency key.
-  const recipients = [
+  return fitsAsAttachments(attachments) ? attachments : [];
+}
+
+function completionRecipients(input: CompletionEmailInput) {
+  return [
     ...input.signers.map((signer) => ({ ...signer, copyOnly: false })),
     ...input.copyRecipients.map((recipient) => ({
       ...recipient,
       copyOnly: true,
     })),
   ];
+}
+
+async function prepareRecipientCompletionEmail(
+  input: CompletionEmailInput,
+  signer: ReturnType<typeof completionRecipients>[number],
+  {
+    attachments,
+    branding,
+    issuedAt,
+    env,
+  }: {
+    attachments: EmailAttachment[];
+    branding: Branding;
+    issuedAt: number;
+    env?: EnvSource;
+  },
+) {
+  if (!signer.id) {
+    throw new SigningMutationError(
+      "Completed signer records must include an id.",
+      500,
+    );
+  }
+
+  // Recipient certificate downloads resolve to the redacted certificate PDF.
+  const options = { database: input.database, env };
+  const ids = { envelopeId: input.envelopeId, signerId: signer.id, issuedAt };
+  const signedLink = await createRecipientDownloadLink(
+    { ...ids, fileType: "signed" },
+    options,
+  );
+  const evidenceLink = await createRecipientDownloadLink(
+    { ...ids, fileType: "evidence" },
+    options,
+  );
+  return {
+    message: {
+      ...buildCompletionSignerEmail({
+        attached: attachments.length > 0,
+        branding,
+        copyOnly: signer.copyOnly,
+        envelopeId: input.envelopeId,
+        envelopeTitle: input.envelopeTitle,
+        evidenceDownloadUrl: evidenceLink.url,
+        senderName: normalizeSenderName(input.sender),
+        signedDownloadUrl: signedLink.url,
+        signerEmail: signer.email,
+        signerName: signer.name,
+      }),
+      ...(attachments.length ? { attachments } : {}),
+    },
+    signerId: signer.id,
+    tokenHashes: [signedLink.tokenHash, evidenceLink.tokenHash],
+    expiresAt: Math.min(signedLink.exp, evidenceLink.exp),
+  };
+}
+
+function completionSenderEmail(
+  input: CompletionEmailInput,
+  branding: Branding,
+  env?: EnvSource,
+) {
+  return buildCompletionSenderEmail({
+    branding,
+    envelopeId: input.envelopeId,
+    env,
+    envelopeTitle: input.envelopeTitle,
+    senderEmail: input.sender.email,
+    senderName: normalizeSenderName(input.sender),
+  });
+}
+
+/** Stores completion links and messages in the caller's publication transaction. */
+export async function enqueueCompletionEmails(
+  input: CompletionEmailInput & { database: DbExecutor; env?: EnvSource },
+): Promise<string[]> {
+  const { database, envelopeId, env } = input;
+  const owner = await queryOne<SenderRow & { userId: string }>(
+    database,
+    'SELECT e.user_id AS "userId", u.email, u.name FROM envelopes e JOIN "user" u ON u.id = e.user_id WHERE e.id = $1',
+    [envelopeId],
+  );
+  if (!owner)
+    throw new SigningMutationError(
+      "The completed envelope is unavailable.",
+      409,
+    );
+  const branding = await getBranding(env, database);
+  const attachments = completionAttachments(input);
+  const issuedAt = Math.floor(Date.now() / 1000);
+  const options = {
+    database,
+    env,
+    addresses: await resolveEmailAddresses(env, database),
+  };
+  const senderJob = await enqueueEmail(
+    {
+      message: completionSenderEmail(
+        { ...input, sender: owner },
+        branding,
+        env,
+      ),
+      dedupeKey: `completion/${envelopeId}/sender`,
+      envelopeId,
+      userId: owner.userId,
+      guard: { kind: "envelope_status", allowedStatuses: ["completed"] },
+      acknowledgement: { kind: "email_audit" },
+    },
+    options,
+  );
+  const jobs = [senderJob.id];
+
+  for (const recipient of completionRecipients(input)) {
+    const { message, signerId, tokenHashes, expiresAt } =
+      await prepareRecipientCompletionEmail(input, recipient, {
+        attachments,
+        branding,
+        issuedAt,
+        env,
+      });
+    const { id } = await enqueueEmail(
+      {
+        message,
+        dedupeKey: `completion/${envelopeId}/${recipient.copyOnly ? "copy" : "signer"}/${signerId}`,
+        envelopeId,
+        userId: owner.userId,
+        expiresAt,
+        guard: { kind: "recipient_download_tokens", signerId, tokenHashes },
+        acknowledgement: { kind: "email_audit", signerId },
+      },
+      options,
+    );
+    jobs.push(id);
+  }
+  return jobs;
+}
+
+async function sendCompletionEmails(
+  input: CompletionEmailInput & {
+    emailService: EmailService;
+  },
+) {
+  const attachments = completionAttachments(input);
+  const branding = await getBranding();
+  const issuedAt = Math.floor(Date.now() / 1000);
   const signerMessages = await Promise.all(
-    recipients.map(async (signer) => {
-      if (!signer.id) {
-        throw new SigningMutationError(
-          "Completed signer records must include an id.",
-          500,
-        );
-      }
-
-      const [signedLink, redactedEvidenceLink] = await Promise.all([
-        createRecipientDownloadLink(
-          {
-            envelopeId: input.envelopeId,
-            fileType: "signed",
-            issuedAt,
-            signerId: signer.id,
-          },
-          {
-            database: input.database,
-          },
-        ),
-        // Recipient certificate downloads resolve to the redacted certificate PDF.
-        createRecipientDownloadLink(
-          {
-            envelopeId: input.envelopeId,
-            fileType: "evidence",
-            issuedAt,
-            signerId: signer.id,
-          },
-          {
-            database: input.database,
-          },
-        ),
-      ]);
-
-      return {
-        message: {
-          ...buildCompletionSignerEmail({
-            attached: attach,
-            branding,
-            copyOnly: signer.copyOnly,
-            envelopeId: input.envelopeId,
-            envelopeTitle: input.envelopeTitle,
-            evidenceDownloadUrl: redactedEvidenceLink.url,
-            senderName,
-            signedDownloadUrl: signedLink.url,
-            signerEmail: signer.email,
-            signerName: signer.name,
-          }),
-          ...(attach ? { attachments } : {}),
-        },
-        signerId: signer.id,
-      };
-    }),
+    completionRecipients(input).map((signer) =>
+      prepareRecipientCompletionEmail(input, signer, {
+        attachments,
+        branding,
+        issuedAt,
+      }),
+    ),
   );
   const messages = [
     {
-      message: buildCompletionSenderEmail({
-        branding,
-        envelopeId: input.envelopeId,
-        envelopeTitle: input.envelopeTitle,
-        senderEmail: input.sender.email,
-        senderName,
-      }),
+      message: completionSenderEmail(input, branding),
       signerId: null,
     },
     ...signerMessages,
@@ -1326,9 +1431,12 @@ export async function sendSignerEmailCode(
   token: string,
   {
     database = getDb(),
-    emailService = createEmailService(),
+    emailService: givenEmailService,
   }: { database?: DbPool; emailService?: EmailService } = {},
 ): Promise<{ emailCodeSentAt: number; maskedEmail: string }> {
+  const durable = isDurableJobsEnabled();
+  const emailService =
+    givenEmailService ?? (durable ? undefined : createEmailService());
   const context = await resolveSigningContext(token, { database });
   const state = await getSignerCheckState(context.signer.id!, database);
   const now = Math.floor(Date.now() / 1000);
@@ -1353,8 +1461,9 @@ export async function sendSignerEmailCode(
   // Claim the resend window and save the code in one statement, so two
   // tabs cannot both send, leaving one emailed code already replaced.
   const presentedTokenHash = hashOpaqueToken(token);
-  const claimed = await database.query(
-    `
+  const claim = (tx: DbExecutor) =>
+    tx.query(
+      `
       UPDATE signers
       SET
         email_code_hash = $1,
@@ -1369,15 +1478,71 @@ export async function sendSignerEmailCode(
           OR email_code_sent_at <= $5
         )
     `,
-    [
-      issued.hash,
-      now + EMAIL_CODE_TTL_SECONDS,
-      now,
-      context.signer.id,
-      now - EMAIL_CODE_RESEND_SECONDS,
-      presentedTokenHash,
-    ],
-  );
+      [
+        issued.hash,
+        now + EMAIL_CODE_TTL_SECONDS,
+        now,
+        context.signer.id,
+        now - EMAIL_CODE_RESEND_SECONDS,
+        presentedTokenHash,
+      ],
+    );
+
+  const minutes = Math.round(EMAIL_CODE_TTL_SECONDS / 60);
+  const textBody = [
+    `Hi ${context.signer.name},`,
+    "",
+    `Your code to open "${context.envelope.title}" in ${branding.productName} is:`,
+    "",
+    issued.code,
+    "",
+    `It works for ${String(minutes)} minutes. If you did not just open a signing link, ignore this email.`,
+  ].join("\n");
+  const htmlBody = [
+    `<p>Hi ${escapeHtml(context.signer.name)},</p>`,
+    `<p>Your code to open &ldquo;${escapeHtml(context.envelope.title)}&rdquo; in ${escapeHtml(branding.productName)} is:</p>`,
+    `<p style="font-size:24px;font-weight:700;letter-spacing:4px">${issued.code}</p>`,
+    `<p>It works for ${String(minutes)} minutes. If you did not just open a signing link, ignore this email.</p>`,
+  ].join("");
+  const body = withUserEmailLegalFooter({ htmlBody, textBody }, branding);
+  const message: TransactionalEmailMessage = {
+    htmlBody: body.htmlBody,
+    subject: emailSubject`Your code for "${context.envelope.title}"`,
+    template: "signing_code",
+    textBody: body.textBody,
+    to: context.signer.email,
+  };
+
+  let jobId: string | undefined;
+  const claimed = durable
+    ? await withTransaction(async (tx) => {
+        const owner = await lockSentEnvelope(context.envelope.id, tx);
+        const result = await claim(tx);
+        if (result.rowCount === 1) {
+          ({ id: jobId } = await enqueueEmail(
+            {
+              message,
+              dedupeKey: `signing-code/${context.envelope.id}/${context.signer.id}/${now}/${issued.hash}`,
+              envelopeId: context.envelope.id,
+              userId: owner.userId,
+              expiresAt: now + EMAIL_CODE_TTL_SECONDS + 1,
+              guard: {
+                kind: "signing_code",
+                signerId: context.signer.id!,
+                tokenHash: presentedTokenHash,
+                codeHash: issued.hash,
+              },
+              acknowledgement: {
+                kind: "email_audit",
+                signerId: context.signer.id,
+              },
+            },
+            { database: tx },
+          ));
+        }
+        return result;
+      }, database)
+    : await claim(database);
 
   if (claimed.rowCount !== 1) {
     const stillThisLink = await queryOne<{ id: string }>(
@@ -1405,37 +1570,17 @@ export async function sendSignerEmailCode(
     };
   }
 
-  const minutes = Math.round(EMAIL_CODE_TTL_SECONDS / 60);
-  const textBody = [
-    `Hi ${context.signer.name},`,
-    "",
-    `Your code to open "${context.envelope.title}" in ${branding.productName} is:`,
-    "",
-    issued.code,
-    "",
-    `It works for ${String(minutes)} minutes. If you did not just open a signing link, ignore this email.`,
-  ].join("\n");
-  const htmlBody = [
-    `<p>Hi ${escapeHtml(context.signer.name)},</p>`,
-    `<p>Your code to open &ldquo;${escapeHtml(context.envelope.title)}&rdquo; in ${escapeHtml(branding.productName)} is:</p>`,
-    `<p style="font-size:24px;font-weight:700;letter-spacing:4px">${issued.code}</p>`,
-    `<p>It works for ${String(minutes)} minutes. If you did not just open a signing link, ignore this email.</p>`,
-  ].join("");
-  const body = withUserEmailLegalFooter({ htmlBody, textBody }, branding);
-  let delivery: Awaited<ReturnType<EmailService["send"]>>;
+  if (jobId) {
+    await tryDeliverWorkflowEmails([jobId], { database, emailService });
+  } else {
+    let delivery: Awaited<ReturnType<EmailService["send"]>>;
 
-  try {
-    delivery = await emailService.send({
-      htmlBody: body.htmlBody,
-      subject: `Your code for "${context.envelope.title}"`,
-      template: "signing_code",
-      textBody: body.textBody,
-      to: context.signer.email,
-    });
-  } catch (error) {
-    // Not sent, so the signer may ask again at once.
-    await database.query(
-      `
+    try {
+      delivery = await emailService!.send(message);
+    } catch (error) {
+      // Not sent, so the signer may ask again at once.
+      await database.query(
+        `
         UPDATE signers
         SET
           email_code_hash = NULL,
@@ -1444,21 +1589,22 @@ export async function sendSignerEmailCode(
           email_code_attempts = 0
         WHERE id = $1 AND email_code_hash = $2
       `,
-      [context.signer.id, issued.hash],
-    );
-    throw error;
-  }
+        [context.signer.id, issued.hash],
+      );
+      throw error;
+    }
 
-  await recordEmailSent(
-    {
-      envelopeId: context.envelope.id,
-      messageId: delivery.messageId,
-      recipient: context.signer.email,
-      signerId: context.signer.id,
-      template: "signing_code",
-    },
-    database,
-  );
+    await recordEmailSent(
+      {
+        envelopeId: context.envelope.id,
+        messageId: delivery.messageId,
+        recipient: context.signer.email,
+        signerId: context.signer.id,
+        template: "signing_code",
+      },
+      database,
+    );
+  }
 
   return {
     emailCodeSentAt: now,
@@ -1939,7 +2085,7 @@ async function reauthenticatePart11Signer(
     verifyPassword,
   }: {
     database: DbPool;
-    emailService: EmailService;
+    emailService?: EmailService;
     requestMeta: SigningRequestMeta;
     verifyPassword?: PasswordVerifier;
   },
@@ -2361,7 +2507,10 @@ export async function submitSigningForToken(
     );
   }
 
-  const emailService = givenEmailService ?? createEmailService();
+  const durable = isDurableJobsEnabled();
+  const emailService =
+    givenEmailService ?? (durable ? undefined : createEmailService());
+  const emailJobs: string[] = [];
   const part11Signature = await reauthenticatePart11Signer(
     context,
     signerChecks.state,
@@ -2383,6 +2532,74 @@ export async function submitSigningForToken(
     fieldUpdates,
   } = buildSignerSubmission(context, parsedInput, submittedAt);
   const presentedTokenHash = hashOpaqueToken(token);
+
+  async function persistSignerFieldsAndAcceptance(tx: DbExecutor) {
+    for (const update of fieldUpdates.values()) {
+      const result = await tx.query(
+        `
+          UPDATE fields
+          SET
+            input_method = $1,
+            value = $2,
+            image_key = $3,
+            checked = $4,
+            submitted_at = $5,
+            updated_at = $6
+          WHERE id = $7
+            AND envelope_id = $8
+            AND signer_id = $9
+          `,
+        [
+          update.inputMethod,
+          update.value,
+          update.imageKey,
+          update.checked,
+          update.submittedAt,
+          submittedAt,
+          update.fieldId,
+          context.envelope.id,
+          currentSignerId,
+        ],
+      );
+
+      if (result.rowCount !== 1) {
+        throw new SigningMutationError(
+          "Unable to save one or more field values.",
+          500,
+        );
+      }
+    }
+
+    const signedSignerResult = await tx.query(
+      `
+        UPDATE signers
+        SET
+          status = 'signed',
+          signing_token_hash = NULL,
+          signing_token_expires_at = NULL,
+          signed_at = $1,
+          updated_at = $2
+        WHERE id = $3
+          AND envelope_id = $4
+          AND status = 'notified'
+          AND signing_token_hash = $5
+        `,
+      [
+        submittedAt,
+        submittedAt,
+        currentSignerId,
+        context.envelope.id,
+        presentedTokenHash,
+      ],
+    );
+
+    if (signedSignerResult.rowCount !== 1) {
+      throw new SigningMutationError(
+        "This signing link is no longer active.",
+        409,
+      );
+    }
+  }
 
   let signingStatePersisted = false;
 
@@ -2456,6 +2673,9 @@ export async function submitSigningForToken(
     });
 
     if (nextSigner && nextSignerLink) {
+      const durableBranding = durable
+        ? await getBranding(undefined, database)
+        : null;
       if (!nextSignerId) {
         throw new SigningMutationError(
           "Envelope routing is out of sync for the next signer.",
@@ -2470,14 +2690,17 @@ export async function submitSigningForToken(
       let nextSignerDeadline = context.envelope.expiresAt ?? null;
 
       await withTransaction(async (tx) => {
-        const lockedEnvelope = await queryOne<{ expiresAt: number | null }>(
+        const lockedEnvelope = await queryOne<{
+          expiresAt: number | null;
+          userId: string;
+        }>(
           tx,
           `
             UPDATE envelopes
             SET updated_at = $1
             WHERE id = $2
               AND status = 'sent'
-            RETURNING expires_at AS "expiresAt"
+            RETURNING expires_at AS "expiresAt", user_id AS "userId"
           `,
           [routedAt, context.envelope.id],
         );
@@ -2507,71 +2730,7 @@ export async function submitSigningForToken(
           tokenHash: presentedTokenHash,
         });
 
-        for (const update of fieldUpdates.values()) {
-          const result = await tx.query(
-            `
-              UPDATE fields
-              SET
-                input_method = $1,
-                value = $2,
-                image_key = $3,
-                checked = $4,
-                submitted_at = $5,
-                updated_at = $6
-              WHERE id = $7
-                AND envelope_id = $8
-                AND signer_id = $9
-            `,
-            [
-              update.inputMethod,
-              update.value,
-              update.imageKey,
-              update.checked,
-              update.submittedAt,
-              submittedAt,
-              update.fieldId,
-              context.envelope.id,
-              currentSignerId,
-            ],
-          );
-
-          if (result.rowCount !== 1) {
-            throw new SigningMutationError(
-              "Unable to save one or more field values.",
-              500,
-            );
-          }
-        }
-
-        const signedSignerResult = await tx.query(
-          `
-            UPDATE signers
-            SET
-              status = 'signed',
-              signing_token_hash = NULL,
-              signing_token_expires_at = NULL,
-              signed_at = $1,
-              updated_at = $2
-            WHERE id = $3
-              AND envelope_id = $4
-              AND status = 'notified'
-              AND signing_token_hash = $5
-          `,
-          [
-            submittedAt,
-            submittedAt,
-            currentSignerId,
-            context.envelope.id,
-            presentedTokenHash,
-          ],
-        );
-
-        if (signedSignerResult.rowCount !== 1) {
-          throw new SigningMutationError(
-            "This signing link is no longer active.",
-            409,
-          );
-        }
+        await persistSignerFieldsAndAcceptance(tx);
 
         const activatedNextSigner = await queryOne<{
           email: string;
@@ -2630,6 +2789,37 @@ export async function submitSigningForToken(
           },
           tx,
         );
+
+        if (durableBranding) {
+          const { id } = await enqueueEmail(
+            {
+              message: buildSigningInvitationEmail({
+                branding: durableBranding,
+                durable: true,
+                envelopeTitle: context.envelope.title,
+                expiresAt: nextSignerDeadline,
+                senderName: normalizeSenderName(context.sender),
+                signerEmail: activatedNextSigner.email,
+                signerName: activatedNextSigner.name,
+                signingUrl: nextSignerLink.url,
+              }),
+              dedupeKey: `invitation/next/${context.envelope.id}/${nextSignerId}`,
+              envelopeId: context.envelope.id,
+              userId: lockedEnvelope.userId,
+              signingExpiresAt:
+                nextSignerDeadline ??
+                nextSignerLinkExpiresAt(null, routedAt) + 1,
+              guard: {
+                kind: "signer_token",
+                signerId: nextSignerId,
+                tokenHash: nextSignerLink.tokenHash,
+              },
+              acknowledgement: { kind: "email_audit", signerId: nextSignerId },
+            },
+            { database: tx },
+          );
+          emailJobs.push(id);
+        }
       }, database);
       signingStatePersisted = true;
       await deleteReplacedRevision(replacedRevisionKey, storageService);
@@ -2641,34 +2831,38 @@ export async function submitSigningForToken(
         );
       }
 
-      try {
-        const delivery = await emailService.send(
-          buildSigningInvitationEmail({
-            branding: await getBranding(),
-            envelopeTitle: context.envelope.title,
-            expiresAt: nextSignerDeadline,
-            senderName: normalizeSenderName(context.sender),
-            signerEmail: nextSignerDelivery.email,
-            signerName: nextSignerDelivery.name,
-            signingUrl: nextSignerLink.url,
-          }),
-        );
+      if (durable) {
+        await tryDeliverWorkflowEmails(emailJobs, { database, emailService });
+      } else {
+        try {
+          const delivery = await emailService!.send(
+            buildSigningInvitationEmail({
+              branding: await getBranding(),
+              envelopeTitle: context.envelope.title,
+              expiresAt: nextSignerDeadline,
+              senderName: normalizeSenderName(context.sender),
+              signerEmail: nextSignerDelivery.email,
+              signerName: nextSignerDelivery.name,
+              signingUrl: nextSignerLink.url,
+            }),
+          );
 
-        await recordEmailSent(
-          {
-            envelopeId: context.envelope.id,
-            messageId: delivery.messageId,
-            recipient: nextSignerDelivery.email,
-            signerId: nextSignerDelivery.id,
-            template: "signing_invitation",
-          },
-          database,
-        );
-      } catch (error) {
-        console.error(
-          `Failed to send next signer invitation for envelope ${context.envelope.id} to ${nextSignerDelivery.email}:`,
-          error,
-        );
+          await recordEmailSent(
+            {
+              envelopeId: context.envelope.id,
+              messageId: delivery.messageId,
+              recipient: nextSignerDelivery.email,
+              signerId: nextSignerDelivery.id,
+              template: "signing_invitation",
+            },
+            database,
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send next signer invitation for envelope ${context.envelope.id} to ${nextSignerDelivery.email}:`,
+            error,
+          );
+        }
       }
 
       return signingSubmitResponseSchema.parse({
@@ -2683,6 +2877,102 @@ export async function submitSigningForToken(
       fieldUpdates,
       submittedAt,
     );
+    if (durable) {
+      // Bind each appearance to the bytes accepted with the final signature.
+      // The last signer's drawn bytes are still available from validation.
+      const uploads = new Map(
+        drawnSignatureUploads.map(({ imageKey, body }) => [imageKey, body]),
+      );
+      const images: { key: string; sha256: string }[] = [];
+      const imageValidation = completedFields.some((field) => field.imageKey)
+        ? await PDFDocument.create()
+        : null;
+      for (const key of new Set(
+        completedFields.flatMap((f) => (f.imageKey ? [f.imageKey] : [])),
+      )) {
+        const bytes =
+          uploads.get(key) ?? (await storageService.getObject(key)).body;
+        try {
+          await imageValidation!.embedPng(bytes);
+        } catch {
+          throw new SigningMutationError(
+            "A drawn signature must be a readable PNG image.",
+            400,
+          );
+        }
+        images.push({ key, sha256: sha256Hex(bytes) });
+      }
+      await withTransaction(async (tx) => {
+        await lockSentEnvelope(context.envelope.id, tx);
+        await lockSignerForPresentedToken(tx, {
+          envelopeId: context.envelope.id,
+          signerId: currentSignerId,
+          tokenHash: presentedTokenHash,
+        });
+        const accepted = await queryOne<{ generatedAt: number }>(
+          tx,
+          `UPDATE envelopes
+             SET finalization_pending = true, updated_at = floor(extract(epoch FROM statement_timestamp()))
+             WHERE id = $1 AND NOT finalization_pending
+               AND (expires_at IS NULL OR expires_at > floor(extract(epoch FROM statement_timestamp())))
+               AND EXISTS (
+                 SELECT 1 FROM signers WHERE id = $2 AND
+                   (signing_token_expires_at IS NULL OR signing_token_expires_at >= floor(extract(epoch FROM statement_timestamp())))
+               )
+             RETURNING updated_at AS "generatedAt"`,
+          [context.envelope.id, currentSignerId],
+        );
+        if (!accepted) throw new SigningAccessError("expired");
+        if (providerSignature)
+          replacedRevisionKey = await commitProviderRevision(
+            tx,
+            context.envelope.id,
+            providerSignature,
+            routedAt,
+          );
+        await persistSignerFieldsAndAcceptance(tx);
+        await recordAuditEvent(signedAuditEvent, tx);
+        const envelope = await getEnvelopeRow(context.envelope.id, tx);
+        if (!envelope) throw new SigningAccessError("expired");
+        const sender = await getSenderRow(envelope.userId, tx);
+        if (!sender) throw new SigningAccessError("expired");
+        const payload = finalizationPayload.parse({
+          version: 1,
+          generatedAt: accepted.generatedAt,
+          envelope: mapEnvelopeRow(envelope),
+          fields: completedFields,
+          pages: context.pages,
+          signers: (await listSignerRows(envelope.id, tx)).map(mapSignerRow),
+          auditEvents: await listAuditEventsForEnvelope(envelope.id, tx),
+          copyRecipients: await listCopyRecipientRows(envelope.id, tx),
+          sender,
+          images,
+          revision: providerSignature
+            ? {
+                key: providerSignature.revision.key,
+                sha256: providerSignature.revision.sha256,
+              }
+            : null,
+        });
+        await enqueueRecoveryJob(
+          {
+            kind: "finalize_envelope",
+            dedupeKey: `finalize/${envelope.id}`,
+            envelopeId: envelope.id,
+            userId: envelope.userId,
+            payload,
+          },
+          { database: tx },
+        );
+      }, database);
+      signingStatePersisted = true;
+      await deleteReplacedRevision(replacedRevisionKey, storageService);
+      return signingSubmitResponseSchema.parse({
+        envelopeId: context.envelope.id,
+        redirectPath: getSigningDoneRedirectPath(token, context.envelope.title),
+        submittedAt,
+      });
+    }
     const completedSigners = applyCurrentSignerCompletion(
       context.signers,
       currentSignerId,
@@ -2773,71 +3063,7 @@ export async function submitSigningForToken(
           );
         }
 
-        for (const update of fieldUpdates.values()) {
-          const result = await tx.query(
-            `
-              UPDATE fields
-              SET
-                input_method = $1,
-                value = $2,
-                image_key = $3,
-                checked = $4,
-                submitted_at = $5,
-                updated_at = $6
-              WHERE id = $7
-                AND envelope_id = $8
-                AND signer_id = $9
-            `,
-            [
-              update.inputMethod,
-              update.value,
-              update.imageKey,
-              update.checked,
-              update.submittedAt,
-              submittedAt,
-              update.fieldId,
-              context.envelope.id,
-              currentSignerId,
-            ],
-          );
-
-          if (result.rowCount !== 1) {
-            throw new SigningMutationError(
-              "Unable to save one or more field values.",
-              500,
-            );
-          }
-        }
-
-        const signedSignerResult = await tx.query(
-          `
-            UPDATE signers
-            SET
-              status = 'signed',
-              signing_token_hash = NULL,
-              signing_token_expires_at = NULL,
-              signed_at = $1,
-              updated_at = $2
-            WHERE id = $3
-              AND envelope_id = $4
-              AND status = 'notified'
-              AND signing_token_hash = $5
-          `,
-          [
-            submittedAt,
-            submittedAt,
-            currentSignerId,
-            context.envelope.id,
-            presentedTokenHash,
-          ],
-        );
-
-        if (signedSignerResult.rowCount !== 1) {
-          throw new SigningMutationError(
-            "This signing link is no longer active.",
-            409,
-          );
-        }
+        await persistSignerFieldsAndAcceptance(tx);
 
         const completedEnvelopeResult = await tx.query(
           `
@@ -2924,7 +3150,7 @@ export async function submitSigningForToken(
         },
         copyRecipients,
         database,
-        emailService,
+        emailService: emailService!,
         envelopeId: context.envelope.id,
         envelopeTitle: context.envelope.title,
         sender: context.sender,
@@ -2944,9 +3170,27 @@ export async function submitSigningForToken(
     });
   } catch (error) {
     if (!signingStatePersisted) {
+      let unusedKeys = drawnSignatureUploads.map((upload) => upload.imageKey);
+      if (durable && unusedKeys.length) {
+        // A lost COMMIT response can leave these exact images referenced by
+        // an accepted signature. If the outcome cannot be read, keep them.
+        unusedKeys = await withTransaction(async (tx) => {
+          await tx.query(
+            "SELECT id FROM envelopes WHERE id = $1 FOR NO KEY UPDATE",
+            [context.envelope.id],
+          );
+          const referenced = await queryMany<{ imageKey: string }>(
+            tx,
+            'SELECT image_key AS "imageKey" FROM fields WHERE envelope_id = $1 AND image_key = ANY($2::text[])',
+            [context.envelope.id, unusedKeys],
+          );
+          const retained = new Set(referenced.map(({ imageKey }) => imageKey));
+          return unusedKeys.filter((key) => !retained.has(key));
+        }, database).catch(() => []);
+      }
       await Promise.all(
-        drawnSignatureUploads.map((upload) =>
-          storageService.deleteObject(upload.imageKey).catch(() => undefined),
+        unusedKeys.map((key) =>
+          storageService.deleteObject(key).catch(() => undefined),
         ),
       );
     }
@@ -3032,6 +3276,7 @@ export async function declineSigningForToken(
   input: unknown,
   {
     database = getDb(),
+    emailService: givenEmailService,
     requestMeta = {},
     verifiedMethods = [],
   }: SubmitSigningOptions = {},
@@ -3040,7 +3285,11 @@ export async function declineSigningForToken(
   const context = await resolveSigningContext(token, { database });
 
   await assertSignerChecksPassed(context, verifiedMethods, database);
-  const emailService = createEmailService();
+  const durable = isDurableJobsEnabled();
+  const emailService =
+    givenEmailService ?? (durable ? undefined : createEmailService());
+  const durableBranding = durable ? await getBranding() : null;
+  const emailJobs: string[] = [];
   const storageService = createStorageService();
   const currentSignerId = context.signer.id;
   const presentedTokenHash = hashOpaqueToken(token);
@@ -3106,7 +3355,7 @@ export async function declineSigningForToken(
   const seal = await loadInstallSealer();
 
   await withTransaction(async (tx) => {
-    await lockSentEnvelope(context.envelope.id, tx);
+    const owner = await lockSentEnvelope(context.envelope.id, tx);
     await assertStillSignersTurn(context.envelope.id, currentSignerId, tx);
     await lockSignerForPresentedToken(tx, {
       envelopeId: context.envelope.id,
@@ -3258,6 +3507,35 @@ export async function declineSigningForToken(
       },
       tx,
     );
+    if (durableBranding) {
+      const sender = await getSenderRow(owner.userId, tx);
+      if (!sender)
+        throw new SigningMutationError(
+          "The declined envelope is unavailable.",
+          409,
+        );
+      const { id } = await enqueueEmail(
+        {
+          message: buildDeclineNotificationEmail({
+            branding: durableBranding,
+            declineReason,
+            envelopeId: context.envelope.id,
+            envelopeTitle: context.envelope.title,
+            senderEmail: sender.email,
+            senderName: normalizeSenderName(sender),
+            signerEmail: context.signer.email,
+            signerName: context.signer.name,
+          }),
+          dedupeKey: `decline/${context.envelope.id}/sender`,
+          envelopeId: context.envelope.id,
+          userId: owner.userId,
+          guard: { kind: "envelope_status", allowedStatuses: ["declined"] },
+          acknowledgement: { kind: "email_audit" },
+        },
+        { database: tx },
+      );
+      emailJobs.push(id);
+    }
   }, database).catch(async (error: unknown) => {
     // Only files this call stored, so only once the envelope was its to end.
     // That includes a failed COMMIT: the cleanup keeps the files if the
@@ -3276,34 +3554,38 @@ export async function declineSigningForToken(
     throw error;
   });
 
-  try {
-    const delivery = await emailService.send(
-      buildDeclineNotificationEmail({
-        branding: await getBranding(),
-        declineReason,
-        envelopeId: context.envelope.id,
-        envelopeTitle: context.envelope.title,
-        senderEmail: context.sender.email,
-        senderName: normalizeSenderName(context.sender),
-        signerEmail: context.signer.email,
-        signerName: context.signer.name,
-      }),
-    );
+  if (durable) {
+    await tryDeliverWorkflowEmails(emailJobs, { database, emailService });
+  } else {
+    try {
+      const delivery = await emailService!.send(
+        buildDeclineNotificationEmail({
+          branding: await getBranding(),
+          declineReason,
+          envelopeId: context.envelope.id,
+          envelopeTitle: context.envelope.title,
+          senderEmail: context.sender.email,
+          senderName: normalizeSenderName(context.sender),
+          signerEmail: context.signer.email,
+          signerName: context.signer.name,
+        }),
+      );
 
-    await recordEmailSent(
-      {
-        envelopeId: context.envelope.id,
-        messageId: delivery.messageId,
-        recipient: context.sender.email,
-        template: "decline_notification",
-      },
-      database,
-    );
-  } catch (error) {
-    console.error(
-      `Failed to send decline notification for envelope ${context.envelope.id}:`,
-      error,
-    );
+      await recordEmailSent(
+        {
+          envelopeId: context.envelope.id,
+          messageId: delivery.messageId,
+          recipient: context.sender.email,
+          template: "decline_notification",
+        },
+        database,
+      );
+    } catch (error) {
+      console.error(
+        `Failed to send decline notification for envelope ${context.envelope.id}:`,
+        error,
+      );
+    }
   }
 
   return signingDeclineResponseSchema.parse({

@@ -1,5 +1,9 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { randomUUID } from "node:crypto";
 
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
 import { removeUnclaimedEnvelopeCertificates } from "./certificate-cleanup.ts";
 import {
@@ -412,6 +416,7 @@ export type EnvelopeDetailDeadline = {
 };
 
 export type EnvelopeDetailData = {
+  finalizationPending?: boolean;
   /** People who get a copy of the finished document without signing. */
   copyRecipients: readonly CopyRecipientRecord[];
   createdAtLabel: string;
@@ -1163,6 +1168,7 @@ async function getEnvelopeByIdForUser(
         declined_at AS "declinedAt",
         voided_at AS "voidedAt",
         expires_at AS "expiresAt",
+        finalization_pending AS "finalizationPending",
         reminder_interval_days AS "reminderIntervalDays",
         part11,
         signature_level AS "signatureLevel",
@@ -1424,6 +1430,7 @@ function buildDashboardContextLine(
   signers: readonly PersistedSignerRecord[],
   fields: readonly PersistedFieldRecord[],
 ): string {
+  if (envelope.finalizationPending) return "All signatures recorded";
   if (envelope.status === "completed") {
     const sentTo = signers.map((signer) => signer.email).join(", ");
     return sentTo.length > 0 ? `Sent to: ${sentTo}` : "Sent to: —";
@@ -1467,6 +1474,7 @@ function buildDashboardStatusLabel(
   envelope: EnvelopeRecord,
   signers: readonly PersistedSignerRecord[],
 ): string {
+  if (envelope.finalizationPending) return "Preparing final documents";
   if (isEnvelopeExpired(envelope, Math.floor(Date.now() / 1000))) {
     return "Expired";
   }
@@ -1559,7 +1567,7 @@ function buildVoidNotificationEmail(input: {
   signerEmail: string;
   signerName: string;
 }) {
-  const subject = `"${input.envelopeTitle}" was voided by ${input.senderName}`;
+  const subject = emailSubject`"${input.envelopeTitle}" was voided by ${input.senderName}`;
   const textBody = [
     `Hi ${input.signerName},`,
     "",
@@ -1683,9 +1691,13 @@ function buildTimelineDescription(event: AuditEventRecord): string {
         ? `Declined by ${targetLabel} — ${declineReason}`
         : `Declined by ${targetLabel}`;
     case "reminded_manual":
-      return `Manual reminder sent to ${targetLabel}`;
+      return event.metadata?.delivery === "requested"
+        ? `Manual reminder requested for ${targetLabel}`
+        : `Manual reminder sent to ${targetLabel}`;
     case "reminded_auto":
-      return `Automatic reminder sent to ${targetLabel}`;
+      return event.metadata?.delivery === "requested"
+        ? `Automatic reminder requested for ${targetLabel}`
+        : `Automatic reminder sent to ${targetLabel}`;
     case "consented":
       return `${targetLabel} agreed to use electronic records and signatures`;
     case "verified":
@@ -1841,6 +1853,7 @@ export async function listEnvelopesForUser(
         declined_at AS "declinedAt",
         voided_at AS "voidedAt",
         expires_at AS "expiresAt",
+        finalization_pending AS "finalizationPending",
         reminder_interval_days AS "reminderIntervalDays",
         part11,
         signature_level AS "signatureLevel",
@@ -1975,8 +1988,9 @@ export async function getEnvelopeDetailDataForUser(
   return {
     copyRecipients,
     createdAtLabel: formatLongDate(envelope.createdAt),
+    finalizationPending: Boolean(envelope.finalizationPending),
     deadline:
-      envelope.status === "sent"
+      envelope.status === "sent" && !envelope.finalizationPending
         ? {
             expired,
             expiresAtLabel:
@@ -2457,7 +2471,10 @@ export async function sendDraftEnvelope(
     );
   }
 
-  const emailService = createEmailServiceForSending();
+  const durable = isDurableJobsEnabled();
+  const emailService = durable ? null : createEmailServiceForSending();
+  const branding = durable ? await getBranding() : null;
+  const jobs: string[] = [];
   const storageService = createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
 
@@ -2642,9 +2659,50 @@ export async function sendDraftEnvelope(
         },
         tx,
       );
+
+      if (branding) {
+        const { id } = await enqueueEmail(
+          {
+            message: buildSigningInvitationEmail({
+              branding,
+              durable: true,
+              envelopeTitle: envelope.title,
+              expiresAt,
+              senderName: input.senderName,
+              signerEmail: firstSigner.email,
+              signerName: firstSigner.name,
+              signingUrl: issuedLink.url,
+            }),
+            dedupeKey: `invitation/first/${envelopeId}/${firstSigner.id}`,
+            envelopeId,
+            userId,
+            signingExpiresAt: expiresAt,
+            guard: {
+              kind: "signer_token",
+              signerId: firstSigner.id,
+              tokenHash: issuedLink.tokenHash,
+            },
+            acknowledgement: { kind: "email_audit", signerId: firstSigner.id },
+          },
+          { database: tx },
+        );
+        jobs.push(id);
+      }
     }, database);
   } catch (error) {
     throw error;
+  }
+
+  const response = sendEnvelopeResponseSchema.parse({
+    envelopeId,
+    expiresAt,
+    notifiedSignerName: firstSigner.name,
+    redirectPath: `/envelopes/${envelopeId}`,
+    sentAt,
+  });
+  if (!emailService) {
+    await tryDeliverWorkflowEmails(jobs, { database });
+    return response;
   }
 
   let invitationMessageId: string | undefined;
@@ -2742,13 +2800,7 @@ export async function sendDraftEnvelope(
     database,
   );
 
-  return sendEnvelopeResponseSchema.parse({
-    envelopeId,
-    expiresAt,
-    notifiedSignerName: firstSigner.name,
-    redirectPath: `/envelopes/${envelopeId}`,
-    sentAt,
-  });
+  return response;
 }
 
 type ChangeEnvelopeDeadlineInput = {
@@ -2776,12 +2828,13 @@ export async function changeEnvelopeDeadline(
 
   await withTransaction(async (tx) => {
     const current = await queryOne<{
+      finalizationPending: boolean;
       expiresAt: number | null;
       status: EnvelopeRecord["status"];
     }>(
       tx,
       `
-        SELECT expires_at AS "expiresAt", status
+        SELECT expires_at AS "expiresAt", finalization_pending AS "finalizationPending", status
         FROM envelopes
         WHERE id = $1 AND user_id = $2
         -- The lock an UPDATE takes, not FOR UPDATE: storing an audit event
@@ -2796,7 +2849,7 @@ export async function changeEnvelopeDeadline(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (current.status !== "sent") {
+    if (current.status !== "sent" || current.finalizationPending) {
       throw new EnvelopeMutationError(
         "Only an envelope that is out for signature has a deadline to change.",
         409,
@@ -2821,6 +2874,14 @@ export async function changeEnvelopeDeadline(
       `,
       [expiresAt, nowUnixTimestamp, envelopeId],
     );
+    if (isDurableJobsEnabled()) {
+      await tx.query(
+        `UPDATE recovery_jobs SET signing_expires_at = $1
+          WHERE envelope_id = $2 AND signing_expires_at IS NOT NULL
+            AND state IN ('pending', 'running', 'needs_attention')`,
+        [expiresAt, envelopeId],
+      );
+    }
     await recordAuditEvent(
       {
         actorEmail: input.senderEmail,
@@ -2852,13 +2913,10 @@ const SENT_ENVELOPE_SIGNER_CORRECTION_MESSAGE =
  * stops working. If it is their turn, a new invitation goes to the
  * corrected address.
  *
- * The envelope and signer rows stay locked until that invitation is sent
- * or refused, so another correction of the same person waits. A failed
- * send rolls the whole transaction back: the last committed identity
- * returns, the original link still works when nothing succeeded, and no
- * signer_corrected event is left behind. The audit event is written in
- * this same transaction after a successful send, so overlapping
- * corrections cannot appear out of order.
+ * The correction and its audit stay in envelope-lock order. Durable mode
+ * queues the new invitation in the correction transaction and attempts
+ * delivery after commit. Legacy mode holds the same locks through delivery
+ * and rolls back the correction when delivery fails.
  */
 export async function correctSentEnvelopeSigner(
   userId: string,
@@ -2872,15 +2930,19 @@ export async function correctSentEnvelopeSigner(
     nowUnixTimestamp = Math.floor(Date.now() / 1000),
   }: CorrectSentEnvelopeSignerOptions = {},
 ): Promise<CorrectSentSignerResult> {
+  const durable = isDurableJobsEnabled();
+  let jobId: string | undefined;
   const parsedInput = correctSentSignerSchema.parse(input);
   // Read settings before taking the envelope lock: an uncached read inside the
   // transaction borrows a second pool connection, and overlapping corrections
   // holding the others while they wait on the lock would starve it.
   const branding = await getBranding();
-  const emailAddresses = emailService ? null : await resolveEmailAddresses();
+  const emailAddresses =
+    durable || emailService ? null : await resolveEmailAddresses();
 
-  return withTransaction(async (tx) => {
+  const response = await withTransaction(async (tx) => {
     const envelope = await queryOne<{
+      finalizationPending: boolean;
       expiresAt: number | null;
       part11: boolean;
       status: EnvelopeRecord["status"];
@@ -2891,7 +2953,7 @@ export async function correctSentEnvelopeSigner(
       tx,
       `
         SELECT
-          expires_at AS "expiresAt",
+          expires_at AS "expiresAt", finalization_pending AS "finalizationPending",
           part11,
           status,
           title,
@@ -2908,7 +2970,7 @@ export async function correctSentEnvelopeSigner(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (envelope.status !== "sent") {
+    if (envelope.status !== "sent" || envelope.finalizationPending) {
       throw new EnvelopeMutationError(
         SENT_ENVELOPE_SIGNER_CORRECTION_MESSAGE,
         409,
@@ -3092,26 +3154,44 @@ export async function correctSentEnvelopeSigner(
     );
 
     if (invitationNeeded && issuedLink) {
-      const mailer =
-        emailService ??
-        createEmailService(
-          emailAddresses === null
-            ? {}
-            : { resolveAddresses: () => Promise.resolve(emailAddresses) },
-        );
-      const invitationMessageId = (
-        await mailer.send(
-          buildSigningInvitationEmail({
-            branding,
-            envelopeTitle: envelope.title,
-            expiresAt: envelope.expiresAt,
-            senderName: context.senderName,
-            signerEmail: nextEmail,
-            signerName: nextName,
-            signingUrl: issuedLink.url,
-          }),
-        )
-      ).messageId;
+      const message = buildSigningInvitationEmail({
+        branding,
+        durable: durable,
+        envelopeTitle: envelope.title,
+        expiresAt: envelope.expiresAt,
+        senderName: context.senderName,
+        signerEmail: nextEmail,
+        signerName: nextName,
+        signingUrl: issuedLink.url,
+      });
+      let invitationMessageId: string | undefined;
+      if (durable) {
+        ({ id: jobId } = await enqueueEmail(
+          {
+            message,
+            dedupeKey: `invitation/correction/${envelopeId}/${signerId}/${issuedLink.tokenHash}`,
+            envelopeId,
+            userId,
+            signingExpiresAt: envelope.expiresAt ?? issuedLink.exp + 1,
+            guard: {
+              kind: "signer_token",
+              signerId,
+              tokenHash: issuedLink.tokenHash,
+            },
+            acknowledgement: { kind: "email_audit", signerId },
+          },
+          { database: tx },
+        ));
+      } else {
+        const mailer =
+          emailService ??
+          createEmailService(
+            emailAddresses === null
+              ? {}
+              : { resolveAddresses: () => Promise.resolve(emailAddresses) },
+          );
+        invitationMessageId = (await mailer.send(message)).messageId;
+      }
 
       await recordAuditEvent(
         {
@@ -3133,21 +3213,23 @@ export async function correctSentEnvelopeSigner(
         },
         tx,
       );
-      await recordEmailSent(
-        {
-          envelopeId,
-          messageId: invitationMessageId,
-          recipient: nextEmail,
-          signerId,
-          template: "signing_invitation",
-        },
-        tx,
-      );
+      if (!durable) {
+        await recordEmailSent(
+          {
+            envelopeId,
+            messageId: invitationMessageId,
+            recipient: nextEmail,
+            signerId,
+            template: "signing_invitation",
+          },
+          tx,
+        );
+      }
 
       return correctSentSignerResponseSchema.parse({
         email: nextEmail,
         envelopeId,
-        invitationSent: true,
+        invitationSent: !durable,
         name: nextName,
         signerId,
       });
@@ -3182,6 +3264,14 @@ export async function correctSentEnvelopeSigner(
       signerId,
     });
   }, database);
+  if (jobId) {
+    const sent = await tryDeliverWorkflowEmails([jobId], {
+      database,
+      emailService,
+    });
+    return { ...response, invitationSent: sent.has(jobId) };
+  }
+  return response;
 }
 
 /**
@@ -3202,7 +3292,7 @@ export async function changeEnvelopeReminders(
     `
       UPDATE envelopes
       SET reminder_interval_days = $1, updated_at = $2
-      WHERE id = $3 AND user_id = $4 AND status = 'sent'
+      WHERE id = $3 AND user_id = $4 AND status = 'sent' AND NOT finalization_pending
     `,
     [reminderIntervalDays, nowUnixTimestamp, envelopeId, userId],
   );
@@ -3236,7 +3326,7 @@ export async function voidSentEnvelope(
     throw new EnvelopeMutationError("Envelope not found.", 404);
   }
 
-  if (envelope.status !== "sent") {
+  if (envelope.status !== "sent" || envelope.finalizationPending) {
     throw new EnvelopeMutationError("Only sent envelopes can be voided.", 409);
   }
 
@@ -3255,7 +3345,10 @@ export async function voidSentEnvelope(
   );
   const currentSigner = notifiedSigners[0];
   const voidedAt = Math.floor(Date.now() / 1000);
-  const emailService = createEmailService();
+  const durable = isDurableJobsEnabled();
+  const emailService = durable ? null : createEmailService();
+  const durableBranding = durable ? await getBranding() : null;
+  const jobs: string[] = [];
   const storageService = createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
 
@@ -3332,10 +3425,13 @@ export async function voidSentEnvelope(
     // second void, a decline or the last signature at the same time waits
     // here, then stops below: it never writes over, or deletes, the files
     // the first one saved.
-    const locked = await queryOne<{ status: EnvelopeRecord["status"] }>(
+    const locked = await queryOne<{
+      status: EnvelopeRecord["status"];
+      finalizationPending: boolean;
+    }>(
       tx,
       `
-        SELECT status
+        SELECT status, finalization_pending AS "finalizationPending"
         FROM envelopes
         WHERE id = $1 AND user_id = $2
         -- The lock an UPDATE takes, not FOR UPDATE: storing an audit event
@@ -3349,12 +3445,20 @@ export async function voidSentEnvelope(
       throw new EnvelopeMutationError("Envelope not found.", 404);
     }
 
-    if (locked.status !== "sent") {
+    if (locked.status !== "sent" || locked.finalizationPending) {
       throw new EnvelopeMutationError(
         "Only sent envelopes can be voided.",
         409,
       );
     }
+
+    // A correction or handoff can win the lock while the void is prepared.
+    // Use the recipients current at the terminal transition for durable mail.
+    const currentRecipients = durableBranding
+      ? (await listSignersForEnvelopeId(envelopeId, tx)).filter(
+          (signer) => signer.status === "notified",
+        )
+      : [];
 
     const certificate = await storeEnvelopeCertificatePdf(
       {
@@ -3449,6 +3553,29 @@ export async function voidSentEnvelope(
       },
       tx,
     );
+    if (durableBranding) {
+      for (const signer of currentRecipients) {
+        const { id } = await enqueueEmail(
+          {
+            message: buildVoidNotificationEmail({
+              branding: durableBranding,
+              envelopeId,
+              envelopeTitle: envelope.title,
+              senderName: input.senderName,
+              signerEmail: signer.email,
+              signerName: signer.name,
+            }),
+            dedupeKey: `void/${envelopeId}/${signer.id}`,
+            envelopeId,
+            userId,
+            guard: { kind: "envelope_status", allowedStatuses: ["voided"] },
+            acknowledgement: { kind: "email_audit", signerId: signer.id },
+          },
+          { database: tx },
+        );
+        jobs.push(id);
+      }
+    }
   }, database).catch(async (error: unknown) => {
     // Only files this call stored, so only once the envelope was its to end.
     // That includes a failed COMMIT: the cleanup keeps the files if the
@@ -3467,46 +3594,50 @@ export async function voidSentEnvelope(
     throw error;
   });
 
-  const branding = await getBranding().catch(() => null);
+  if (!emailService) {
+    await tryDeliverWorkflowEmails(jobs, { database });
+  } else {
+    const branding = await getBranding().catch(() => null);
 
-  await Promise.all(
-    notifiedSigners.map(async (signer) => {
-      try {
-        if (!branding) {
-          throw new Error(
-            "Could not load settings for the notification email.",
+    await Promise.all(
+      notifiedSigners.map(async (signer) => {
+        try {
+          if (!branding) {
+            throw new Error(
+              "Could not load settings for the notification email.",
+            );
+          }
+
+          const delivery = await emailService.send(
+            buildVoidNotificationEmail({
+              branding,
+              envelopeId,
+              envelopeTitle: envelope.title,
+              senderName: input.senderName,
+              signerEmail: signer.email,
+              signerName: signer.name,
+            }),
+          );
+
+          await recordEmailSent(
+            {
+              envelopeId,
+              messageId: delivery.messageId,
+              recipient: signer.email,
+              signerId: signer.id,
+              template: "void_notification",
+            },
+            database,
+          );
+        } catch (error) {
+          console.error(
+            `Failed to send void notification for envelope ${envelopeId} to ${signer.email}:`,
+            error,
           );
         }
-
-        const delivery = await emailService.send(
-          buildVoidNotificationEmail({
-            branding,
-            envelopeId,
-            envelopeTitle: envelope.title,
-            senderName: input.senderName,
-            signerEmail: signer.email,
-            signerName: signer.name,
-          }),
-        );
-
-        await recordEmailSent(
-          {
-            envelopeId,
-            messageId: delivery.messageId,
-            recipient: signer.email,
-            signerId: signer.id,
-            template: "void_notification",
-          },
-          database,
-        );
-      } catch (error) {
-        console.error(
-          `Failed to send void notification for envelope ${envelopeId} to ${signer.email}:`,
-          error,
-        );
-      }
-    }),
-  );
+      }),
+    );
+  }
 
   return voidEnvelopeResponseSchema.parse({
     envelopeId,

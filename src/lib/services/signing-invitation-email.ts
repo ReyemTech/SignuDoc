@@ -1,3 +1,4 @@
+import { emailSubject } from "./email-subject.ts";
 import { type Branding } from "../branding.ts";
 import { formatDeadline } from "../envelope-deadline.ts";
 import { escapeHtml } from "../utils/html.ts";
@@ -9,6 +10,7 @@ type SigningInvitationEmailInput = {
   envelopeTitle: string;
   /** The envelope's deadline, when it has one. */
   expiresAt?: number | null;
+  durable?: boolean;
   senderName: string;
   signerEmail: string;
   signerName: string;
@@ -18,7 +20,9 @@ type SigningInvitationEmailInput = {
 /** "This request expires on …", or nothing for an envelope with no deadline. */
 export function buildDeadlineLine(
   expiresAt: number | null | undefined,
+  durable = false,
 ): string | null {
+  if (durable) return "Open your signing link to see the current deadline.";
   return typeof expiresAt === "number"
     ? `This request expires on ${formatDeadline(expiresAt)}.`
     : null;
@@ -28,8 +32,8 @@ export function buildSigningInvitationEmail(
   input: SigningInvitationEmailInput,
 ): TransactionalEmailMessage {
   const { productName } = input.branding;
-  const subject = `${input.senderName} requested your signature on "${input.envelopeTitle}"`;
-  const deadlineLine = buildDeadlineLine(input.expiresAt);
+  const subject = emailSubject`${input.senderName} requested your signature on "${input.envelopeTitle}"`;
+  const deadlineLine = buildDeadlineLine(input.expiresAt, input.durable);
   const textBody = [
     `Hi ${input.signerName},`,
     "",

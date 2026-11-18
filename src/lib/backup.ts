@@ -274,25 +274,43 @@ export async function* exportDatabaseLines(
 
       const cursorName = `backup_${String(tables.indexOf(table))}`;
 
-      await client.query(
-        `DECLARE ${cursorName} NO SCROLL CURSOR FOR SELECT row_to_json(t)::text AS row FROM ${quoteIdentifier(table)} t`,
-      );
-
-      for (;;) {
-        const batch = await client.query<{ row: string }>(
-          `FETCH ${String(EXPORT_BATCH_ROWS)} FROM ${cursorName}`,
+      // The snapshot is shared by both cursors. Cleared jobs are small;
+      // a live encrypted snapshot can contain 25 MiB of base64-encoded
+      // attachments, hex-encoded again by row_to_json.
+      const scans =
+        table === "recovery_jobs"
+          ? [
+              {
+                predicate: " WHERE t.payload_ciphertext IS NULL",
+                fetchRows: EXPORT_BATCH_ROWS,
+              },
+              {
+                predicate: " WHERE t.payload_ciphertext IS NOT NULL",
+                fetchRows: 1,
+              },
+            ]
+          : [{ predicate: "", fetchRows: EXPORT_BATCH_ROWS }];
+      for (const { predicate, fetchRows } of scans) {
+        await client.query(
+          `DECLARE ${cursorName} NO SCROLL CURSOR FOR SELECT row_to_json(t)::text AS row FROM ${quoteIdentifier(table)} t${predicate}`,
         );
 
-        for (const { row } of batch.rows) {
-          yield `{"table":${JSON.stringify(table)},"row":${row}}\n`;
+        for (;;) {
+          const batch = await client.query<{ row: string }>(
+            `FETCH ${String(fetchRows)} FROM ${cursorName}`,
+          );
+
+          for (const { row } of batch.rows) {
+            yield `{"table":${JSON.stringify(table)},"row":${row}}\n`;
+          }
+
+          if (batch.rows.length < fetchRows) {
+            break;
+          }
         }
 
-        if (batch.rows.length < EXPORT_BATCH_ROWS) {
-          break;
-        }
+        await client.query(`CLOSE ${cursorName}`);
       }
-
-      await client.query(`CLOSE ${cursorName}`);
     }
 
     await client.query("COMMIT");
@@ -535,19 +553,16 @@ export async function* readDatabaseBackup(
   // whole.
   lines.setEncoding("utf8");
 
-  let buffered = "";
+  let partial: string[] = [];
   let first = true;
 
   for await (const chunk of lines) {
-    buffered += chunk as string;
-
-    let newline = buffered.indexOf("\n");
-
-    while (newline >= 0) {
-      const line = buffered.slice(0, newline);
-
-      buffered = buffered.slice(newline + 1);
-      newline = buffered.indexOf("\n");
+    const pieces = (chunk as string).split("\n");
+    const tail = pieces.pop()!;
+    for (const piece of pieces) {
+      partial.push(piece);
+      const line = partial.join("");
+      partial = [];
 
       if (!line.trim()) {
         continue;
@@ -575,6 +590,7 @@ export async function* readDatabaseBackup(
         table: String(parsed.table),
       };
     }
+    if (tail) partial.push(tail);
   }
 }
 
@@ -601,8 +617,10 @@ export async function restoreDatabase({
   backupPath,
   database,
   store,
+  maxBatchBytes = 1024 * 1024,
 }: {
   backupPath: string;
+  maxBatchBytes?: number;
   database: DbPool;
   store: BackupStore;
 }): Promise<{ rows: Record<string, number> }> {
@@ -632,26 +650,26 @@ export async function restoreDatabase({
   const client = await database.connect();
   const counts: Record<string, number> = {};
   let batchTable: string | null = null;
-  let batch: unknown[] = [];
+  let batch: string[] = [];
+  let batchBytes = 2;
+  let columns = "";
 
   async function flush() {
     if (!batchTable || batch.length === 0) {
       return;
     }
 
-    const columns = Object.keys(batch[0] as Record<string, unknown>)
-      .map(quoteIdentifier)
-      .join(", ");
     const table = quoteIdentifier(batchTable);
 
     // Only the columns the backup has, so a column added by a newer
     // migration gets its default.
     await client.query(
       `INSERT INTO ${table} (${columns}) SELECT ${columns} FROM json_populate_recordset(null::${table}, $1::json)`,
-      [JSON.stringify(batch)],
+      ["[" + batch.join(",") + "]"],
     );
     counts[batchTable] = (counts[batchTable] ?? 0) + batch.length;
     batch = [];
+    batchBytes = 2;
   }
 
   try {
@@ -680,12 +698,24 @@ export async function restoreDatabase({
         continue;
       }
 
-      if (entry.table !== batchTable || batch.length >= RESTORE_BATCH_ROWS) {
+      const row = JSON.stringify(entry.row);
+      const bytes = Buffer.byteLength(row) + 1;
+      if (
+        entry.table !== batchTable ||
+        batch.length >= RESTORE_BATCH_ROWS ||
+        batchBytes + bytes > maxBatchBytes
+      ) {
         await flush();
         batchTable = entry.table;
       }
 
-      batch.push(entry.row);
+      if (!batch.length)
+        columns = Object.keys(entry.row as Record<string, unknown>)
+          .map(quoteIdentifier)
+          .join(", ");
+      batch.push(row);
+      batchBytes += bytes;
+      if (batchBytes >= maxBatchBytes) await flush();
     }
 
     await flush();

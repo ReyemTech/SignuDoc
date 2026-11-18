@@ -31,11 +31,13 @@ export type BlobClient = {
 type CreateBlobStorageServiceOptions = {
   client?: BlobClient;
   env?: EnvSource;
+  signal?: AbortSignal;
 };
 
 export function createBlobStorageService({
   client = { del, get, head, put },
   env = process.env,
+  signal,
 }: CreateBlobStorageServiceOptions = {}): StorageService {
   if (!hasBlobCredentials(env)) {
     throw new ServiceConfigurationError("storage", ["BLOB_READ_WRITE_TOKEN"]);
@@ -48,6 +50,7 @@ export function createBlobStorageService({
     const result = await client.get(normalizedKey, {
       access: BLOB_ACCESS,
       useCache: false,
+      ...(signal ? { abortSignal: signal } : {}),
     });
 
     if (!result || result.statusCode !== 200) {
@@ -61,7 +64,10 @@ export function createBlobStorageService({
     const normalizedKey = normalizeStorageKey(key);
 
     try {
-      const metadata = await client.head(normalizedKey);
+      const metadata = await client.head(
+        normalizedKey,
+        signal ? { abortSignal: signal } : undefined,
+      );
 
       return {
         bucketName: BLOB_BUCKET_NAME,
@@ -86,7 +92,10 @@ export function createBlobStorageService({
 
   return {
     async deleteObject(key) {
-      await client.del(normalizeStorageKey(key));
+      await client.del(
+        normalizeStorageKey(key),
+        signal ? { abortSignal: signal } : undefined,
+      );
     },
     async getObject(key) {
       const { normalizedKey, result } = await fetchObject(key);
@@ -116,6 +125,10 @@ export function createBlobStorageService({
     },
     headObject,
     async putObject(input) {
+      const abortSignal =
+        input.signal && signal
+          ? AbortSignal.any([signal, input.signal])
+          : (input.signal ?? signal);
       const normalizedKey = normalizeStorageKey(input.key);
 
       try {
@@ -132,6 +145,7 @@ export function createBlobStorageService({
             // name the same object. Writing it again replaces it, unless the
             // caller asked for what is there to be kept, and then Blob
             // itself refuses the write.
+            ...(abortSignal ? { abortSignal } : {}),
             addRandomSuffix: false,
             allowOverwrite: !input.keepExisting,
             contentType: input.contentType,

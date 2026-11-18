@@ -1,3 +1,14 @@
+import { emailSubject } from "./services/email-subject.ts";
+import {
+  RETENTION_WARNING_DAYS,
+  RETENTION_MIN_NOTICE_DAYS,
+  readRetentionPolicy,
+  retentionNoticeKeySql,
+  type RetentionPolicy,
+} from "./recovery/retention-policy.ts";
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbExecutor,
   getDb,
@@ -9,6 +20,7 @@ import { findRecordKeeper } from "./people.ts";
 import {
   buildEnvelopeThumbnailKey,
   getRecipientCertificateKey,
+  parseFinalizationAttemptKey,
 } from "./services/storage-keys.ts";
 import {
   createStorageService,
@@ -18,6 +30,8 @@ import { createEmailService, type EmailService } from "./services/email.ts";
 import { recordSystemAuditEvent } from "./services/system-audit.ts";
 import { readStoredSettings } from "./settings.ts";
 import { type EnvSource, isHostedMode, resolveAppUrl } from "./utils/env.ts";
+
+export { RETENTION_WARNING_DAYS } from "./recovery/retention-policy.ts";
 
 const DAY_IN_SECONDS = 24 * 60 * 60;
 export const STALE_DRAFT_RETENTION_DAYS = 30;
@@ -69,13 +83,6 @@ export type RetentionSweepSummary = {
   providerSigningSessionsEnded: number;
   ranAt: number;
 };
-
-/** How long before deletion a sender is told, and the shortest notice. */
-export const RETENTION_WARNING_DAYS = 30;
-// Nothing is deleted until this long after its warning, whatever the
-// setting says by then: the date in the warning is never brought forward,
-// even when an administrator shortens the period afterwards.
-const RETENTION_MIN_NOTICE_DAYS = RETENTION_WARNING_DAYS;
 
 function getCurrentUnixTimestamp() {
   return Math.floor(Date.now() / 1000);
@@ -530,9 +537,10 @@ async function handOverFinishedEnvelopes(
 }
 
 export class AccountPurgeDeferredError extends Error {
-  constructor(userId: string) {
+  constructor(userId: string, reason?: string) {
     super(
-      `Account ${userId} holds finished envelopes and no other user can keep them. Its purge is deferred until another administrator exists or the records are exported and deleted by hand.`,
+      reason ??
+        `Account ${userId} holds finished envelopes and no other user can keep them. Its purge is deferred until another administrator exists or the records are exported and deleted by hand.`,
     );
     this.name = "AccountPurgeDeferredError";
   }
@@ -562,7 +570,8 @@ async function deleteAccountRows(
   now: number,
   keepFinishedEnvelopes: boolean,
   database: DbExecutor,
-): Promise<string[] | null> {
+  env: EnvSource,
+): Promise<{ queued: string[]; immediate: string[] } | null> {
   const account = await queryOne<{ id: string }>(
     database,
     `SELECT id FROM "user" WHERE id = $1 FOR UPDATE`,
@@ -573,22 +582,29 @@ async function deleteAccountRows(
     return null;
   }
 
+  // Serialize erasure with signature acceptance and publication in both
+  // modes. If publication wins, a fresh enumeration sees its three names.
+  // If purge wins, publication waits and then finds its parent gone.
+  // NO KEY UPDATE remains compatible with audit foreign-key checks.
+  await database.query(
+    `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
+    [userId],
+  );
+
   if (keepFinishedEnvelopes) {
-    // The account's envelopes are locked before the finished ones are
-    // handed over, and stay locked until the account is gone. Signing,
-    // declining and voiding all change the envelope's row, so one that got
-    // in first has finished and its envelope is handed over here, and one
-    // that comes after waits and then finds no envelope. Without the lock
-    // an envelope could be completed between the hand-over and the delete,
-    // and its signed record would go with the account.
-    //
-    // The lock an UPDATE takes, not FOR UPDATE: a signer's audit event
-    // needs a share of this row for its foreign key, and FOR UPDATE would
-    // make it wait.
-    await database.query(
-      `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
-      [userId],
-    );
+    // The JSON lookup also works on a disabled install predating the migration.
+    if (
+      await queryOne(
+        database,
+        `SELECT id FROM envelopes WHERE user_id=$1 AND status='sent'
+      AND to_jsonb(envelopes)->>'finalization_pending'='true' LIMIT 1`,
+        [userId],
+      )
+    )
+      throw new AccountPurgeDeferredError(
+        userId,
+        "Account purge deferred while accepted signatures await final documents.",
+      );
 
     if (!(await handOverFinishedEnvelopes(userId, now, database))) {
       throw new AccountPurgeDeferredError(userId);
@@ -600,14 +616,21 @@ async function deleteAccountRows(
     envelopes.map((envelope) => envelope.id),
     database,
   );
-  const storageKeys = new Set<string>();
+  const immediate = new Set<string>();
+  const queued = new Set<string>();
 
   for (const envelope of envelopes) {
-    for (const key of buildEnvelopeStorageKeys(
+    const keys = buildEnvelopeStorageKeys(
       envelope,
       fieldImagesByEnvelopeId.get(envelope.id) ?? [],
-    )) {
-      storageKeys.add(key);
+    );
+    if (keepFinishedEnvelopes) {
+      for (const key of keys) immediate.add(key);
+    } else {
+      // Account deletion discards these pointers. The daily file cleanup
+      // must be able to finish even if the very first external delete fails.
+      await queueFileDeletions(envelope.id, keys, now, database);
+      for (const key of keys) queued.add(key);
     }
   }
 
@@ -620,7 +643,7 @@ async function deleteAccountRows(
   );
 
   for (const template of templates) {
-    storageKeys.add(template.sourcePdfKey);
+    immediate.add(template.sourcePdfKey);
   }
 
   // The access it ends is worth a line in the install's trail, which lands
@@ -646,6 +669,32 @@ async function deleteAccountRows(
     database,
   );
 
+  // The relation may be absent on a legacy install.
+  // Account mail and owner notices go with the account. A retained envelope
+  // keeps its sealing snapshot, recipient mail and tombstones. The frozen
+  // user_id remains part of their authenticated identity. Removed envelopes
+  // cascade all their jobs, including when the feature flag is off.
+  if (
+    isDurableJobsEnabled(env) ||
+    (
+      await queryOne<{ present: boolean }>(
+        database,
+        "SELECT to_regclass('public.recovery_jobs') IS NOT NULL AS present",
+      )
+    )?.present
+  ) {
+    await database.query(
+      `DELETE FROM public.recovery_jobs WHERE user_id = $1 AND COALESCE(purge_with_user,
+        -- Backups and encrypted jobs created before explicit lifetime tracking.
+        envelope_id IS NULL OR dedupe_key IN (
+          'completion/' || envelope_id || '/sender', 'decline/' || envelope_id || '/sender'
+        ) OR starts_with(dedupe_key, 'expiry-notice/' || envelope_id || '/')
+          OR starts_with(dedupe_key, 'retention-notice/' || envelope_id || '/')
+      )`,
+      [userId],
+    );
+  }
+
   await database.query(
     `
       DELETE FROM "user"
@@ -654,7 +703,7 @@ async function deleteAccountRows(
     [userId],
   );
 
-  return [...storageKeys];
+  return { queued: [...queued], immediate: [...immediate] };
 }
 
 async function purgeQueuedAccount(
@@ -673,22 +722,35 @@ async function purgeQueuedAccount(
   // that hands in its own connection decides where its transaction ends.
   const storageKeys = isPool(database)
     ? await withTransaction(
-        (tx) => deleteAccountRows(userId, now, keepFinishedEnvelopes, tx),
+        (tx) => deleteAccountRows(userId, now, keepFinishedEnvelopes, tx, env),
         database,
       )
-    : await deleteAccountRows(userId, now, keepFinishedEnvelopes, database);
+    : await deleteAccountRows(
+        userId,
+        now,
+        keepFinishedEnvelopes,
+        database,
+        env,
+      );
 
   if (!storageKeys) {
     return false;
   }
 
-  // Only once the rows are gone for good.
-  await deleteStorageKeys(storageKeys, storageService).catch((error) => {
-    console.error(
-      `Failed to delete storage artifacts for purged account ${userId}:`,
-      error,
-    );
-  });
+  // Only the pool path knows its transaction has committed. A caller
+  // holding a transaction leaves the hosted envelope keys to the next sweep.
+  if (isPool(database)) {
+    for (const key of storageKeys.queued)
+      await deletePendingFile(key, database, storageService);
+  }
+  await deleteStorageKeys(storageKeys.immediate, storageService).catch(
+    (error) => {
+      console.error(
+        `Failed to delete storage artifacts for purged account ${userId}:`,
+        error,
+      );
+    },
+  );
 
   return true;
 }
@@ -742,11 +804,20 @@ type FinishedEnvelopeRow = EnvelopeArtifactRow & {
 async function listFinishedEnvelopesToHandle(
   {
     deleteBefore,
+    policy,
     warnBefore,
     warnedBefore,
-  }: { deleteBefore: number; warnBefore: number; warnedBefore: number },
+  }: {
+    deleteBefore: number;
+    policy: RetentionPolicy | null;
+    warnBefore: number;
+    warnedBefore: number;
+  },
   database: DbExecutor,
 ): Promise<FinishedEnvelopeRow[]> {
+  const warnedAt = policy
+    ? `CASE WHEN e.retention_warning_key = ${retentionNoticeKeySql("$4")} THEN e.retention_warned_at END`
+    : "e.retention_warned_at";
   return queryMany<FinishedEnvelopeRow>(
     database,
     `
@@ -759,7 +830,7 @@ async function listFinishedEnvelopesToHandle(
         e.signed_pdf_key AS "signedPdfKey",
         e.evidence_key AS "evidenceKey",
         e.updated_at AS "updatedAt",
-        e.retention_warned_at AS "retentionWarnedAt",
+        (${warnedAt}) AS "retentionWarnedAt",
         COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt",
         u.email AS "ownerEmail",
         u.name AS "ownerName"
@@ -771,23 +842,60 @@ async function listFinishedEnvelopesToHandle(
         AND NOT e.part11
         AND (
           (
-            e.retention_warned_at IS NULL
+            (${warnedAt}) IS NULL
+            ${
+              policy
+                ? `AND NOT EXISTS (
+              SELECT 1 FROM recovery_jobs r WHERE r.dedupe_key = ${retentionNoticeKeySql("$4")}
+            )`
+                : ""
+            }
             AND COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) < $1
           )
           OR (
-            e.retention_warned_at <= $3
+            (${warnedAt}) <= $3
             AND COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) < $2
           )
         )
       ORDER BY "finishedAt" ASC, e.id ASC
       LIMIT 500
     `,
-    [warnBefore, deleteBefore, warnedBefore],
+    [
+      warnBefore,
+      deleteBefore,
+      warnedBefore,
+      ...(policy ? [policy.generation] : []),
+    ],
   );
 }
 
 function formatDay(timestamp: number): string {
   return new Date(timestamp * 1000).toISOString().slice(0, 10);
+}
+
+function buildRetentionWarning(
+  envelope: Pick<
+    FinishedEnvelopeRow,
+    "id" | "ownerEmail" | "ownerName" | "title"
+  >,
+  deleteOn: number,
+) {
+  const appUrl = resolveAppUrl();
+  const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
+
+  return {
+    subject: emailSubject`"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
+    template: "retention_notice" as const,
+    textBody: [
+      `Hello ${envelope.ownerName},`,
+      "",
+      `Your organization keeps finished documents for a set time. "${envelope.title}" and its audit trail will be deleted on or after ${formatDay(deleteOn)}.`,
+      "",
+      "Download the signed PDF and the certificate now if you need to keep them.",
+      ...(link ? ["", link] : []),
+    ].join("\n"),
+    to: envelope.ownerEmail,
+  };
 }
 
 async function warnBeforeRetentionDeletion(
@@ -797,30 +905,134 @@ async function warnBeforeRetentionDeletion(
   database: DbExecutor,
   emailService: EmailService,
 ) {
-  const appUrl = resolveAppUrl();
-  const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
-
-  await emailService.send(
-    {
-      subject: `"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
-      template: "retention_notice",
-      textBody: [
-        `Hello ${envelope.ownerName},`,
-        "",
-        `Your organization keeps finished documents for a set time. "${envelope.title}" and its audit trail will be deleted on or after ${formatDay(deleteOn)}.`,
-        "",
-        "Download the signed PDF and the certificate now if you need to keep them.",
-        ...(link ? ["", link] : []),
-      ].join("\n"),
-      to: envelope.ownerEmail,
-    },
-    { idempotencyKey: `retention-notice/${envelope.id}` },
-  );
+  await emailService.send(buildRetentionWarning(envelope, deleteOn), {
+    idempotencyKey: `retention-notice/${envelope.id}`,
+  });
 
   await database.query(
     `UPDATE envelopes SET retention_warned_at = $1 WHERE id = $2`,
     [now, envelope.id],
   );
+}
+
+async function enqueueRetentionWarning(
+  envelopeId: string,
+  now: number,
+  database: DbExecutor,
+): Promise<string | undefined> {
+  const enqueue = async (tx: DbExecutor) => {
+    const policy = await readRetentionPolicy(tx, true);
+    if (!policy) return;
+    const current = await queryOne<
+      Pick<
+        FinishedEnvelopeRow,
+        | "id"
+        | "ownerEmail"
+        | "ownerName"
+        | "userId"
+        | "title"
+        | "finishedAt"
+        | "retentionWarnedAt"
+      > & { warningKey: string | null; noticeKey: string }
+    >(
+      tx,
+      `SELECT e.id, e.title, e.user_id AS "userId", u.email AS "ownerEmail", u.name AS "ownerName",
+        COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt",
+        e.retention_warned_at AS "retentionWarnedAt",
+        e.retention_warning_key AS "warningKey", ${retentionNoticeKeySql("$2")} AS "noticeKey"
+      FROM envelopes e JOIN "user" u ON u.id = e.user_id
+      WHERE e.id = $1 AND e.status IN ('completed', 'declined', 'voided') AND NOT e.part11
+      FOR NO KEY UPDATE OF e FOR SHARE OF u`,
+      [envelopeId, policy.generation],
+    );
+    if (!current) return;
+
+    if (
+      (current.retentionWarnedAt !== null &&
+        current.warningKey === current.noticeKey) ||
+      current.finishedAt >=
+        now - (policy.days - RETENTION_WARNING_DAYS) * DAY_IN_SECONDS
+    )
+      return;
+
+    const dedupeKey = current.noticeKey;
+    const existing = await queryOne<{ id: string }>(
+      tx,
+      "SELECT id FROM recovery_jobs WHERE dedupe_key = $1",
+      [dedupeKey],
+    );
+    if (existing) return;
+
+    const deleteOn = Math.max(
+      current.finishedAt + policy.days * DAY_IN_SECONDS,
+      now + RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
+    );
+    const { id } = await enqueueEmail(
+      {
+        message: buildRetentionWarning(current, deleteOn),
+        dedupeKey,
+        envelopeId: current.id,
+        userId: current.userId,
+        acknowledgement: {
+          kind: "retention_warning",
+          policyGeneration: policy.generation,
+          noticeKey: dedupeKey,
+        },
+      },
+      { database: tx },
+    );
+    return id;
+  };
+  return isPool(database)
+    ? withTransaction(enqueue, database)
+    : enqueue(database);
+}
+
+async function deleteUnderRetentionPolicy(
+  envelopeId: string,
+  now: number,
+  database: DbExecutor,
+  storageService: StorageService,
+): Promise<boolean> {
+  const remove = async (tx: DbExecutor) => {
+    const policy = await readRetentionPolicy(tx, true);
+    if (!policy) return null;
+    const current = await queryOne<{
+      finishedAt: number;
+      warnedAt: number;
+    }>(
+      tx,
+      `SELECT retention_warned_at AS "warnedAt",
+          COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt"
+        FROM envelopes e JOIN "user" u ON u.id=e.user_id
+        WHERE e.id = $1 AND status IN ('completed', 'declined', 'voided')
+          AND NOT part11 AND retention_warned_at IS NOT NULL
+          AND retention_warning_key = ${retentionNoticeKeySql("$2")}
+        FOR NO KEY UPDATE OF e FOR SHARE OF u`,
+      [envelopeId, policy.generation],
+    );
+    if (!current) return null;
+    if (
+      current.warnedAt > now - RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS ||
+      current.finishedAt >= now - policy.days * DAY_IN_SECONDS
+    )
+      return null;
+
+    const keys = await listEnvelopeStorageKeys(envelopeId, tx);
+    await queueFileDeletions(envelopeId, keys, now, tx);
+    await tx.query("DELETE FROM envelopes WHERE id = $1", [envelopeId]);
+    return keys;
+  };
+
+  const keys = isPool(database)
+    ? await withTransaction(remove, database)
+    : await remove(database);
+  if (!keys) return false;
+  if (isPool(database)) {
+    for (const key of keys)
+      await deletePendingFile(key, database, storageService);
+  }
+  return true;
 }
 
 /**
@@ -830,10 +1042,12 @@ async function warnBeforeRetentionDeletion(
  */
 async function applyRetentionPeriod(
   retentionDays: number,
+  policy: RetentionPolicy | null,
   now: number,
   database: DbExecutor,
   storageService: StorageService,
   emailService: () => EmailService,
+  injectedEmailService: EmailService | undefined,
   summary: RetentionSweepSummary,
 ) {
   const warnBefore =
@@ -841,29 +1055,42 @@ async function applyRetentionPeriod(
   const candidates = await listFinishedEnvelopesToHandle(
     {
       deleteBefore: now - retentionDays * DAY_IN_SECONDS,
+      policy,
       warnBefore,
       warnedBefore: now - RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
     },
     database,
   );
-  const fieldImagesByEnvelopeId = await listFieldImagesForEnvelopeIds(
-    candidates.map((envelope) => envelope.id),
-    database,
-  );
+  const fieldImagesByEnvelopeId = policy
+    ? null
+    : await listFieldImagesForEnvelopeIds(
+        candidates.map((envelope) => envelope.id),
+        database,
+      );
 
+  const jobs: string[] = [];
   for (const envelope of candidates) {
     const deleteOn = envelope.finishedAt + retentionDays * DAY_IN_SECONDS;
 
     try {
       if (envelope.retentionWarnedAt === null) {
-        await warnBeforeRetentionDeletion(
-          envelope,
-          Math.max(deleteOn, now + RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS),
-          now,
-          database,
-          emailService(),
+        const earliestDeleteOn = Math.max(
+          deleteOn,
+          now + RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
         );
-        summary.finishedEnvelopeWarningsSent += 1;
+        if (policy) {
+          const id = await enqueueRetentionWarning(envelope.id, now, database);
+          if (id) jobs.push(id);
+        } else {
+          await warnBeforeRetentionDeletion(
+            envelope,
+            earliestDeleteOn,
+            now,
+            database,
+            emailService(),
+          );
+          summary.finishedEnvelopeWarningsSent += 1;
+        }
         continue;
       }
 
@@ -875,11 +1102,25 @@ async function applyRetentionPeriod(
         continue;
       }
 
+      if (policy) {
+        if (
+          await deleteUnderRetentionPolicy(
+            envelope.id,
+            now,
+            database,
+            storageService,
+          )
+        ) {
+          summary.finishedEnvelopesDeleted += 1;
+        }
+        continue;
+      }
+
       // Files first: a failure leaves the row, so the next run retries.
       await deleteStorageKeys(
         buildEnvelopeStorageKeys(
           envelope,
-          fieldImagesByEnvelopeId.get(envelope.id) ?? [],
+          fieldImagesByEnvelopeId?.get(envelope.id) ?? [],
         ),
         storageService,
       );
@@ -900,6 +1141,13 @@ async function applyRetentionPeriod(
         error,
       );
     }
+  }
+  if (isPool(database)) {
+    const sent = await tryDeliverWorkflowEmails(jobs, {
+      database,
+      emailService: injectedEmailService,
+    });
+    summary.finishedEnvelopeWarningsSent += sent.size;
   }
 }
 
@@ -989,6 +1237,28 @@ export async function deletePendingFile(
   storageService: StorageService,
 ): Promise<boolean> {
   try {
+    const attempt = parseFinalizationAttemptKey(key);
+    if (attempt) {
+      // The manifest is removed in the same commit that publishes pointers.
+      // A single snapshot sees the active manifest or the published result.
+      // An abandoned lease can never re-acquire its immutable names.
+      const held = await queryOne(
+        database,
+        `SELECT 1 FROM envelopes WHERE id = $1
+          AND (signed_pdf_key = $2 OR evidence_key = $3)
+        UNION ALL
+        SELECT 1 FROM finalization_attempts WHERE lease_token = $4 AND $2 = ANY(storage_keys)
+        LIMIT 1`,
+        [attempt.envelopeId, key, attempt.internalKey, attempt.leaseToken],
+      );
+      if (held) {
+        await database.query(
+          "UPDATE pending_file_deletions SET last_tried_at = $2 WHERE storage_key = $1",
+          [key, getCurrentUnixTimestamp()],
+        );
+        return false;
+      }
+    }
     // Deleting a file that is already gone succeeds.
     await storageService.deleteObject(key);
     await database.query(
@@ -1174,17 +1444,23 @@ export async function runRetentionSweep({
     }
   }
 
-  const retentionDays = (await readStoredSettings(database))?.retentionDays;
+  const durable = isDurableJobsEnabled();
+  const policy = durable ? await readRetentionPolicy(database) : null;
+  const retentionDays = durable
+    ? policy?.days
+    : (await readStoredSettings(database))?.retentionDays;
 
   if (retentionDays) {
     let service = emailService;
 
     await applyRetentionPeriod(
       retentionDays,
+      policy,
       now,
       database,
       storageService,
       () => (service ??= createEmailService()),
+      emailService,
       summary,
     );
   }

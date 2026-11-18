@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { gzipSync } from "node:zlib";
 import { randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
 import { after, before, beforeEach, test } from "node:test";
@@ -15,8 +16,10 @@ import {
   RestoreError,
   runBackup,
 } from "./backup.ts";
-import { openTestDatabase } from "./db/test-database.ts";
+import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import { recordSystemAuditEvent } from "./services/system-audit.ts";
+import { readRetentionPolicy } from "./recovery/retention-policy.ts";
+import { runRetentionSweep } from "./retention.ts";
 import { saveSettings } from "./settings.ts";
 
 // The daily backup and its restore, against a real Postgres and an
@@ -126,7 +129,11 @@ test("a backup restores into an empty database exactly as it was", async () => {
   const userId = await addUser("pat@acme.com");
 
   await saveSettings(
-    { organizationName: "Acme Corp", supportAddress: "help@acme.com" },
+    {
+      organizationName: "Acme Corp",
+      supportAddress: "help@acme.com",
+      retentionDays: 90,
+    },
     database,
   );
   await recordSystemAuditEvent(
@@ -139,6 +146,8 @@ test("a backup restores into an empty database exactly as it was", async () => {
     database,
   );
 
+  const currentPolicy = await readRetentionPolicy(database);
+  assert.ok(currentPolicy);
   const before = await database.query(
     "select * from system_audit_events order by sequence",
   );
@@ -177,6 +186,12 @@ test("a backup restores into an empty database exactly as it was", async () => {
   });
 
   assert.equal(restored.rows.user, 1);
+  assert.deepEqual(await readRetentionPolicy(database), currentPolicy);
+  await saveSettings({ retentionDays: 91 }, database);
+  assert.notEqual(
+    (await readRetentionPolicy(database))?.generation,
+    currentPolicy.generation,
+  );
 
   const after = await database.query(
     "select * from system_audit_events order by sequence",
@@ -451,4 +466,222 @@ test("a file written again at the same size is copied again", async () => {
 
   assert.equal(third.filesCopied, 0);
   assert.equal(third.filesUnchanged, 1);
+});
+
+test("logical restore splits recovery rows within a small byte budget and preserves their bytes", async (t) => {
+  const user = await addUser("backup@example.test");
+  const ids = Array.from({ length: 4 }, () => randomUUID());
+  t.after(() =>
+    database
+      .query("DELETE FROM recovery_jobs WHERE id=ANY($1)", [ids])
+      .then(() => {}),
+  );
+  for (const id of ids)
+    await database.query(
+      "INSERT INTO recovery_jobs(id,kind,dedupe_key,user_id,payload_digest,payload_ciphertext) VALUES($1::uuid,'email',$1::uuid::text,$2,decode('ab','hex'),decode(repeat('cd',800),'hex'))",
+      [id, user],
+    );
+  const cleared = Array.from({ length: 1200 }, () => randomUUID());
+  t.after(() =>
+    database
+      .query("DELETE FROM recovery_jobs WHERE id=ANY($1)", [cleared])
+      .then(() => {}),
+  );
+  await database.query(
+    "INSERT INTO recovery_jobs(id,kind,dedupe_key,user_id,payload_digest,state) SELECT id,'email',id::text,$2,decode('ab','hex'),'succeeded' FROM unnest($1::uuid[]) AS id",
+    [cleared, user],
+  );
+  const target = memoryStore();
+  let cursor = "";
+  const fetches: number[] = [];
+  const observed = afterStatement(
+    database,
+    (sql) => {
+      if (sql.startsWith("DECLARE ") && sql.includes('FROM "recovery_jobs"'))
+        cursor = sql.split(" ")[1];
+      if (cursor && sql.startsWith("FETCH ") && sql.endsWith("FROM " + cursor))
+        fetches.push(Number(sql.split(" ")[1]));
+      return false;
+    },
+    async () => {},
+  );
+  const summary = await runBackup({
+    database: observed,
+    keepDays: 2,
+    source: memoryStore(),
+    target,
+  });
+  assert.ok(
+    fetches.filter((size) => size === 1).length >= ids.length,
+    "live snapshots must use individual fetches",
+  );
+  assert.ok(
+    fetches.length <= 3 + ids.length + 1,
+    "cleared rows must be fetched in batches",
+  );
+  await clearTables();
+  const sizes: number[] = [];
+  const measured = afterStatement(
+    database,
+    (sql, values) => {
+      if (sql.startsWith('INSERT INTO "recovery_jobs"')) {
+        const rows = JSON.parse(String(values[0])) as {
+          payload_ciphertext: string | null;
+        }[];
+        if (rows.some((row) => row.payload_ciphertext !== null))
+          sizes.push(rows.length);
+      }
+      return false;
+    },
+    async () => {},
+  );
+  await restoreDatabase({
+    database: measured,
+    store: target,
+    backupPath: summary.databaseBackup,
+    maxBatchBytes: 2048,
+  });
+  assert.deepEqual(sizes, [1, 1, 1, 1]);
+  assert.equal(
+    (
+      await database.query(
+        "SELECT count(*) FROM recovery_jobs WHERE id=ANY($1) AND state='succeeded' AND payload_ciphertext IS NULL",
+        [cleared],
+      )
+    ).rows[0].count,
+    cleared.length,
+  );
+  assert.deepEqual(
+    (
+      await database.query(
+        "SELECT id FROM recovery_jobs WHERE id=ANY($1) AND payload_ciphertext=decode(repeat('cd',800),'hex') ORDER BY id",
+        [ids],
+      )
+    ).rows.map((row) => row.id),
+    ids.sort(),
+  );
+});
+
+test("a pre-UUID backup with historical grace and a fresh sequence requires a new notice", async (t) => {
+  const target = memoryStore();
+  const user = randomUUID(),
+    envelope = randomUUID(),
+    tombstone = randomUUID();
+  const now = Math.floor(Date.now() / 1000);
+  // A retired policy 2 survives only on the envelope and in its cleared job.
+  const entries = [
+    {
+      format: "signudoc-backup",
+      version: 1,
+      createdAt: new Date().toISOString(),
+      migrations: [],
+      tables: ["user", "app_settings", "envelopes", "recovery_jobs"],
+    },
+    {
+      table: "user",
+      row: { id: user, name: "Restore keeper", email: user + "@example.test" },
+    },
+    {
+      table: "app_settings",
+      row: {
+        id: true,
+        created_at: now,
+        updated_at: now,
+        retention_days: 120,
+        retention_policy_generation: 3,
+      },
+    },
+    {
+      table: "envelopes",
+      row: {
+        id: envelope,
+        user_id: user,
+        title: "Restored",
+        status: "completed",
+        completed_at: now - 150 * 86400,
+        source_pdf_key: "synthetic.pdf",
+        source_pdf_filename: "file.pdf",
+        source_pdf_hash: "a".repeat(64),
+        source_pdf_size_bytes: 1,
+        page_count: 1,
+        retention_warned_at: now - 40 * 86400,
+        retention_warning_policy_generation: 2,
+      },
+    },
+    {
+      table: "recovery_jobs",
+      row: {
+        id: tombstone,
+        kind: "email",
+        dedupe_key: "retention-notice/" + envelope + "/2",
+        envelope_id: envelope,
+        user_id: user,
+        state: "succeeded",
+        payload_digest: "\\x00",
+      },
+    },
+  ];
+  await target.put(
+    "legacy",
+    gzipSync(entries.map((entry) => JSON.stringify(entry)).join("\n") + "\n"),
+    { contentType: "application/gzip" },
+  );
+  await database.query(
+    "SELECT setval('retention_policy_generation_seq',1,false)",
+  );
+  await restoreDatabase({ database, store: target, backupPath: "legacy" });
+  await database.query(
+    "SELECT setval('retention_policy_generation_seq',2,false)",
+  );
+  // Direct update matches any writer, without an upsert consuming a sequence value.
+  await database.query("UPDATE app_settings SET retention_days=90 WHERE id");
+  const previous = { ...process.env };
+  Object.assign(process.env, {
+    DURABLE_JOBS_ENABLED: "true",
+    BETTER_AUTH_SECRET: "fixture-secret-for-durable-workflow",
+    CRON_SECRET: "test-cron",
+    APP_URL: "https://example.test",
+    EMAIL_DRIVER: "capture",
+    STORAGE_DRIVER: "local",
+  });
+  t.after(() => {
+    for (const key of [
+      "DURABLE_JOBS_ENABLED",
+      "BETTER_AUTH_SECRET",
+      "CRON_SECRET",
+      "APP_URL",
+      "EMAIL_DRIVER",
+      "STORAGE_DRIVER",
+    ]) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  });
+  globalThis.__signudocPgPool = database;
+  const sent: string[] = [];
+  const sweep = (time: number) =>
+    runRetentionSweep({
+      database,
+      now: time,
+      emailService: {
+        async send(message) {
+          sent.push(message.to);
+          return {
+            accepted: [message.to],
+            rejected: [],
+            messageId: "restored",
+          };
+        },
+        async sendBatch() {
+          throw new Error("unexpected");
+        },
+      },
+    });
+  assert.equal((await sweep(now)).finishedEnvelopesDeleted, 0);
+  assert.deepEqual(sent, [user + "@example.test"]);
+  assert.equal((await sweep(now + 29 * 86400)).finishedEnvelopesDeleted, 0);
+  assert.equal((await sweep(now + 31 * 86400)).finishedEnvelopesDeleted, 1);
+  const prior = (await readRetentionPolicy(database))!.generation;
+  await database.query("UPDATE app_settings SET retention_days=91");
+  assert.notEqual((await readRetentionPolicy(database))!.generation, prior);
 });
