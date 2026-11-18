@@ -1,10 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { Resend } from "resend";
 
-import { getSettings } from "../settings.ts";
+import { type DbExecutor } from "../db/connection.ts";
+import {
+  getSettings,
+  readStoredSettings,
+  resolveSettings,
+} from "../settings.ts";
 import { type EmailTemplateKind } from "../types/domain.ts";
 import { getEnv, isLocalDeployment, type EnvSource } from "../utils/env.ts";
 import { buildEmailAddresses, type EmailAddresses } from "./email-addresses.ts";
@@ -63,7 +68,11 @@ export type EmailDeliveryResult = {
 };
 
 export type EmailSendOptions = {
+  /** Frozen addresses supplied by a durable job. */
+  addresses?: EmailAddresses;
   idempotencyKey?: string;
+  /** Cancels the provider request. An aborted request may already be accepted. */
+  signal?: AbortSignal;
 };
 
 type CreateEmailServiceOptions = {
@@ -138,11 +147,10 @@ function getResendErrorMessage(error: unknown): string {
 }
 
 function buildResendOptions(options?: EmailSendOptions) {
-  return options?.idempotencyKey
-    ? {
-        idempotencyKey: options.idempotencyKey,
-      }
-    : undefined;
+  return {
+    idempotencyKey: options?.idempotencyKey,
+    signal: options?.signal,
+  };
 }
 
 function buildResendPayload(
@@ -226,56 +234,90 @@ function createCaptureEmailService(
 
   async function capture(
     message: TransactionalEmailMessage,
+    options?: EmailSendOptions,
   ): Promise<EmailDeliveryResult> {
-    const config = await resolveAddresses();
-    const messageId = `capture-${randomUUID()}`;
+    options?.signal?.throwIfAborted();
+    const config = options?.addresses ?? (await resolveAddresses());
+    const stableId = options?.idempotencyKey
+      ? createHash("sha256").update(options.idempotencyKey).digest("hex")
+      : null;
+    const messageId = `capture-${stableId ?? randomUUID()}`;
     const filePath = path.join(
       /*turbopackIgnore: true*/ captureDir,
-      `${String(Date.now())}-${messageId}.json`,
+      stableId
+        ? `${messageId}.json`
+        : `${String(Date.now())}-${messageId}.json`,
     );
-
-    const temporaryPath = `${filePath}.tmp`;
-
-    // Written under a temporary name and renamed, so anything watching the
-    // outbox never reads a half-written file.
-    await mkdir(captureDir, { recursive: true });
-    await writeFile(
-      temporaryPath,
-      JSON.stringify(
-        {
-          ...buildResendPayload({ ...message, attachments: undefined }, config),
-          // The files themselves are not written out; their names, sizes
-          // and fingerprints are enough to check what would have been sent.
-          attachments: message.attachments?.map((attachment) => ({
+    const temporaryPath = `${filePath}.${randomUUID()}.tmp`;
+    const payload = {
+      ...buildResendPayload({ ...message, attachments: undefined }, config),
+      // Fingerprints describe what would be sent without keeping another PDF.
+      attachments: message.attachments?.length
+        ? message.attachments.map((attachment) => ({
             bytes: attachment.content.byteLength,
             contentType: attachment.contentType,
             filename: attachment.filename,
             sha256: createHash("sha256")
               .update(attachment.content)
               .digest("hex"),
-          })),
-          capturedAt: new Date().toISOString(),
-          messageId,
-          template: message.template,
-        },
-        null,
-        2,
-      ),
-    );
-    await rename(temporaryPath, filePath);
-    console.info(
-      `[email:capture] ${message.template} to ${message.to} -> ${filePath}`,
-    );
-
-    return {
-      accepted: [message.to],
-      messageId,
-      rejected: [],
+          }))
+        : undefined,
+      template: message.template,
     };
+    const payloadDigest = createHash("sha256")
+      .update(JSON.stringify(payload))
+      .digest("hex");
+    const delivery = { accepted: [message.to], messageId, rejected: [] };
+
+    // Publish the whole message atomically. A keyed delivery uses a hard
+    // link so concurrent processes cannot replace the winning snapshot.
+    await mkdir(captureDir, { recursive: true });
+    try {
+      await writeFile(
+        temporaryPath,
+        JSON.stringify(
+          {
+            ...payload,
+            capturedAt: new Date().toISOString(),
+            messageId,
+            payloadDigest,
+          },
+          null,
+          2,
+        ),
+        { mode: 0o600 },
+      );
+      if (stableId) {
+        try {
+          await link(temporaryPath, filePath);
+        } catch (error) {
+          if (!(
+            error &&
+            typeof error === "object" &&
+            "code" in error &&
+            error.code === "EEXIST"
+          ))
+            throw error;
+          const existing = JSON.parse(await readFile(filePath, "utf8"));
+          if (existing.payloadDigest !== payloadDigest) {
+            throw new Error(
+              "Email capture idempotency key conflicts with a different payload.",
+            );
+          }
+          return delivery;
+        }
+      } else {
+        await rename(temporaryPath, filePath);
+      }
+      console.info(`[email:capture] ${message.template} -> ${messageId}`);
+      return delivery;
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
   }
 
   return {
-    send: (message) => capture(message),
+    send: capture,
     async sendBatch(messages) {
       const results: EmailDeliveryResult[] = [];
 
@@ -291,8 +333,11 @@ function createCaptureEmailService(
 /** The addresses this install sends from, as configured right now. */
 export async function resolveEmailAddresses(
   env: EnvSource = process.env,
+  database?: DbExecutor,
 ): Promise<EmailAddresses> {
-  const settings = await getSettings(env);
+  const settings = database
+    ? resolveSettings(await readStoredSettings(database), env)
+    : await getSettings(env);
 
   return resolveEmailDriver(env) === "capture"
     ? buildEmailAddresses(settings, DEFAULT_CAPTURE_SENDER_ADDRESS)
@@ -332,15 +377,16 @@ export function createEmailService({
 
   return {
     async send(message, options) {
-      const config = await resolveAddresses();
-      const { data, error } = await sendWithinRateLimit(
-        () =>
-          client.emails.send(
-            buildResendPayload(message, config),
-            buildResendOptions(options),
-          ),
-        wait,
-      );
+      const config = options?.addresses ?? (await resolveAddresses());
+      const send = () =>
+        client.emails.send(
+          buildResendPayload(message, config),
+          buildResendOptions(options),
+        );
+      // The durable worker owns the retry schedule when it supplies a signal.
+      const { data, error } = options?.signal
+        ? await send()
+        : await sendWithinRateLimit(send, wait);
 
       if (error) {
         throw new Error(getResendErrorMessage(error));
