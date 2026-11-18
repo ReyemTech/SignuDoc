@@ -52,6 +52,8 @@ jobs:
             echo "CHART_ARCHIVE=$archive"
           } >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          version: v0.37.2
       - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ghcr.io
@@ -67,8 +69,14 @@ jobs:
           check_tag() {
             local name=$1 ref=$2 result
             if result=$(docker buildx imagetools inspect "$ref" --raw 2>&1); then
+              if ! jq -e '.schemaVersion == 2 and
+                ((.manifests | type == "array") or ((.config | type == "object") and (.layers | type == "array")))' <<< "$result" >/dev/null; then
+                printf 'Invalid manifest for %s\n' "$ref" >&2
+                return 1
+              fi
               echo "$name=true" >> "$GITHUB_OUTPUT"
-            elif [[ $result == *'not found'* || $result == *'manifest unknown'* || $result == *'name unknown'* || $result == *'denied: denied'* ]]; then
+            elif [[ $result == "ERROR: $ref: not found" ]]; then
+              # Buildx renders the manifest endpoint's HTTP 404 in this form.
               echo "$name=false" >> "$GITHUB_OUTPUT"
             else
               printf 'Could not check %s: %s\n' "$ref" "$result" >&2
@@ -78,12 +86,11 @@ jobs:
           chart_ref="${CHART_REGISTRY#oci://}/signudoc:$CHART_VERSION"
           check_tag chart "$chart_ref"
           if grep -qx 'chart=true' "$GITHUB_OUTPUT"; then
-            # Fail before pushing any images if this chart version points elsewhere.
+            # Fail before pushing any images if this chart version has different content.
             existing=$(mktemp -d)
+            trap 'rm -rf -- "$existing"' EXIT
             helm pull "$CHART_REGISTRY/signudoc" --version "$CHART_VERSION" --destination "$existing"
-            helm show values "$CHART_ARCHIVE" > "$existing/expected-values.yaml"
-            helm show values "$existing/signudoc-$CHART_VERSION.tgz" > "$existing/published-values.yaml"
-            diff -u "$existing/expected-values.yaml" "$existing/published-values.yaml"
+            python3 deploy/reyemtech/compare-chart-archives.py "$CHART_ARCHIVE" "$existing/signudoc-$CHART_VERSION.tgz"
           fi
           check_tag app "$APP_IMAGE:$COMMIT"
           check_tag migration "$MIGRATION_IMAGE:$COMMIT"
@@ -132,9 +139,11 @@ jobs:
       - name: Verify the published OCI chart
         run: |
           verified=$(mktemp -d)
+          trap 'rm -rf -- "$verified"' EXIT
           chart_ref="$CHART_REGISTRY/signudoc"
           helm pull "$chart_ref" --version "$CHART_VERSION" --destination "$verified"
           pulled="$verified/signudoc-$CHART_VERSION.tgz"
+          python3 deploy/reyemtech/compare-chart-archives.py "$CHART_ARCHIVE" "$pulled"
           helm show values "$pulled" | yq -o=json '.' |
             jq -e --arg app "$APP_IMAGE" --arg migration "$MIGRATION_IMAGE" --arg commit "$COMMIT" \
               '.image.repository == $app and .migration.image.repository == $migration and .image.tag == $commit and .migration.image.tag == $commit'
