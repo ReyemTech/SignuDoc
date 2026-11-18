@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
+
+import { Pool } from "pg";
 import { after, before, test } from "node:test";
 
 import { openTestDatabase } from "../db/test-database.ts";
@@ -298,4 +302,249 @@ test("link expiry clears a pending payload even while retry backoff is in effect
     [id],
   );
   assert.deepEqual(cleared.rows, [{ state: "cancelled", cleared: true }]);
+});
+
+async function waitForBlockedQuery(filter: string, pid?: number) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const blocked = await database.query(
+      `SELECT 1 FROM pg_stat_activity
+        WHERE datname = current_database() AND wait_event_type = 'Lock'
+          AND query LIKE $1 AND ($2::int IS NULL OR pid = $2)`,
+      [`%${filter}%`, pid ?? null],
+    );
+    if (blocked.rowCount) return;
+    await delay(5);
+  }
+  assert.fail("The recovery statement never waited on the fixture lock.");
+}
+
+for (const [name, mutate] of [
+  ["renewal", renewRecoveryLease],
+  ["cancellation", cancelRecoveryJob],
+] as const) {
+  test(`a blocked ${name} rechecks the fence after the lock releases`, async () => {
+    const { id } = await enqueue();
+    const owner = await claim(id);
+    assert.ok(owner);
+    const blocker = await database.connect();
+    const writer = await database.connect();
+    let pending: Promise<boolean> | undefined;
+    try {
+      const {
+        rows: [{ pid }],
+      } = await writer.query("SELECT pg_backend_pid() AS pid");
+      await database.query(
+        "UPDATE recovery_jobs SET lease_expires_at = clock_timestamp() + interval '800 milliseconds' WHERE id = $1",
+        [id],
+      );
+      await blocker.query("BEGIN");
+      await blocker.query(
+        "SELECT id FROM recovery_jobs WHERE id = $1 FOR UPDATE",
+        [id],
+      );
+      pending = mutate(owner, { database: writer });
+      await waitForBlockedQuery("recovery_jobs", pid);
+      await blocker.query(
+        `SELECT pg_sleep(GREATEST(0, extract(epoch FROM lease_expires_at - clock_timestamp())) + 0.04)
+          FROM recovery_jobs WHERE id = $1`,
+        [id],
+      );
+      await blocker.query("ROLLBACK");
+      assert.equal(await pending, false);
+      const retained = await database.query(
+        "SELECT state, lease_token, payload_ciphertext IS NOT NULL AS retained FROM recovery_jobs WHERE id = $1",
+        [id],
+      );
+      assert.deepEqual(retained.rows, [
+        { state: "running", lease_token: owner.leaseToken, retained: true },
+      ]);
+      const replacement = await claim(id);
+      assert.ok(replacement);
+      assert.notEqual(replacement.leaseToken, owner.leaseToken);
+    } finally {
+      await blocker.query("ROLLBACK");
+      await pending?.catch(() => undefined);
+      blocker.release();
+      writer.release();
+    }
+  });
+}
+
+test("a quarantined credential is cleared when it expires and keeps its dedupe tombstone", async () => {
+  const {
+    rows: [{ expiresAt }],
+  } = await database.query(
+    'SELECT floor(extract(epoch FROM clock_timestamp()))::bigint + 2 AS "expiresAt"',
+  );
+  const credential = { ...input(), expiresAt };
+  const { id } = await enqueue(credential);
+  const owner = await claim(id);
+  assert.ok(owner);
+  assert.equal(
+    await failRecoveryJob(owner, {
+      database,
+      code: "payload_invalid",
+      permanent: true,
+    }),
+    true,
+  );
+  assert.equal(await claim(id), null);
+  const state = () =>
+    database.query(
+      "SELECT state, payload_ciphertext IS NULL AS cleared, last_error_code FROM recovery_jobs WHERE id = $1",
+      [id],
+    );
+  assert.deepEqual((await state()).rows, [
+    {
+      state: "needs_attention",
+      cleared: false,
+      last_error_code: "payload_invalid",
+    },
+  ]);
+  await database.query(
+    "SELECT pg_sleep(GREATEST(0, $1 - extract(epoch FROM clock_timestamp())) + 0.04)",
+    [expiresAt],
+  );
+  assert.equal(await claim(id), null);
+  assert.deepEqual((await state()).rows, [
+    { state: "cancelled", cleared: true, last_error_code: "expired" },
+  ]);
+  assert.deepEqual(await enqueue(credential), { id, created: false });
+});
+
+async function finishWithinTestWindow<T>(run: Promise<T>): Promise<T> {
+  return Promise.race([
+    run,
+    once(AbortSignal.timeout(1100), "abort").then(() =>
+      assert.fail(
+        "Recovery ran after its deadline while the DB lock was held.",
+      ),
+    ),
+  ]);
+}
+
+test("the worker deadline cancels a claim blocked by a table lock", async () => {
+  const { id } = await enqueue();
+  const blocker = await database.connect();
+  let run: ReturnType<typeof runRecoveryJobs> | undefined;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query("LOCK TABLE recovery_jobs IN ACCESS EXCLUSIVE MODE");
+    run = runRecoveryJobs({
+      database,
+      env,
+      jobId: id,
+      maxDurationMs: 300,
+      handlers: {
+        email: async () => assert.fail("a blocked claim reached its handler"),
+      },
+    });
+    await waitForBlockedQuery("discarded AS");
+    assert.deepEqual(await finishWithinTestWindow(run), {
+      enabled: true,
+      processed: 0,
+      failed: 0,
+      budgetExhausted: true,
+    });
+  } finally {
+    await blocker.query("ROLLBACK");
+    await run?.catch(() => undefined);
+    blocker.release();
+  }
+  const pending = await database.query(
+    "SELECT state, attempts FROM recovery_jobs WHERE id = $1",
+    [id],
+  );
+  assert.deepEqual(pending.rows, [{ state: "pending", attempts: 0 }]);
+});
+
+test("the worker deadline bounds blocked failure recording and heartbeat cleanup", async (t) => {
+  t.mock.timers.enable({ apis: ["setInterval"] });
+  const { id } = await enqueue();
+  const blocker = await database.connect();
+  let run: ReturnType<typeof runRecoveryJobs> | undefined;
+  let allowFailure: () => void = () => {};
+  const handlerEntered = Promise.withResolvers();
+  try {
+    await blocker.query("BEGIN");
+    const canFail = new Promise<void>((resolve) => {
+      allowFailure = resolve;
+    });
+    run = runRecoveryJobs({
+      database,
+      env,
+      jobId: id,
+      maxDurationMs: 600,
+      handlers: {
+        email: async () => {
+          await blocker.query(
+            "SELECT id FROM recovery_jobs WHERE id = $1 FOR UPDATE",
+            [id],
+          );
+          handlerEntered.resolve(undefined);
+          await canFail;
+          throw new Error("synthetic handler failure");
+        },
+      },
+    });
+    await handlerEntered.promise;
+    const lease = () =>
+      database.query(
+        "SELECT state, lease_expires_at, last_error_code FROM recovery_jobs WHERE id = $1",
+        [id],
+      );
+    const before = (await lease()).rows;
+    t.mock.timers.tick(30_000);
+    await waitForBlockedQuery("lease_expires_at = clock_timestamp()");
+    allowFailure();
+    await waitForBlockedQuery("next_state");
+    assert.deepEqual(await finishWithinTestWindow(run), {
+      enabled: true,
+      processed: 1,
+      failed: 0,
+      budgetExhausted: true,
+    });
+    assert.deepEqual((await lease()).rows, before);
+    await blocker.query("ROLLBACK");
+    assert.deepEqual((await lease()).rows, before);
+  } finally {
+    allowFailure();
+    await blocker.query("ROLLBACK");
+    await run?.catch(() => undefined);
+    blocker.release();
+  }
+});
+
+test("a worker that times out waiting for a pool checkout never claims later", async () => {
+  const { id } = await enqueue();
+  const limited = new Pool({ ...database.options, max: 1 });
+  const occupied = await limited.connect();
+  let run: ReturnType<typeof runRecoveryJobs> | undefined;
+  try {
+    run = runRecoveryJobs({
+      database: limited,
+      env,
+      jobId: id,
+      maxDurationMs: 120,
+      handlers: {
+        email: async () =>
+          assert.fail("pool checkout after deadline reached a handler"),
+      },
+    });
+    assert.deepEqual(await finishWithinTestWindow(run), {
+      enabled: true,
+      processed: 0,
+      failed: 0,
+      budgetExhausted: true,
+    });
+  } finally {
+    occupied.release();
+    await run?.catch(() => undefined);
+    await limited.end();
+  }
+  const pending = await database.query(
+    "SELECT state, attempts FROM recovery_jobs WHERE id = $1",
+    [id],
+  );
+  assert.deepEqual(pending.rows, [{ state: "pending", attempts: 0 }]);
 });

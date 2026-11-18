@@ -10,7 +10,11 @@ import { Resend } from "resend";
 import { type DbPool, withTransaction } from "../db/connection.ts";
 import { openTestDatabase } from "../db/test-database.ts";
 import { verifyAuditChain } from "../services/audit.ts";
-import { createEmailService, type EmailService } from "../services/email.ts";
+import {
+  createEmailService,
+  type EmailService,
+  type TransactionalEmailMessage,
+} from "../services/email.ts";
 import { enqueueEmail } from "./email.ts";
 import { enqueueRecoveryJob } from "./jobs.ts";
 import { runRecoveryJobs } from "./worker.ts";
@@ -392,7 +396,7 @@ test(
 );
 
 test(
-  "the worker budget aborts an outstanding provider request and records an unknown outcome",
+  "the worker budget aborts an outstanding provider request and leaves it reclaimable",
   { timeout: 5000 },
   async () => {
     let requestArrived = false;
@@ -425,13 +429,18 @@ test(
         jobId: id,
         maxDurationMs: 600,
       });
-      assert.deepEqual(result, { enabled: true, processed: 1, failed: 1 });
+      assert.deepEqual(result, {
+        enabled: true,
+        processed: 1,
+        failed: 0,
+        budgetExhausted: true,
+      });
       const recorded = await database.query(
         "SELECT state, last_error_code FROM recovery_jobs WHERE id = $1",
         [id],
       );
       assert.deepEqual(recorded.rows, [
-        { state: "pending", last_error_code: "provider_outcome_unknown" },
+        { state: "running", last_error_code: null },
       ]);
       assert.equal(requestArrived, true);
       assert.equal(disconnected, true);
@@ -488,4 +497,98 @@ test("a corrupt attachment snapshot cannot reach the provider", async () => {
   assert.deepEqual(recorded.rows, [
     { state: "needs_attention", last_error_code: "payload_invalid" },
   ]);
+});
+
+test("the deadline stops a blocked acknowledgement and a replacement reuses the accepted provider key", async () => {
+  const { id } = await enqueueEmail(
+    {
+      message,
+      dedupeKey: dedupeKey(),
+      userId,
+      envelopeId,
+      acknowledgement: { kind: "email_audit" },
+    },
+    { database, env, addresses },
+  );
+  const blocker = await database.connect();
+  const auditCount = async () =>
+    (
+      await database.query(
+        "SELECT id FROM audit_events WHERE envelope_id = $1 AND event = 'email_sent'",
+        [envelopeId],
+      )
+    ).rowCount;
+  const before = await auditCount();
+  const requests: { message: TransactionalEmailMessage; key?: string }[] = [];
+  const provider = "fixture-delivery-id";
+  let run: ReturnType<typeof runRecoveryJobs> | undefined;
+  try {
+    await blocker.query("BEGIN");
+    await blocker.query(
+      "SELECT id FROM envelopes WHERE id = $1 FOR NO KEY UPDATE",
+      [envelopeId],
+    );
+    run = runRecoveryJobs({
+      database,
+      env,
+      jobId: id,
+      maxDurationMs: 300,
+      emailService: {
+        ...sendNever,
+        async send(frozen, options) {
+          requests.push({ message: frozen, key: options?.idempotencyKey });
+          return { accepted: [message.to], rejected: [], messageId: provider };
+        },
+      },
+    });
+    const stopped = await Promise.race([
+      run,
+      once(AbortSignal.timeout(1100), "abort").then(() =>
+        assert.fail(
+          "Worker remained blocked after its acknowledgement budget.",
+        ),
+      ),
+    ]);
+    assert.deepEqual(stopped, {
+      enabled: true,
+      processed: 1,
+      failed: 0,
+      budgetExhausted: true,
+    });
+    assert.equal(requests.length, 1);
+    assert.equal(await auditCount(), before);
+    assert.deepEqual(
+      (
+        await database.query("SELECT state FROM recovery_jobs WHERE id = $1", [
+          id,
+        ])
+      ).rows,
+      [{ state: "running" }],
+    );
+    await blocker.query("ROLLBACK");
+    assert.equal(await auditCount(), before);
+    await database.query(
+      "UPDATE recovery_jobs SET lease_expires_at = clock_timestamp() - interval '1 second' WHERE id = $1",
+      [id],
+    );
+    await runRecoveryJobs({
+      database,
+      env,
+      jobId: id,
+      emailService: {
+        ...sendNever,
+        async send(frozen, options) {
+          requests.push({ message: frozen, key: options?.idempotencyKey });
+          return { accepted: [message.to], rejected: [], messageId: provider };
+        },
+      },
+    });
+    assert.equal(requests.length, 2);
+    assert.deepEqual(requests[1], requests[0]);
+    assert.equal(await auditCount(), (before ?? 0) + 1);
+  } finally {
+    await blocker.query("ROLLBACK");
+    await run?.catch(() => undefined);
+    blocker.release();
+  }
 });

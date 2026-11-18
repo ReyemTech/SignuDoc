@@ -12,6 +12,10 @@ import {
   type ClaimedRecoveryJob,
   type RecoveryJobKind,
 } from "./jobs.ts";
+import {
+  createBoundedRecoveryDatabase,
+  createRecoveryBudget,
+} from "./worker-database.ts";
 
 export type RecoveryHandler = (
   job: ClaimedRecoveryJob,
@@ -24,6 +28,8 @@ export type RecoveryRunSummary = {
   processed: number;
   /** Handlers that threw and had a fenced failure recorded. */
   failed: number;
+  /** Work still leased at cutoff can be reclaimed after its lease expires. */
+  budgetExhausted: boolean;
 };
 
 type RecoveryRunOptions = {
@@ -48,7 +54,7 @@ async function runClaim(
   const lease = new AbortController();
   let heartbeat: Promise<void> | null = null;
   const interval = setInterval(() => {
-    if (heartbeat || lease.signal.aborted) return;
+    if (heartbeat || lease.signal.aborted || signal.aborted) return;
     heartbeat = renewRecoveryLease(job, { database })
       .then(
         (renewed) => {
@@ -61,6 +67,8 @@ async function runClaim(
       });
   }, RECOVERY_HEARTBEAT_MS);
   interval.unref();
+  const stopHeartbeat = () => clearInterval(interval);
+  signal.addEventListener("abort", stopHeartbeat, { once: true });
 
   try {
     const active = AbortSignal.any([signal, lease.signal]);
@@ -68,6 +76,7 @@ async function runClaim(
     await handler(job, { database, env, signal: active });
     return false;
   } catch (error) {
+    if (signal.aborted) return false;
     // The handler may have reached the provider before failing. Only the
     // fenced state and sanitized classification belong in diagnostics.
     return await failRecoveryJob(job, {
@@ -76,7 +85,8 @@ async function runClaim(
       permanent: error instanceof RecoveryJobError && error.permanent,
     });
   } finally {
-    clearInterval(interval);
+    stopHeartbeat();
+    signal.removeEventListener("abort", stopHeartbeat);
     await heartbeat;
   }
 }
@@ -91,7 +101,7 @@ export async function runRecoveryJobs({
   emailService,
 }: RecoveryRunOptions = {}): Promise<RecoveryRunSummary> {
   const enabled = isDurableJobsEnabled(env);
-  const summary = { enabled, processed: 0, failed: 0 };
+  const summary = { enabled, processed: 0, failed: 0, budgetExhausted: false };
   if (!enabled) return summary;
   assertRecoveryConfigured(env);
   if (
@@ -105,7 +115,6 @@ export async function runRecoveryJobs({
   }
   if (limit === 0) return summary;
 
-  const db = database ?? getDb();
   const available = {
     email:
       handlers?.email ??
@@ -115,21 +124,30 @@ export async function runRecoveryJobs({
   const kinds: RecoveryJobKind[] = available.finalize_envelope
     ? ["email", "finalize_envelope"]
     : ["email"];
-  const started = performance.now();
-  const signal = AbortSignal.timeout(maxDurationMs);
-
-  while (
-    summary.processed < limit &&
-    !signal.aborted &&
-    performance.now() - started < maxDurationMs
-  ) {
-    const job = await claimRecoveryJob({ database: db, env, jobId, kinds });
-    if (!job) break;
-    const handler = available[job.kind];
-    if (!handler) break;
-    summary.processed += 1;
-    if (await runClaim(job, handler, { database: db, env, signal }))
-      summary.failed += 1;
+  const budget = createRecoveryBudget(maxDurationMs);
+  try {
+    const db = createBoundedRecoveryDatabase(database ?? getDb(), budget);
+    while (summary.processed < limit && !budget.expired()) {
+      const job = await claimRecoveryJob({ database: db, env, jobId, kinds });
+      if (!job || budget.expired()) break;
+      const handler = available[job.kind];
+      if (!handler) break;
+      summary.processed += 1;
+      if (
+        await runClaim(job, handler, {
+          database: db,
+          env,
+          signal: budget.signal,
+        })
+      ) {
+        summary.failed += 1;
+      }
+    }
+  } catch (error) {
+    if (!budget.expired()) throw error;
+  } finally {
+    summary.budgetExhausted = budget.expired();
+    budget.dispose();
   }
   return summary;
 }

@@ -280,7 +280,10 @@ export async function claimRecoveryJob({
           ELSE 'attempts_exhausted'
         END AS reason
         FROM recovery_jobs
-        WHERE ${CLAIM_SCOPE} AND (state = 'pending' OR (${RECLAIMABLE})) AND (${SHOULD_REAP})
+        WHERE ${CLAIM_SCOPE} AND (
+          (state = 'needs_attention' AND ${EXPIRED_AT_CLAIM})
+          OR ((state = 'pending' OR (${RECLAIMABLE})) AND (${SHOULD_REAP}))
+        )
         ORDER BY available_at, id
         LIMIT $5
         FOR UPDATE SKIP LOCKED
@@ -341,14 +344,30 @@ const FENCE = `
   id = $1 AND state = 'running' AND lease_token = $2 AND lease_expires_at > clock_timestamp()
 `;
 
+// PostgreSQL may evaluate predicates before waiting on a row locked by
+// another transaction. Judge lease time from the locked tuple, after any
+// wait, so a live lease at statement start cannot revive after expiring.
+const LOCK_JOB = `
+  WITH locked AS MATERIALIZED (
+    SELECT id, state, lease_token, lease_expires_at, expires_at, kind, first_attempt_at, attempts
+    FROM recovery_jobs
+    WHERE id = $1 AND state = 'running' AND lease_token = $2
+    FOR UPDATE
+  )
+`;
+const LOCK_FENCE = `
+  ${LOCK_JOB}, owned AS (SELECT id FROM locked WHERE ${FENCE})
+`;
+
 export async function renewRecoveryLease(
   job: JobFence,
   { database }: { database: DbExecutor },
 ): Promise<boolean> {
   const result = await database.query(
-    `UPDATE recovery_jobs
+    `${LOCK_FENCE}
+      UPDATE recovery_jobs AS job
       SET lease_expires_at = clock_timestamp() + $3::int * interval '1 second', updated_at = clock_timestamp()
-      WHERE ${FENCE}`,
+      FROM owned WHERE job.id = owned.id`,
     [job.id, job.leaseToken, RECOVERY_LEASE_SECONDS],
   );
   return result.rowCount === 1;
@@ -378,7 +397,7 @@ export async function completeRecoveryJob(
       }
 
       const owner = await tx.query(
-        `SELECT id FROM recovery_jobs WHERE ${FENCE} FOR UPDATE`,
+        `${LOCK_FENCE} SELECT id FROM owned`,
         values,
       );
       if (owner.rowCount !== 1) return false;
@@ -405,11 +424,12 @@ export async function cancelRecoveryJob(
   { database, code = "cancelled" }: { database: DbExecutor; code?: string },
 ): Promise<boolean> {
   const result = await database.query(
-    `UPDATE recovery_jobs
+    `${LOCK_FENCE}
+      UPDATE recovery_jobs AS job
       SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
         payload_ciphertext = NULL, last_error_code = $3,
         updated_at = clock_timestamp(), completed_at = clock_timestamp()
-      WHERE ${FENCE}`,
+      FROM owned WHERE job.id = owned.id`,
     [job.id, job.leaseToken, safeCode(code)],
   );
   return result.rowCount === 1;
@@ -424,7 +444,7 @@ export async function failRecoveryJob(
   }: { database: DbExecutor; code: string; permanent?: boolean },
 ): Promise<boolean> {
   const result = await database.query(
-    `WITH failed AS (
+    `${LOCK_JOB}, failed AS (
         SELECT id, CASE
           WHEN ${EXPIRED} THEN 'cancelled'
           WHEN $5 OR attempts >= $6 OR
@@ -432,8 +452,7 @@ export async function failRecoveryJob(
             THEN 'needs_attention'
           ELSE 'pending'
         END AS next_state
-        FROM recovery_jobs WHERE ${FENCE}
-        FOR UPDATE
+        FROM locked WHERE ${FENCE}
       )
       UPDATE recovery_jobs AS job
       SET state = next_state, lease_token = NULL, lease_expires_at = NULL,
