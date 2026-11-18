@@ -95,6 +95,8 @@ type EnqueueRecoveryJobInput = {
   envelopeId?: string;
   userId?: string;
   expiresAt?: number;
+  /** Mutable effective expiry for a signing credential. */
+  signingExpiresAt?: number;
 };
 
 type JobOptions = {
@@ -176,8 +178,11 @@ export async function enqueueRecoveryJob(
     throw new Error("Invalid recovery job dedupe key.");
   }
   if (
-    input.expiresAt !== undefined &&
-    (!Number.isSafeInteger(input.expiresAt) || input.expiresAt < 0)
+    [input.expiresAt, input.signingExpiresAt].some(
+      (expiresAt) =>
+        expiresAt !== undefined &&
+        (!Number.isSafeInteger(expiresAt) || expiresAt < 0),
+    )
   ) {
     throw new Error("Invalid recovery job expiry.");
   }
@@ -197,8 +202,8 @@ export async function enqueueRecoveryJob(
   const ciphertext = encryptPayload(payload, { id, ...parent }, env);
   const { rowCount } = await database.query(
     `INSERT INTO recovery_jobs (
-        id, kind, dedupe_key, envelope_id, user_id, expires_at, payload_digest, payload_ciphertext
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        id, kind, dedupe_key, envelope_id, user_id, expires_at, payload_digest, payload_ciphertext, signing_expires_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
       ON CONFLICT (dedupe_key) DO NOTHING`,
     [
       id,
@@ -209,6 +214,7 @@ export async function enqueueRecoveryJob(
       parent.expiresAt,
       digest,
       ciphertext,
+      input.signingExpiresAt ?? null,
     ],
   );
   if (rowCount === 1) return { id, created: true };
@@ -244,9 +250,9 @@ const CLAIM_SCOPE = `
 `;
 const RECLAIMABLE =
   "state = 'running' AND lease_expires_at <= statement_timestamp()";
-const EXPIRED = "expires_at <= extract(epoch from clock_timestamp())";
-const EXPIRED_AT_CLAIM =
-  "expires_at <= extract(epoch from statement_timestamp())";
+const EFFECTIVE_EXPIRY = "LEAST(expires_at, signing_expires_at)";
+const EXPIRED = `${EFFECTIVE_EXPIRY} <= extract(epoch from clock_timestamp())`;
+const EXPIRED_AT_CLAIM = `${EFFECTIVE_EXPIRY} <= extract(epoch from statement_timestamp())`;
 const WINDOW_ELAPSED_AT_CLAIM = `
   kind = 'email' AND first_attempt_at <= statement_timestamp() - $4::int * interval '1 second'
 `;
@@ -349,7 +355,7 @@ const FENCE = `
 // wait, so a live lease at statement start cannot revive after expiring.
 const LOCK_JOB = `
   WITH locked AS MATERIALIZED (
-    SELECT id, state, lease_token, lease_expires_at, expires_at, kind, first_attempt_at, attempts
+    SELECT id, state, lease_token, lease_expires_at, expires_at, signing_expires_at, kind, first_attempt_at, attempts
     FROM recovery_jobs
     WHERE id = $1 AND state = 'running' AND lease_token = $2
     FOR UPDATE
@@ -424,7 +430,9 @@ export async function cancelRecoveryJob(
   { database, code = "cancelled" }: { database: DbExecutor; code?: string },
 ): Promise<boolean> {
   const result = await database.query(
-    `${LOCK_FENCE}
+    `${LOCK_JOB}, owned AS (
+        SELECT id FROM locked WHERE ${FENCE} AND ($3 <> 'expired' OR ${EXPIRED})
+      )
       UPDATE recovery_jobs AS job
       SET state = 'cancelled', lease_token = NULL, lease_expires_at = NULL,
         payload_ciphertext = NULL, last_error_code = $3,
@@ -495,8 +503,14 @@ export async function getEmailDispatchStatus(
   return result.rows[0]?.status ?? "stale";
 }
 
+export const PENDING_SIGNING_LOCK_ALERT = `
+  event = 'signing_locked' AND metadata @> '{"durableAlert":true}'::jsonb
+  AND signing_lock_alert_reconciled_at IS NULL
+`;
+
 export type RecoveryQueueHealth = {
   counts: Record<RecoveryJobState, number>;
+  pendingSigningLockAlerts: number;
   attention: {
     id: string;
     kind: RecoveryJobKind;
@@ -545,5 +559,12 @@ export async function getRecoveryQueueHealth({
     ...row,
     code: row.code === null ? null : safeCode(row.code),
   }));
-  return { counts, attention };
+  const pending = await database.query<{ count: number }>(
+    `SELECT count(*)::int AS count FROM system_audit_events WHERE ${PENDING_SIGNING_LOCK_ALERT}`,
+  );
+  return {
+    counts,
+    attention,
+    pendingSigningLockAlerts: pending.rows[0]?.count ?? 0,
+  };
 }

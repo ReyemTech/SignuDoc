@@ -11,7 +11,7 @@ import type { Pool } from "pg";
 import { cache } from "react";
 
 import { type Branding } from "../branding.ts";
-import { getDb, queryOne } from "../db/connection.ts";
+import { getDb, queryOne, withTransaction } from "../db/connection.ts";
 import { isDurableJobsEnabled } from "../recovery/config.ts";
 import { enqueueEmail } from "../recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "../recovery/workflow-email.ts";
@@ -241,7 +241,7 @@ function emailVerificationExpiry(token: string): number {
   return payload.exp;
 }
 
-async function resetPasswordExpiry(
+async function resetPasswordVerification(
   token: string,
   userId: string,
   database: Pool,
@@ -249,14 +249,12 @@ async function resetPasswordExpiry(
   // The native password-reset endpoint inserts this opaque token before
   // invoking the callback. Use its actual expiry rather than restarting
   // the clock after enqueue or depending on Better Auth's default TTL.
-  const reset = await queryOne<{ expiresAt: number }>(
+  return queryOne<{ expiresAt: number; id: string }>(
     database,
-    `SELECT floor(extract(epoch from "expiresAt"))::bigint AS "expiresAt"
+    `SELECT id, floor(extract(epoch from "expiresAt"))::bigint AS "expiresAt"
       FROM verification WHERE identifier = $1 AND value = $2`,
     [`reset-password:${token}`, userId],
   );
-  if (!reset) throw new Error("Missing Better Auth password reset expiry.");
-  return reset.expiresAt;
 }
 
 // Auth emails are sent after the response, so sign-in is never slowed down
@@ -358,21 +356,40 @@ export function createAppAuth({
 
     // The adapter owns its user/verification writes. Await this independent
     // queue commit inside the callback; only delivery belongs in after().
-    const expiresAt =
+    const verification =
       input.template === "password_reset"
-        ? await resetPasswordExpiry(input.token, input.userId, database)
-        : emailVerificationExpiry(input.token);
+        ? await resetPasswordVerification(input.token, input.userId, database)
+        : null;
+    if (input.template === "password_reset" && !verification) return;
+    const expiresAt =
+      verification?.expiresAt ?? emailVerificationExpiry(input.token);
     const requestDigest = createHash("sha256").update(input.url).digest("hex");
-    const branding = await getBranding(env, database);
-    const { id } = await enqueueEmail(
-      {
-        message: { ...input.buildContent(branding), to: input.to },
-        dedupeKey: `auth/${input.template}/${input.userId}/${requestDigest}`,
-        userId: input.userId,
-        expiresAt,
-      },
-      { database, env },
-    );
+
+    const job = await withTransaction(async (tx) => {
+      // Better Auth calls signup verification after its account commit.
+      // This lock orders existing-account callbacks with account purge.
+      const account = await queryOne<{ id: string }>(
+        tx,
+        'SELECT id FROM "user" WHERE id = $1 FOR KEY SHARE',
+        [input.userId],
+      );
+      if (!account) return;
+      const branding = await getBranding(env, tx);
+      return enqueueEmail(
+        {
+          message: { ...input.buildContent(branding), to: input.to },
+          dedupeKey: `auth/${input.template}/${input.userId}/${requestDigest}`,
+          userId: input.userId,
+          expiresAt,
+          guard: verification
+            ? { kind: "password_reset", verificationId: verification.id }
+            : undefined,
+        },
+        { database: tx, env },
+      );
+    }, database);
+    if (!job) return;
+    const { id } = job;
 
     try {
       afterResponse(async () => {

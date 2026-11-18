@@ -1,7 +1,12 @@
 import { Resend, type Response as ResendResponse } from "resend";
 import { z } from "zod";
 
-import { type DbExecutor, type DbPool, queryOne } from "../db/connection.ts";
+import {
+  type DbExecutor,
+  type DbPool,
+  queryOne,
+  withTransaction,
+} from "../db/connection.ts";
 import { recordAuditEvent } from "../services/audit.ts";
 import {
   createEmailService,
@@ -19,6 +24,11 @@ import {
 import { EMAIL_CODE_MAX_ATTEMPTS } from "../signer-checks.ts";
 import { emailTemplateKinds, envelopeStatuses } from "../types/domain.ts";
 import { readEnv, type EnvSource } from "../utils/env.ts";
+import {
+  RETENTION_DAY_SECONDS,
+  RETENTION_WARNING_DAYS,
+  readRetentionPolicy,
+} from "./retention-policy.ts";
 import { assertRecoveryConfigured, isDurableJobsEnabled } from "./config.ts";
 import {
   cancelRecoveryJob,
@@ -48,7 +58,13 @@ const guardSchema = z.discriminatedUnion("kind", [
     allowedStatuses: z.array(z.enum(envelopeStatuses)).nonempty(),
   }),
   z.object({ kind: z.literal("signer_token"), signerId: id, tokenHash }),
-  z.object({ kind: z.literal("signing_lock"), adminId: id, lockedAt: expiry }),
+  z.object({ kind: z.literal("password_reset"), verificationId: id }),
+  z.object({
+    kind: z.literal("signing_lock"),
+    adminId: id,
+    lockedAt: expiry,
+    auditSequence: z.number().int().positive().optional(),
+  }),
   z.object({
     kind: z.literal("signing_code"),
     signerId: id,
@@ -68,6 +84,7 @@ const acknowledgementSchema = z.discriminatedUnion("kind", [
   emailAudit.extend({ kind: z.literal("email_audit") }),
   z.object({
     kind: z.literal("retention_warning"),
+    policyGeneration: z.number().int().positive().optional(),
     audit: emailAudit.optional(),
   }),
   z.object({
@@ -114,9 +131,24 @@ type EnqueueEmailInput = {
   envelopeId?: string;
   userId?: string;
   expiresAt?: number;
+  signingExpiresAt?: number;
   guard?: EmailJobGuard;
   acknowledgement?: EmailAcknowledgement;
 };
+
+function hasGuardAssociation(
+  job: { envelopeId?: string | null; userId?: string | null },
+  {
+    acknowledgement,
+    guard,
+  }: Pick<EnqueueEmailInput, "acknowledgement" | "guard">,
+): boolean {
+  if (acknowledgement && !job.envelopeId) return false;
+  if (!guard) return true;
+  return guard.kind === "signing_lock" || guard.kind === "password_reset"
+    ? Boolean(job.userId)
+    : Boolean(job.envelopeId);
+}
 
 export async function enqueueEmail(
   { message, guard, acknowledgement, ...job }: EnqueueEmailInput,
@@ -129,8 +161,12 @@ export async function enqueueEmail(
   if (!isDurableJobsEnabled(env)) throw new Error("Durable jobs are disabled.");
   assertRecoveryConfigured(env);
   if (
-    (acknowledgement && !job.envelopeId) ||
-    (guard && (guard.kind === "signing_lock" ? !job.userId : !job.envelopeId))
+    !hasGuardAssociation(job, { guard, acknowledgement }) ||
+    (job.signingExpiresAt !== undefined && guard?.kind !== "signer_token") ||
+    (message.template === "password_reset" &&
+      guard?.kind !== "password_reset") ||
+    (acknowledgement?.kind === "retention_warning" &&
+      acknowledgement.policyGeneration === undefined)
   ) {
     throw new RecoveryJobError("payload_invalid", true);
   }
@@ -173,13 +209,29 @@ type EnvelopeGuardRow = {
   retentionWarnedAt: number | null;
   part11: boolean;
   now: number;
+  finishedAt: number;
+  warningGeneration: number | null;
 };
 
-async function envelopeGuardMatches(
+async function emailGuardMatches(
   job: ClaimedRecoveryJob,
   { guard, acknowledgement, message }: FrozenEmail,
   database: DbExecutor,
 ): Promise<boolean> {
+  if (guard?.kind === "password_reset") {
+    const reset = await queryOne<{ id: string }>(
+      database,
+      `
+      SELECT v.id FROM verification v
+      JOIN "user" u ON u.id = v.value
+      WHERE v.id = $1 AND u.id = $2 AND lower(u.email) = lower($3)
+        AND v.identifier LIKE 'reset-password:%' AND v."expiresAt" > clock_timestamp()
+    `,
+      [guard.verificationId, job.userId, message.to],
+    );
+    return reset !== null;
+  }
+
   if (guard?.kind === "signing_lock") {
     const admin = await queryOne<{ id: string }>(
       database,
@@ -187,8 +239,18 @@ async function envelopeGuardMatches(
       SELECT a.id FROM "user" a
       JOIN "user" person ON person.id = $1 AND person.signing_locked_at = $2
       WHERE a.id = $3 AND a.role = 'admin' AND a.email = $4
+        AND ($5::bigint IS NULL OR NOT EXISTS (
+          SELECT 1 FROM system_audit_events WHERE target_user_id = person.id
+            AND sequence > $5 AND event IN ('signing_locked', 'signing_unlocked', 'account_deleted')
+        ))
     `,
-      [job.userId, guard.lockedAt, guard.adminId, message.to],
+      [
+        job.userId,
+        guard.lockedAt,
+        guard.adminId,
+        message.to,
+        guard.auditSequence ?? null,
+      ],
     );
     return admin !== null;
   }
@@ -199,7 +261,9 @@ async function envelopeGuardMatches(
   const envelope = await queryOne<EnvelopeGuardRow>(
     database,
     `SELECT status, expires_at AS "expiresAt", expiry_notified_at AS "expiryNotifiedAt",
-        retention_warned_at AS "retentionWarnedAt", part11, ${DATABASE_SECONDS} AS now
+        retention_warned_at AS "retentionWarnedAt", part11, ${DATABASE_SECONDS} AS now,
+        COALESCE(completed_at, declined_at, voided_at, updated_at) AS "finishedAt",
+        retention_warning_policy_generation AS "warningGeneration"
       FROM envelopes WHERE id = $1`,
     [job.envelopeId],
   );
@@ -214,13 +278,21 @@ async function envelopeGuardMatches(
   )
     return false;
 
-  if (
-    acknowledgement?.kind === "retention_warning" &&
-    (!FINAL_ENVELOPE_STATUSES.has(envelope.status) ||
+  if (acknowledgement?.kind === "retention_warning") {
+    const policy = await readRetentionPolicy(database);
+    if (
+      !policy ||
+      policy.generation !== acknowledgement.policyGeneration ||
+      !FINAL_ENVELOPE_STATUSES.has(envelope.status) ||
       envelope.part11 ||
-      envelope.retentionWarnedAt !== null)
-  )
-    return false;
+      (envelope.retentionWarnedAt !== null &&
+        envelope.warningGeneration === policy.generation) ||
+      envelope.finishedAt >=
+        envelope.now -
+          (policy.days - RETENTION_WARNING_DAYS) * RETENTION_DAY_SECONDS
+    )
+      return false;
+  }
 
   if (!guard) return true;
   if (guard.kind === "envelope_status")
@@ -274,12 +346,20 @@ async function acknowledgeEmail(
   if (!acknowledgement) return;
 
   if (acknowledgement.kind === "retention_warning") {
-    await database.query(
-      `UPDATE envelopes SET retention_warned_at = ${DATABASE_SECONDS}
-        WHERE id = $1 AND status IN ('completed', 'declined', 'voided')
-          AND NOT part11 AND retention_warned_at IS NULL`,
-      [envelopeId],
-    );
+    const policy = await readRetentionPolicy(database, true);
+    if (policy && policy.generation === acknowledgement.policyGeneration) {
+      await database.query(
+        `UPDATE envelopes SET retention_warned_at = ${DATABASE_SECONDS}, retention_warning_policy_generation = $2
+          WHERE id = $1 AND status IN ('completed', 'declined', 'voided') AND NOT part11
+            AND (retention_warned_at IS NULL OR retention_warning_policy_generation IS DISTINCT FROM $2)
+            AND COALESCE(completed_at, declined_at, voided_at, updated_at) < ${DATABASE_SECONDS} - $3`,
+        [
+          envelopeId,
+          policy.generation,
+          (policy.days - RETENTION_WARNING_DAYS) * RETENTION_DAY_SECONDS,
+        ],
+      );
+    }
   } else if (acknowledgement.kind === "expiry_notice") {
     const recorded = await queryOne<{ notifiedAt: number }>(
       database,
@@ -387,24 +467,22 @@ export async function processEmailJob(
     throw new RecoveryJobError("payload_invalid", true);
   const payload = parsed.data;
   if (
-    (payload.acknowledgement && !job.envelopeId) ||
-    (payload.guard &&
-      (payload.guard.kind === "signing_lock" ? !job.userId : !job.envelopeId))
+    payload.message.template === "password_reset" &&
+    payload.guard?.kind !== "password_reset"
   ) {
+    await cancelRecoveryJob(job, { database, code: "guard_changed" });
+    return;
+  }
+  if (!hasGuardAssociation(job, payload)) {
     throw new RecoveryJobError("payload_invalid", true);
   }
 
-  if (job.userId) {
+  if (job.userId && payload.guard?.kind !== "password_reset") {
     const user = await database.query('SELECT 1 FROM "user" WHERE id = $1', [
       job.userId,
     ]);
     // A Better Auth-owned transaction may still be inserting this user.
     if (user.rowCount !== 1) throw new RecoveryJobError("missing_parent");
-  }
-
-  if (!(await envelopeGuardMatches(job, payload, database))) {
-    await cancelRecoveryJob(job, { database, code: "guard_changed" });
-    return;
   }
 
   const attachments = payload.message.attachments?.map((item) => {
@@ -418,8 +496,6 @@ export async function processEmailJob(
     throw new RecoveryJobError("payload_invalid", true);
   }
   const message = { ...payload.message, attachments };
-  const service = emailService ?? createRecoveryEmailService(env);
-
   const status = await getEmailDispatchStatus(job, database);
   if (status === "stale") return;
   if (status === "expired") {
@@ -428,6 +504,30 @@ export async function processEmailJob(
   }
   if (status === "retry_window_elapsed")
     throw new RecoveryJobError(status, true);
+  if (!(await emailGuardMatches(job, payload, database))) {
+    // A signer deadline may have moved since the read. Decide whether to
+    // retire the token under the same envelope-first order as the edit.
+    if (payload.guard?.kind === "signer_token" && job.envelopeId) {
+      const current = await withTransaction(async (tx) => {
+        const envelope = await queryOne<{ id: string }>(
+          tx,
+          "SELECT id FROM envelopes WHERE id = $1 FOR NO KEY UPDATE",
+          [job.envelopeId],
+        );
+        if (envelope && (await emailGuardMatches(job, payload, tx)))
+          return true;
+        await cancelRecoveryJob(job, { database: tx, code: "guard_changed" });
+        return false;
+      }, database);
+      if (!current || (await getEmailDispatchStatus(job, database)) !== "ready")
+        return;
+    } else {
+      await cancelRecoveryJob(job, { database, code: "guard_changed" });
+      return;
+    }
+  }
+
+  const service = emailService ?? createRecoveryEmailService(env);
   if (signal?.aborted) throw new RecoveryJobError("deadline_exceeded");
 
   const requestSignal = AbortSignal.timeout(EMAIL_REQUEST_TIMEOUT_MS);

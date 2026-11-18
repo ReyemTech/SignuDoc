@@ -2654,6 +2654,7 @@ export async function sendDraftEnvelope(
           {
             message: buildSigningInvitationEmail({
               branding,
+              durable: true,
               envelopeTitle: envelope.title,
               expiresAt,
               senderName: input.senderName,
@@ -2664,7 +2665,7 @@ export async function sendDraftEnvelope(
             dedupeKey: `invitation/first/${envelopeId}/${firstSigner.id}`,
             envelopeId,
             userId,
-            expiresAt,
+            signingExpiresAt: expiresAt,
             guard: {
               kind: "signer_token",
               signerId: firstSigner.id,
@@ -2861,6 +2862,14 @@ export async function changeEnvelopeDeadline(
       `,
       [expiresAt, nowUnixTimestamp, envelopeId],
     );
+    if (isDurableJobsEnabled()) {
+      await tx.query(
+        `UPDATE recovery_jobs SET signing_expires_at = $1
+          WHERE envelope_id = $2 AND signing_expires_at IS NOT NULL
+            AND state IN ('pending', 'running', 'needs_attention')`,
+        [expiresAt, envelopeId],
+      );
+    }
     await recordAuditEvent(
       {
         actorEmail: input.senderEmail,
@@ -3134,6 +3143,7 @@ export async function correctSentEnvelopeSigner(
     if (invitationNeeded && issuedLink) {
       const message = buildSigningInvitationEmail({
         branding,
+        durable: durable,
         envelopeTitle: envelope.title,
         expiresAt: envelope.expiresAt,
         senderName: context.senderName,
@@ -3149,7 +3159,7 @@ export async function correctSentEnvelopeSigner(
             dedupeKey: `invitation/correction/${envelopeId}/${signerId}/${issuedLink.tokenHash}`,
             envelopeId,
             userId,
-            expiresAt: envelope.expiresAt ?? issuedLink.exp + 1,
+            signingExpiresAt: envelope.expiresAt ?? issuedLink.exp + 1,
             guard: {
               kind: "signer_token",
               signerId,

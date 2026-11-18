@@ -214,6 +214,7 @@ function buildReminderEmail(input: {
   envelopeId: string;
   envelopeTitle: string;
   expiresAt?: number | null;
+  durable?: boolean;
   kind: ReminderRequest["kind"];
   senderName: string;
   signerEmail: string;
@@ -227,7 +228,7 @@ function buildReminderEmail(input: {
   const introLine = automatic
     ? `${input.senderName} is still waiting for your signature on "${input.envelopeTitle}", sent through ${input.branding.productName}.`
     : `${input.senderName} sent you a reminder to sign "${input.envelopeTitle}" through ${input.branding.productName}.`;
-  const deadlineLine = buildDeadlineLine(input.expiresAt);
+  const deadlineLine = buildDeadlineLine(input.expiresAt, input.durable);
   const textBody = [
     `Hi ${input.signerName},`,
     "",
@@ -502,11 +503,12 @@ async function persistReminder(
             persisted,
             request.kind,
             await getBranding(process.env, tx),
+            true,
           ),
           dedupeKey: `reminder/${auditEvent.id}`,
           envelopeId,
           userId: persisted.userId,
-          expiresAt: persistedEnvelope.expiresAt ?? issuedLink.exp + 1,
+          signingExpiresAt: persistedEnvelope.expiresAt ?? issuedLink.exp + 1,
           guard: {
             kind: "signer_token",
             signerId: persisted.signerId,
@@ -529,9 +531,11 @@ function reminderMessage(
   persisted: PersistedReminder,
   kind: ReminderRequest["kind"],
   branding: Branding,
+  durable = false,
 ) {
   return buildReminderEmail({
     branding,
+    durable,
     envelopeId: persisted.envelopeId,
     envelopeTitle: persisted.envelopeTitle,
     expiresAt: persisted.envelopeExpiresAt,

@@ -1,5 +1,8 @@
 import { isDurableJobsEnabled } from "./recovery/config.ts";
-import { enqueueEmail } from "./recovery/email.ts";
+import {
+  buildSigningLockAlert,
+  tryReconcileSigningLockAlert,
+} from "./recovery/signing-lock-alerts.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbExecutor,
@@ -352,7 +355,6 @@ export async function checkSigningCredentials(
   } = {},
 ): Promise<SigningPasswordResult> {
   const durable = isDurableJobsEnabled();
-  const jobs: string[] = [];
   const outcome = await withTransaction(async (tx) => {
     const account = await queryOne<{
       email: string;
@@ -443,37 +445,19 @@ export async function checkSigningCredentials(
         createdAt: now,
         event: locked ? "signing_locked" : "reauthentication_failed",
         ipAddress: input.ipAddress ?? null,
-        metadata: { failedAttempts },
+        metadata: {
+          failedAttempts,
+          ...(durable && locked ? { durableAlert: true } : {}),
+        },
         targetUserId: input.userId,
         userAgent: input.userAgent ?? null,
       },
       tx,
     );
 
-    if (durable && locked) {
-      const admins = await queryMany<{ email: string; id: string }>(
-        tx,
-        `SELECT id, email FROM "user" WHERE role = 'admin' ORDER BY id`,
-      );
-      if (admins.length) {
-        const { productName } = await getBranding(process.env, tx);
-        for (const admin of admins) {
-          const { id } = await enqueueEmail(
-            {
-              message: buildSigningLockAlert(account, productName, admin.email),
-              dedupeKey: `signing-lock/${event.id}/${admin.id}`,
-              userId: input.userId,
-              guard: { kind: "signing_lock", adminId: admin.id, lockedAt: now },
-            },
-            { database: tx },
-          );
-          jobs.push(id);
-        }
-      }
-    }
-
     return {
       account,
+      lockAuditId: durable && locked ? event.id : undefined,
       attemptsLeft: Math.max(0, MAX_SIGNING_PASSWORD_ATTEMPTS - failedAttempts),
       locked,
       ok: false as const,
@@ -481,7 +465,13 @@ export async function checkSigningCredentials(
   }, database);
 
   if (durable) {
-    await tryDeliverWorkflowEmails(jobs, { database, emailService });
+    if ("lockAuditId" in outcome && outcome.lockAuditId) {
+      const jobs = await tryReconcileSigningLockAlert(
+        outcome.lockAuditId,
+        database,
+      );
+      await tryDeliverWorkflowEmails(jobs, { database, emailService });
+    }
   } else if (
     !outcome.ok &&
     "account" in outcome &&
@@ -508,26 +498,6 @@ export async function checkSigningCredentials(
   };
 }
 
-function buildSigningLockAlert(
-  person: { email: string; name: string },
-  productName: string,
-  recipient: string,
-) {
-  const textBody = [
-    `${person.name} <${person.email}> gave the wrong password ${MAX_SIGNING_PASSWORD_ATTEMPTS} times in a row while signing on ${productName}.`,
-    "",
-    "Their account can no longer sign until an administrator unlocks it under Settings, People.",
-    "If this was not them, someone may be trying to sign in their name. Check with them before unlocking.",
-  ].join("\n");
-
-  return {
-    subject: `Signing locked for ${person.name}`,
-    template: "signing_lock_alert",
-    textBody,
-    to: recipient,
-  } as const;
-}
-
 /** Tells every administrator that an account was locked for signing. */
 async function alertAdministrators(
   person: { email: string; name: string },
@@ -550,7 +520,12 @@ async function alertAdministrators(
     for (const admin of admins) {
       try {
         await service.send(
-          buildSigningLockAlert(person, productName, admin.email),
+          buildSigningLockAlert(
+            person,
+            productName,
+            admin.email,
+            MAX_SIGNING_PASSWORD_ATTEMPTS,
+          ),
         );
       } catch (error) {
         console.error("Failed to send a signing lock alert:", error);

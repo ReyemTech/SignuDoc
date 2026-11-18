@@ -1,3 +1,6 @@
+import { tmpdir } from "node:os";
+import { runRetentionSweep } from "./retention.ts";
+import { createStorageService } from "./services/storage.ts";
 import { runRecoveryJobs } from "./recovery/worker.ts";
 import { type TransactionalEmailMessage } from "./services/email.ts";
 import assert from "node:assert/strict";
@@ -9,7 +12,7 @@ import type pg from "pg";
 
 import type { createAppAuth as CreateAppAuth } from "./auth/server.ts";
 import { replaceDbPoolForTests } from "./db/connection.ts";
-import { openTestDatabase } from "./db/test-database.ts";
+import { afterStatement, openTestDatabase } from "./db/test-database.ts";
 import { clearRateLimitStoreForTests } from "./security/rate-limit.ts";
 import {
   listSystemAuditEvents,
@@ -795,6 +798,39 @@ test("Better Auth awaits encrypted verification, reset and email-change intents 
       );
       assert.equal(job.expires_at, exp);
     }
+    const confirmationUrl = delivered[2]!.textBody.match(
+      /https?:\/\/\S+verify-email\?[^\s]+/,
+    )?.[0];
+    assert.ok(confirmationUrl);
+    const confirmation = await auth.handler(new Request(confirmationUrl));
+    assert.ok(confirmation.ok || confirmation.status === 302);
+    const verification = (await intents())[3];
+    assert.ok(verification);
+    const prospective: string[] = [];
+    await runRecoveryJobs({
+      database,
+      env: localEnv,
+      jobId: verification.id,
+      emailService: {
+        async send(message) {
+          prospective.push(message.to);
+          return {
+            accepted: [message.to],
+            rejected: [],
+            messageId: verification.id,
+          };
+        },
+        async sendBatch() {
+          throw new Error("unexpected batch");
+        },
+      },
+    });
+    assert.deepEqual(prospective, ["next-auth@example.test"]);
+    assert.equal(
+      (await database.query('SELECT email FROM "user" WHERE id = $1', [userId]))
+        .rows[0]?.email,
+      email,
+    );
     assert.ok(attempted.every((message) => message.to === email));
   } finally {
     auth = original;
@@ -804,3 +840,165 @@ test("Better Auth awaits encrypted verification, reset and email-change intents 
       ]);
   }
 });
+
+test("queued resets are cleared when the mailbox changes or the native token is consumed", async () => {
+  const { createAppAuth } = await import("./auth/server.ts");
+  const localEnv = {
+    ...env,
+    DURABLE_JOBS_ENABLED: "true",
+    CRON_SECRET: "test-cron",
+  };
+  const original = auth;
+  auth = createAppAuth({
+    database,
+    env: localEnv,
+    includeNextCookies: false,
+    afterResponse: () => {},
+  });
+  const owners: string[] = [];
+  try {
+    for (const changes of ["mailbox", "consumed"] as const) {
+      const email = `reset-${changes}@example.test`;
+      const userId = await createVerifiedUser(email);
+      owners.push(userId);
+      assert.equal(
+        (await call("/request-password-reset", { email, redirectTo: BASE_URL }))
+          .status,
+        200,
+      );
+      const job = (
+        await database.query<{ id: string }>(
+          "SELECT id FROM recovery_jobs WHERE user_id = $1 AND state = 'pending'",
+          [userId],
+        )
+      ).rows[0];
+      assert.ok(job);
+      if (changes === "mailbox") {
+        await database.query('UPDATE "user" SET email = $1 WHERE id = $2', [
+          "replacement@example.test",
+          userId,
+        ]);
+      } else {
+        const row = (
+          await database.query<{ identifier: string }>(
+            "SELECT identifier FROM verification WHERE value = $1 AND identifier LIKE 'reset-password:%'",
+            [userId],
+          )
+        ).rows[0];
+        assert.ok(row);
+        assert.equal(
+          (
+            await call("/reset-password", {
+              token: row.identifier.slice("reset-password:".length),
+              newPassword: "Another sufficiently long passphrase!",
+            })
+          ).status,
+          200,
+        );
+      }
+      let dispatched = false;
+      await runRecoveryJobs({
+        database,
+        env: localEnv,
+        jobId: job.id,
+        emailService: {
+          async send(message) {
+            dispatched = true;
+            return {
+              accepted: [message.to],
+              rejected: [],
+              messageId: "fixture",
+            };
+          },
+          async sendBatch() {
+            throw new Error("unexpected batch");
+          },
+        },
+      });
+      assert.equal(dispatched, false, changes);
+      assert.deepEqual(
+        (
+          await database.query(
+            "SELECT state, payload_ciphertext FROM recovery_jobs WHERE id = $1",
+            [job.id],
+          )
+        ).rows,
+        [{ state: "cancelled", payload_ciphertext: null }],
+      );
+    }
+  } finally {
+    auth = original;
+    await database.query("DELETE FROM recovery_jobs WHERE user_id = ANY($1)", [
+      owners,
+    ]);
+  }
+});
+
+test(
+  "an account purge winning the reset callback race leaves no queued ciphertext",
+  { timeout: 5000 },
+  async () => {
+    const { createAppAuth } = await import("./auth/server.ts");
+    const localEnv = {
+      ...env,
+      DURABLE_JOBS_ENABLED: "true",
+      CRON_SECRET: "test-cron",
+    };
+    const original = auth;
+    const email = "purged-reset@example.test";
+    const userId = await createVerifiedUser(email);
+    await database.query(
+      "INSERT INTO account_closure_requests (user_id, requested_at, export_expires_at, purge_after_at, updated_at) VALUES ($1, 1, 2, 2, 1)",
+      [userId],
+    );
+    const paused = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const delayed = afterStatement(
+      database,
+      (sql) =>
+        sql.includes("FROM verification WHERE identifier = $1 AND value = $2"),
+      async () => {
+        paused.resolve();
+        await resume.promise;
+      },
+    );
+    auth = createAppAuth({
+      database: delayed,
+      env: localEnv,
+      includeNextCookies: false,
+      afterResponse: () => {},
+    });
+    const started = call("/request-password-reset", {
+      email,
+      redirectTo: BASE_URL,
+    });
+    try {
+      await paused.promise;
+      const purge = await runRetentionSweep({
+        database,
+        storageService: createStorageService({
+          env: { STORAGE_DRIVER: "local", STORAGE_LOCAL_DIR: tmpdir() },
+        }),
+      });
+      assert.equal(purge.accountsPurged, 1);
+      resume.resolve();
+      assert.equal((await started).status, 200);
+      assert.equal(
+        (
+          await database.query(
+            "SELECT 1 FROM recovery_jobs WHERE user_id = $1",
+            [userId],
+          )
+        ).rowCount,
+        0,
+      );
+    } finally {
+      auth = original;
+      resume.resolve();
+      await started.catch(() => undefined);
+      await database.query("DELETE FROM recovery_jobs WHERE user_id = $1", [
+        userId,
+      ]);
+    }
+  },
+);

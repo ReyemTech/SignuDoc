@@ -11,7 +11,11 @@ import { afterStatement, openTestDatabase } from "../db/test-database.ts";
 import { sendFreshDownloadLinks } from "../download-renewal.ts";
 import { createRecipientDownloadLink } from "../downloads.ts";
 import { runEnvelopeSchedule } from "../envelope-schedule.ts";
-import { changeEnvelopeDeadline } from "../envelopes.ts";
+import { formatDeadline } from "../envelope-deadline.ts";
+import {
+  changeEnvelopeDeadline,
+  correctSentEnvelopeSigner,
+} from "../envelopes.ts";
 import { checkSigningCredentials } from "../part11.ts";
 import { sendManualEnvelopeNudge } from "../reminders.ts";
 import { runRetentionSweep } from "../retention.ts";
@@ -32,6 +36,7 @@ import {
   sendSignerEmailCode,
 } from "../signing.ts";
 import { enqueueEmail } from "./email.ts";
+import { getRecoveryQueueHealth } from "./jobs.ts";
 import { runRecoveryJobs } from "./worker.ts";
 
 const DAY = 86_400;
@@ -152,8 +157,9 @@ async function jobFor(envelopeId: string) {
       id: string;
       state: string;
       expires_at: number | null;
+      signing_expires_at: number | null;
     }>(
-      "SELECT id, state, expires_at FROM recovery_jobs WHERE envelope_id = $1 ORDER BY created_at DESC LIMIT 1",
+      "SELECT id, state, expires_at, signing_expires_at FROM recovery_jobs WHERE envelope_id = $1 ORDER BY created_at DESC LIMIT 1",
       [envelopeId],
     )
   ).rows[0];
@@ -181,7 +187,7 @@ test("durable reminder retries the exact new link while keeping it active throug
   );
   const job = await jobFor(f.envelopeId);
   assert.equal(job?.state, "pending");
-  assert.equal(job.expires_at, f.deadline);
+  assert.equal(job.signing_expires_at, f.deadline);
   const token = failed.sent[0]?.message.textBody.match(/\/sign\/([\w-]+)/)?.[1];
   assert.ok(token);
   await getSigningPayloadForToken(token, { database });
@@ -412,8 +418,8 @@ test("durable account closure is atomic and purge clears user and envelope jobs"
     {
       message: {
         subject: "Fixture",
-        template: "password_reset",
-        textBody: "Fixture reset link",
+        template: "email_verification",
+        textBody: "Fixture verification link",
         to: f.email,
       },
       dedupeKey: `purge/${f.userId}`,
@@ -452,7 +458,7 @@ test("durable account closure is atomic and purge clears user and envelope jobs"
   );
 });
 
-test("durable Part 11 lock rolls back with its alert and cancels delivery to a former administrator", async () => {
+test("Part 11 lock persists through queue failure and recovers its alert without a credential request", async () => {
   const person = await user();
   const administrator = await user();
   await database.query(`UPDATE "user" SET role = 'admin' WHERE id = $1`, [
@@ -475,37 +481,70 @@ test("durable Part 11 lock rolls back with its alert and cancels delivery to a f
     password: "fixture-rejected-password",
   };
   const failed = mail(true);
+  await database.query(
+    `INSERT INTO account (id, "accountId", "providerId", "userId", password)
+       VALUES ($1, $2, 'credential', $2, 'fixture-stored-hash')`,
+    [randomUUID(), person],
+  );
+  let blockedInserts = 0;
   const failingDatabase = afterStatement(
     database,
     (sql) => sql.includes("INSERT INTO recovery_jobs"),
     async () => {
-      assert.deepEqual(await state(), {
-        signing_failed_attempts: 4,
-        signing_locked_at: null,
-      });
-      throw new Error("forced enqueue transaction rollback");
+      blockedInserts += 1;
+      throw new Error("fixture queue insertion unavailable");
     },
   );
-  await assert.rejects(
-    checkSigningCredentials(input, {
-      database: failingDatabase,
-      emailService: failed.emailService,
-    }),
-    /forced enqueue transaction rollback/,
-  );
-  assert.deepEqual(await state(), {
-    signing_failed_attempts: 4,
-    signing_locked_at: null,
-  });
-
+  const locked = { attemptsLeft: 0, locked: true, ok: false };
+  const verifyPassword = async ({ password }: { password: string }) =>
+    password === "fixture-correct-password";
   assert.deepEqual(
     await checkSigningCredentials(input, {
-      database,
+      database: failingDatabase,
       emailService: failed.emailService,
+      verifyPassword,
     }),
-    { attemptsLeft: 0, locked: true, ok: false },
+    locked,
   );
   assert.equal((await state()).signing_failed_attempts, 5);
+  assert.ok((await state()).signing_locked_at);
+  assert.deepEqual(
+    await checkSigningCredentials(
+      { ...input, password: "fixture-correct-password" },
+      {
+        database: failingDatabase,
+        emailService: failed.emailService,
+        verifyPassword,
+      },
+    ),
+    locked,
+  );
+
+  const locks = await database.query(
+    "SELECT id FROM system_audit_events WHERE target_user_id = $1 AND event = 'signing_locked'",
+    [person],
+  );
+  assert.equal(locks.rowCount, 1);
+  await runRecoveryJobs({
+    database: failingDatabase,
+    emailService: failed.emailService,
+  });
+  assert.ok(blockedInserts >= 2);
+  assert.equal(
+    (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+    1,
+  );
+  assert.equal(failed.sent.length, 0);
+
+  await database.query(
+    "UPDATE system_audit_events SET signing_lock_alert_retry_at = clock_timestamp() WHERE target_user_id = $1",
+    [person],
+  );
+  await runRecoveryJobs({ database, emailService: failed.emailService });
+  assert.equal(
+    (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+    0,
+  );
   assert.ok(
     failed.sent.some(
       ({ message }) => message.to === `${administrator}@example.test`,
@@ -564,5 +603,219 @@ test("the completion producer freezes the sender dashboard URL from its supplied
     delivery.sent[0]?.message.textBody.includes(
       `https://completion.example.test/envelopes/${f.envelopeId}`,
     ),
+  );
+});
+
+for (const deadlineEdit of [
+  "extended past original expiry",
+  "shortened",
+] as const) {
+  test(`a pending durable invitation remains actionable when the deadline is ${deadlineEdit}`, async () => {
+    const extended = deadlineEdit === "extended past original expiry";
+    const f = await fixture({ deadline: clock() + (extended ? 2 : 30 * DAY) });
+    const provider = mail(true);
+    await correctSentEnvelopeSigner(
+      f.userId,
+      f.envelopeId,
+      f.signerId,
+      { name: "Corrected signer" },
+      {
+        senderEmail: "sender@example.test",
+        senderName: "Fixture Owner",
+      },
+      { database, emailService: provider.emailService },
+    );
+    const job = await jobFor(f.envelopeId);
+    assert.equal(job?.state, "pending");
+    const sentLink =
+      provider.sent[0]?.message.textBody.match(/\/sign\/([\w-]+)/)?.[1];
+    assert.ok(sentLink);
+
+    const changed = await changeEnvelopeDeadline(
+      f.userId,
+      f.envelopeId,
+      {
+        expiresInDays: 7,
+        senderEmail: "sender@example.test",
+      },
+      { database },
+    );
+    if (extended) {
+      await database.query(
+        "SELECT pg_sleep(GREATEST(0, $1 - extract(epoch from clock_timestamp())))",
+        [f.deadline],
+      );
+    }
+    await getSigningPayloadForToken(sentLink, { database });
+    const successful = mail();
+    await retry(job.id, successful.emailService);
+    assert.deepEqual(successful.sent, provider.sent);
+    assert.equal((await jobFor(f.envelopeId))?.state, "succeeded");
+    assert.ok(
+      !successful.sent[0]!.message.textBody.includes(
+        formatDeadline(f.deadline),
+      ),
+    );
+    assert.ok(
+      !successful.sent[0]!.message.textBody.includes(
+        formatDeadline(changed.expiresAt),
+      ),
+    );
+  });
+}
+
+test("retention policy changes cancel stale notices and require current-policy grace", async () => {
+  const prior = (await readStoredSettings(database))?.retentionDays ?? null;
+  const f = await fixture({
+    status: "completed",
+    finishedAt: clock() - 95 * DAY,
+  });
+  const failed = mail(true);
+  const success = mail();
+  const sentToOwner = () =>
+    success.sent.filter(
+      ({ message }) => message.to === `${f.userId}@example.test`,
+    );
+  const sweep = (emailService: EmailService, now = clock()) =>
+    runRetentionSweep({ database, storageService: storage, emailService, now });
+  try {
+    await saveSettings({ retentionDays: 90 }, database);
+    await sweep(failed.emailService);
+    const warned = await jobFor(f.envelopeId);
+    assert.equal(warned?.state, "pending");
+
+    await saveSettings({ retentionDays: null }, database);
+    await retry(warned.id, success.emailService);
+    assert.equal(sentToOwner().length, 0);
+    assert.equal((await jobFor(f.envelopeId))?.state, "cancelled");
+
+    await saveSettings({ retentionDays: 90 }, database);
+    await sweep(failed.emailService);
+    const next = await jobFor(f.envelopeId);
+    assert.ok(next && next.id !== warned.id);
+    await saveSettings({ retentionDays: 130 }, database);
+    await retry(next.id, success.emailService);
+    await sweep(success.emailService);
+    assert.equal(sentToOwner().length, 0);
+    assert.equal((await jobFor(f.envelopeId))?.state, "cancelled");
+
+    await saveSettings({ retentionDays: 90 }, database);
+    await sweep(success.emailService);
+    assert.equal(sentToOwner().length, 1);
+    assert.equal((await jobFor(f.envelopeId))?.state, "succeeded");
+
+    await saveSettings({ retentionDays: 120 }, database);
+    const later = await sweep(success.emailService, clock() + 31 * DAY);
+    assert.equal(later.finishedEnvelopesDeleted, 0);
+    assert.ok((await jobFor(f.envelopeId))?.id !== next.id);
+    assert.equal((await jobFor(f.envelopeId))?.state, "succeeded");
+    assert.equal(sentToOwner().length, 2);
+    assert.equal(
+      (
+        await database.query("SELECT 1 FROM envelopes WHERE id = $1", [
+          f.envelopeId,
+        ])
+      ).rowCount,
+      1,
+    );
+    await sweep(success.emailService, clock() + 32 * DAY);
+    assert.equal(
+      (
+        await database.query("SELECT 1 FROM envelopes WHERE id = $1", [
+          f.envelopeId,
+        ])
+      ).rowCount,
+      0,
+    );
+  } finally {
+    await saveSettings({ retentionDays: prior }, database);
+  }
+});
+
+test("disabled account purge works with the optional recovery table absent", async () => {
+  const userId = await user();
+  await database.query(
+    "INSERT INTO account_closure_requests (user_id, requested_at, export_expires_at, purge_after_at, updated_at) VALUES ($1, 1, 2, 2, 1)",
+    [userId],
+  );
+  delete process.env.DURABLE_JOBS_ENABLED;
+  await database.query(
+    "ALTER TABLE recovery_jobs RENAME TO recovery_jobs_fixture",
+  );
+  try {
+    const summary = await runRetentionSweep({
+      database,
+      storageService: storage,
+    });
+    assert.equal(summary.accountsPurged, 1);
+    assert.equal(
+      (await database.query('SELECT 1 FROM "user" WHERE id = $1', [userId]))
+        .rowCount,
+      0,
+    );
+  } finally {
+    await database.query(
+      "ALTER TABLE recovery_jobs_fixture RENAME TO recovery_jobs",
+    );
+    process.env.DURABLE_JOBS_ENABLED = "true";
+  }
+});
+
+test("account purge retires an unreconciled Part 11 alert without recreating ciphertext", async () => {
+  const person = await user();
+  const admin = await user();
+  await database.query(`UPDATE "user" SET role = 'admin' WHERE id = $1`, [
+    admin,
+  ]);
+  await database.query(
+    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+    [person, clock()],
+  );
+  const failed = afterStatement(
+    database,
+    (sql) => sql.includes("INSERT INTO recovery_jobs"),
+    async () => {
+      throw new Error("fixture queue insertion unavailable");
+    },
+  );
+  const provider = mail();
+  await checkSigningCredentials(
+    { userId: person, email: `${person}@example.test`, password: "wrong" },
+    {
+      database: failed,
+      emailService: provider.emailService,
+    },
+  );
+  assert.equal(
+    (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+    1,
+  );
+  await database.query(
+    "INSERT INTO account_closure_requests (user_id, requested_at, export_expires_at, purge_after_at, updated_at) VALUES ($1, 1, 2, 2, 1)",
+    [person],
+  );
+  await runRetentionSweep({
+    database,
+    storageService: storage,
+    emailService: provider.emailService,
+  });
+  const before = provider.sent.length;
+  await runRecoveryJobs({ database, emailService: provider.emailService });
+  assert.equal(
+    (await getRecoveryQueueHealth({ database })).pendingSigningLockAlerts,
+    0,
+  );
+  assert.equal(
+    (
+      await database.query("SELECT 1 FROM recovery_jobs WHERE user_id = $1", [
+        person,
+      ])
+    ).rowCount,
+    0,
+  );
+  assert.ok(
+    provider.sent
+      .slice(before)
+      .every(({ message }) => message.template !== "signing_lock_alert"),
   );
 });

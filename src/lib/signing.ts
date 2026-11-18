@@ -2780,6 +2780,7 @@ export async function submitSigningForToken(
             {
               message: buildSigningInvitationEmail({
                 branding: durableBranding,
+                durable: true,
                 envelopeTitle: context.envelope.title,
                 expiresAt: nextSignerDeadline,
                 senderName: normalizeSenderName(context.sender),
@@ -2790,7 +2791,7 @@ export async function submitSigningForToken(
               dedupeKey: `invitation/next/${context.envelope.id}/${nextSignerId}`,
               envelopeId: context.envelope.id,
               userId: lockedEnvelope.userId,
-              expiresAt:
+              signingExpiresAt:
                 nextSignerDeadline ??
                 nextSignerLinkExpiresAt(null, routedAt) + 1,
               guard: {

@@ -1,3 +1,5 @@
+import { readStoredSettings, saveSettings } from "../settings.ts";
+import { readRetentionPolicy } from "./retention-policy.ts";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -279,14 +281,26 @@ test("deadline changes and replaced signing tokens cancel queued copies", async 
   );
 });
 
-test("a malformed provider result stays retryable and cannot start retention grace", async () => {
+test("a malformed provider result stays retryable and cannot start retention grace", async (t) => {
+  const previous = (await readStoredSettings(database))?.retentionDays ?? null;
+  t.after(() => saveSettings({ retentionDays: previous }, database));
+  await saveSettings({ retentionDays: 60 }, database);
+  await database.query(
+    `UPDATE envelopes SET completed_at = floor(extract(epoch FROM clock_timestamp()))::bigint - 70 * 86400 WHERE id = $1`,
+    [envelopeId],
+  );
+  const policy = await readRetentionPolicy(database);
+  assert.ok(policy);
   const { id } = await enqueueEmail(
     {
       message: { ...message, template: "retention_notice" },
       dedupeKey: dedupeKey(),
       envelopeId,
       userId,
-      acknowledgement: { kind: "retention_warning" },
+      acknowledgement: {
+        kind: "retention_warning",
+        policyGeneration: policy.generation,
+      },
     },
     { database, env, addresses },
   );
