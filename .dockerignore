@@ -1,0 +1,14 @@
+# Build from source and the lockfile, without local data, credentials or builds.
+**
+!package.json
+!package-lock.json
+!next.config.ts
+!postcss.config.mjs
+!tsconfig.json
+!db/
+!db/**
+!public/
+!public/**
+!src/
+!src/**
+**/.env*

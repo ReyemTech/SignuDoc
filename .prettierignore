@@ -1,3 +1,6 @@
 .next
 node_modules
 tsconfig.tsbuildinfo
+
+# Helm templates use Go template syntax within YAML.
+charts/signudoc/templates/
