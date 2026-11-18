@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
@@ -191,7 +192,7 @@ function buildExpiryNotice(envelope: ExpiredEnvelopeRow) {
       : "";
 
   return {
-    subject: `"${envelope.title}" expired before everyone signed`,
+    subject: emailSubject`"${envelope.title}" expired before everyone signed`,
     template: "expiry_notice" as const,
     textBody: [
       `Hello ${envelope.ownerName?.trim() || envelope.ownerEmail},`,

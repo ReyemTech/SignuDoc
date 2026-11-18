@@ -16,7 +16,9 @@ import { formatDeadline } from "../envelope-deadline.ts";
 import {
   changeEnvelopeDeadline,
   correctSentEnvelopeSigner,
+  getEnvelopeDetailDataForUser,
 } from "../envelopes.ts";
+import { setPersonRole } from "../people.ts";
 import { checkSigningCredentials } from "../part11.ts";
 import { sendManualEnvelopeNudge } from "../reminders.ts";
 import { runRetentionSweep } from "../retention.ts";
@@ -177,7 +179,7 @@ async function retry(id: string, emailService: EmailService) {
 test("durable reminder retries the exact new link while keeping it active through outage", async () => {
   const f = await fixture();
   const failed = mail(true);
-  await sendManualEnvelopeNudge(
+  const response = await sendManualEnvelopeNudge(
     f.userId,
     f.envelopeId,
     {
@@ -185,6 +187,23 @@ test("durable reminder retries the exact new link while keeping it active throug
       senderName: "Fixture Owner",
     },
     { database, emailService: failed.emailService },
+  );
+  assert.equal(response.sentAt, null);
+  const detail = await getEnvelopeDetailDataForUser(
+    f.userId,
+    f.envelopeId,
+    database,
+  );
+  assert.ok(detail);
+  assert.ok(
+    detail.timeline.some((event) =>
+      event.description.includes("Manual reminder requested for Signer"),
+    ),
+  );
+  assert.ok(
+    !detail.timeline.some((event) =>
+      event.description.includes("accepted for delivery"),
+    ),
   );
   const job = await jobFor(f.envelopeId);
   assert.equal(job?.state, "pending");
@@ -214,6 +233,17 @@ test("the durable schedule leaves a failed automatic reminder active for recover
     assert.equal(summary.remindersSent, 0);
     assert.deepEqual(summary.reminderFailures, []);
     assert.equal(failed.sent[0]?.message.template, "automatic_reminder");
+    const detail = await getEnvelopeDetailDataForUser(
+      f.userId,
+      f.envelopeId,
+      database,
+    );
+    assert.ok(
+      detail?.timeline.some(
+        (event) =>
+          event.description === "Automatic reminder requested for Signer",
+      ),
+    );
     assert.equal((await jobFor(f.envelopeId))?.state, "pending");
   } finally {
     await database.query(
@@ -1046,3 +1076,90 @@ test("a busy oldest alert yields to a later audit under a one-source limit", asy
     );
   }
 });
+
+for (const identity of ["mailbox", "keeper"] as const) {
+  for (const change of [
+    "before dispatch",
+    "before acknowledgement",
+    "after acknowledgement",
+  ] as const) {
+    test(`retention refreshes recipient grace after ${identity} change ${change}`, async (t) => {
+      const prior = (await readStoredSettings(database))?.retentionDays ?? null;
+      t.after(() => saveSettings({ retentionDays: prior }, database));
+      const f = await fixture({
+        status: "completed",
+        finishedAt: clock() - 150 * DAY,
+      });
+      await saveSettings({ retentionDays: 90 }, database);
+      const sweep = (emailService: EmailService, now = clock()) =>
+        runRetentionSweep({
+          database,
+          storageService: storage,
+          emailService,
+          now,
+        });
+      const successor = identity === "keeper" ? await user() : undefined;
+      if (successor) {
+        await database.query(
+          `UPDATE "user" SET role='admin', "createdAt"=to_timestamp(1) WHERE id=ANY($1)`,
+          [[successor, f.userId]],
+        );
+        await database.query(
+          "UPDATE envelopes SET handed_over_at=1 WHERE id=$1",
+          [f.envelopeId],
+        );
+        t.after(() =>
+          database
+            .query(`UPDATE "user" SET role='user' WHERE id=ANY($1)`, [
+              [successor, f.userId],
+            ])
+            .then(() => {}),
+        );
+      }
+      const changed = successor
+        ? successor + "@example.test"
+        : f.userId + "-new@example.test";
+      const move = () =>
+        successor
+          ? setPersonRole(successor, f.userId, "user", database)
+          : database.query('UPDATE "user" SET email=$2 WHERE id=$1', [
+              f.userId,
+              changed,
+            ]);
+      await sweep(mail(true).emailService);
+      const job = await jobFor(f.envelopeId);
+      const capture = mail();
+      if (change === "before dispatch") await move();
+      await retry(job.id, {
+        ...capture.emailService,
+        async send(message, options) {
+          const accepted = await capture.emailService.send(message, options);
+          if (change === "before acknowledgement") await move();
+          return accepted;
+        },
+      });
+      if (change === "before dispatch") assert.equal(capture.sent.length, 0);
+      if (change === "after acknowledgement") await move();
+      else
+        assert.equal(
+          (
+            await database.query(
+              "SELECT retention_warned_at FROM envelopes WHERE id=$1",
+              [f.envelopeId],
+            )
+          ).rows[0].retention_warned_at,
+          null,
+        );
+      const fresh = mail();
+      await sweep(fresh.emailService, clock() + 31 * DAY);
+      assert.ok(fresh.sent.some(({ message }) => message.to === changed));
+      assert.ok(
+        (
+          await database.query("SELECT 1 FROM envelopes WHERE id=$1", [
+            f.envelopeId,
+          ])
+        ).rowCount,
+      );
+    });
+  }
+}

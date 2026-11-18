@@ -1,6 +1,10 @@
 import { type PoolClient } from "pg";
 
-import { type DbPool, withTransaction } from "../db/connection.ts";
+import {
+  type DbPool,
+  type TransactionPool,
+  withTransaction,
+} from "../db/connection.ts";
 
 class RecoveryBudgetExceeded extends Error {
   constructor() {
@@ -124,17 +128,11 @@ function boundedConnect(
 export function createBoundedRecoveryDatabase(
   database: DbPool,
   budget: RecoveryBudget,
-): DbPool {
-  const scoped = new Proxy(database, {
-    get(target, key, receiver) {
-      if (key === "connect") return () => boundedConnect(target, budget);
-      if (key === "query") {
-        return (text: string, values?: unknown[]) =>
-          withTransaction((client) => client.query(text, values), scoped);
-      }
-      const value: unknown = Reflect.get(target, key, receiver);
-      return typeof value === "function" ? value.bind(target) : value;
-    },
-  });
+): TransactionPool {
+  const scoped: TransactionPool = {
+    connect: () => boundedConnect(database, budget),
+    query: (text, values) =>
+      withTransaction((client) => client.query(text, values), scoped),
+  };
   return scoped;
 }

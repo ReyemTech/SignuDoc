@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { PDFDocument } from "pdf-lib";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
@@ -365,7 +366,7 @@ function buildCompletionSenderEmail(input: {
   senderName: string;
 }) {
   const completedUrl = getEnvelopeUrl(input.envelopeId, input.env);
-  const subject = `"${input.envelopeTitle}" is fully signed`;
+  const subject = emailSubject`"${input.envelopeTitle}" is fully signed`;
   const textBody = [
     `Hi ${input.senderName},`,
     "",
@@ -409,7 +410,7 @@ function buildDeclineNotificationEmail(input: {
   signerName: string;
 }) {
   const envelopeUrl = getEnvelopeUrl(input.envelopeId);
-  const subject = `"${input.envelopeTitle}" was declined by ${input.signerName}`;
+  const subject = emailSubject`"${input.envelopeTitle}" was declined by ${input.signerName}`;
   const reasonLine = input.declineReason?.trim()
     ? `Reason provided: ${input.declineReason.trim()}`
     : null;
@@ -460,7 +461,7 @@ function buildCompletionSignerEmail(input: {
   signerName: string;
   signedDownloadUrl: string;
 }) {
-  const subject = `"${input.envelopeTitle}" is fully signed`;
+  const subject = emailSubject`"${input.envelopeTitle}" is fully signed`;
   const textBody = [
     `Hi ${input.signerName},`,
     "",
@@ -1253,9 +1254,9 @@ export async function enqueueCompletionEmails(
   input: CompletionEmailInput & { database: DbExecutor; env?: EnvSource },
 ): Promise<string[]> {
   const { database, envelopeId, env } = input;
-  const owner = await queryOne<{ userId: string }>(
+  const owner = await queryOne<SenderRow & { userId: string }>(
     database,
-    'SELECT user_id AS "userId" FROM envelopes WHERE id = $1',
+    'SELECT e.user_id AS "userId", u.email, u.name FROM envelopes e JOIN "user" u ON u.id = e.user_id WHERE e.id = $1',
     [envelopeId],
   );
   if (!owner)
@@ -1273,7 +1274,11 @@ export async function enqueueCompletionEmails(
   };
   const senderJob = await enqueueEmail(
     {
-      message: completionSenderEmail(input, branding, env),
+      message: completionSenderEmail(
+        { ...input, sender: owner },
+        branding,
+        env,
+      ),
       dedupeKey: `completion/${envelopeId}/sender`,
       envelopeId,
       userId: owner.userId,
@@ -1502,7 +1507,7 @@ export async function sendSignerEmailCode(
   const body = withUserEmailLegalFooter({ htmlBody, textBody }, branding);
   const message: TransactionalEmailMessage = {
     htmlBody: body.htmlBody,
-    subject: `Your code for "${context.envelope.title}"`,
+    subject: emailSubject`Your code for "${context.envelope.title}"`,
     template: "signing_code",
     textBody: body.textBody,
     to: context.signer.email,

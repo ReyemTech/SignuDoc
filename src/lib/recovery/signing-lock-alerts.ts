@@ -1,6 +1,8 @@
+import { emailSubject } from "../services/email-subject.ts";
 import {
   type DbExecutor,
   type DbPool,
+  type TransactionPool,
   queryMany,
   queryOne,
   withTransaction,
@@ -26,7 +28,7 @@ function isLockContention(error: unknown): boolean {
 }
 
 function withShortLockWait<T>(
-  database: DbPool,
+  database: TransactionPool,
   run: (tx: DbExecutor) => Promise<T>,
 ): Promise<T> {
   return withTransaction(async (tx) => {
@@ -51,7 +53,7 @@ export function buildSigningLockAlert(
   ].join("\n");
 
   return {
-    subject: `Signing locked for ${person.name}`,
+    subject: emailSubject`Signing locked for ${person.name}`,
     template: "signing_lock_alert",
     textBody,
     to: recipient,
@@ -69,7 +71,7 @@ type LockAudit = {
 
 async function reconcileSigningLockAlert(
   audit: LockAudit,
-  database: DbPool,
+  database: TransactionPool,
   env: EnvSource,
 ): Promise<string[]> {
   return withShortLockWait(database, async (tx) => {
@@ -154,7 +156,7 @@ async function discoverSigningLockAlerts({
   limit,
 }: {
   auditId?: string;
-  database: DbPool;
+  database: TransactionPool;
   limit: number;
 }): Promise<LockAudit[]> {
   return withShortLockWait(database, (tx) =>
@@ -194,7 +196,7 @@ async function reconcileSigningLockAlerts({
   signal,
 }: {
   auditId?: string;
-  database: DbPool;
+  database: TransactionPool;
   env?: EnvSource;
   limit: number;
   signal: AbortSignal;

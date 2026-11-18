@@ -1,10 +1,5 @@
 import { attachDatabasePool } from "@vercel/functions";
-import pg, {
-  Pool,
-  type PoolClient,
-  type QueryResult,
-  type QueryResultRow,
-} from "pg";
+import pg, { Pool, type QueryResult, type QueryResultRow } from "pg";
 
 import { getEnv } from "../utils/env.ts";
 import { requireConfigValue } from "../services/service-config.ts";
@@ -19,7 +14,18 @@ pg.types.setTypeParser(20, (value) => Number.parseInt(value, 10));
 
 let cachedPool: Pool | null = null;
 
-export type DbExecutor = Pick<Pool, "query"> | Pick<PoolClient, "query">;
+export type DbExecutor = {
+  query<Row extends QueryResultRow = QueryResultRow>(
+    text: string,
+    values?: unknown[],
+  ): Promise<QueryResult<Row>>;
+};
+export type TransactionClient = DbExecutor & {
+  release(error?: Error | boolean): void;
+};
+export type TransactionPool = DbExecutor & {
+  connect(): Promise<TransactionClient>;
+};
 export type DbPool = Pool;
 
 export function getDb(): Pool {
@@ -99,8 +105,8 @@ export function afterCommit(database: DbExecutor, callback: () => void): void {
 }
 
 export async function withTransaction<T>(
-  run: (client: PoolClient) => Promise<T>,
-  pool: Pool = getDb(),
+  run: (client: TransactionClient) => Promise<T>,
+  pool: TransactionPool = getDb(),
 ): Promise<T> {
   const client = await pool.connect();
   const pending: (() => void)[] = [];

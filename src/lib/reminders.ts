@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
@@ -223,8 +224,8 @@ function buildReminderEmail(input: {
 }) {
   const automatic = input.kind === "automatic";
   const subject = automatic
-    ? `Reminder: ${input.senderName} is waiting for your signature on "${input.envelopeTitle}"`
-    : `${input.senderName} sent you a reminder to sign "${input.envelopeTitle}"`;
+    ? emailSubject`Reminder: ${input.senderName} is waiting for your signature on "${input.envelopeTitle}"`
+    : emailSubject`${input.senderName} sent you a reminder to sign "${input.envelopeTitle}"`;
   const introLine = automatic
     ? `${input.senderName} is still waiting for your signature on "${input.envelopeTitle}", sent through ${input.branding.productName}.`
     : `${input.senderName} sent you a reminder to sign "${input.envelopeTitle}" through ${input.branding.productName}.`;
@@ -441,6 +442,7 @@ async function persistReminder(
     }
 
     const signerMetadata = {
+      ...(durable ? { delivery: "requested" } : {}),
       signerEmail: persistedSigner.email,
       signerId: persistedSigner.id,
       signerName: persistedSigner.name,
@@ -689,11 +691,13 @@ export async function sendManualEnvelopeNudge(
     database,
   );
 
+  let accepted = true;
   if (persisted.jobId) {
-    await tryDeliverWorkflowEmails([persisted.jobId], {
+    const delivered = await tryDeliverWorkflowEmails([persisted.jobId], {
       database,
       emailService: service,
     });
+    accepted = delivered.has(persisted.jobId);
   } else {
     await deliverReminder(persisted, "manual", database, service!);
   }
@@ -702,7 +706,8 @@ export async function sendManualEnvelopeNudge(
     envelopeId: persisted.envelopeId,
     nextAvailableAt: persisted.nextAvailableAt,
     nextAvailableAtLabel: formatReminderAvailableAt(persisted.nextAvailableAt),
-    sentAt: nowUnixTimestamp,
+    sentAt: accepted ? nowUnixTimestamp : null,
+    ...(persisted.jobId ? { requestedAt: nowUnixTimestamp } : {}),
     signerId: persisted.signerId,
     signerName: persisted.signerName,
   });

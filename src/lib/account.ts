@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
@@ -248,7 +249,7 @@ async function buildAccountClosureEmail(
   const purgeAfterAt = formatRetentionDeadline(closureSchedule.purgeAfterAt);
   return {
     replyTo: account.email,
-    subject: `Account closure request — ${account.name}`,
+    subject: emailSubject`Account closure request — ${account.name}`,
     template: "account_closure_request",
     textBody: [
       `A sender requested account closure from the ${productName} settings page.`,

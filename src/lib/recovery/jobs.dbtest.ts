@@ -554,3 +554,12 @@ test("a worker that times out waiting for a pool checkout never claims later", a
   );
   assert.deepEqual(pending.rows, [{ state: "pending", attempts: 0 }]);
 });
+
+// Compile-time regression: custom handlers get only the budgeted promise API.
+type HandlerDatabase = Parameters<
+  import("./worker.ts").RecoveryHandler
+>[1]["database"];
+const callbackFree: Parameters<HandlerDatabase["connect"]>["length"] extends 0
+  ? true
+  : false = true;
+void callbackFree;

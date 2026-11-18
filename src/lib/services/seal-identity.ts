@@ -10,7 +10,11 @@ import {
 
 import { PDFDocument } from "pdf-lib";
 
-import { getDb, withTransaction, type DbPool } from "../db/connection.ts";
+import {
+  getDb,
+  withTransaction,
+  type TransactionPool,
+} from "../db/connection.ts";
 import type { Branding } from "../branding.ts";
 import { getBranding } from "../settings.ts";
 import {
@@ -144,7 +148,7 @@ type SealKeyRow = {
 
 async function identityFromDatabase(
   env: EnvSource,
-  database: DbPool,
+  database: TransactionPool,
 ): Promise<CachedIdentity> {
   const key = encryptionKey(env);
   // Read before the transaction: settings come through another connection,
@@ -219,7 +223,10 @@ async function identityFromDatabase(
 export async function getSealIdentity({
   database = getDb(),
   env = process.env,
-}: { database?: DbPool; env?: EnvSource } = {}): Promise<SealIdentity> {
+}: {
+  database?: TransactionPool;
+  env?: EnvSource;
+} = {}): Promise<SealIdentity> {
   const cached = globalThis.__signudocSealIdentity;
 
   if (cached) {
@@ -259,7 +266,7 @@ export async function saveInstallSealedPdf(
   }: {
     branding?: Branding;
     signal?: AbortSignal;
-    database?: DbPool;
+    database?: TransactionPool;
     env?: EnvSource;
     identity?: SealIdentity;
   } = {},

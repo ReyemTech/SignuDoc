@@ -1,4 +1,4 @@
-import { getDb, type DbPool } from "../db/connection.ts";
+import { getDb, type DbPool, type TransactionPool } from "../db/connection.ts";
 import { type EmailService } from "../services/email.ts";
 import { type EnvSource } from "../utils/env.ts";
 import { assertRecoveryConfigured, isDurableJobsEnabled } from "./config.ts";
@@ -20,7 +20,7 @@ import {
 
 export type RecoveryHandler = (
   job: ClaimedRecoveryJob,
-  options: { database: DbPool; env: EnvSource; signal: AbortSignal },
+  options: { database: TransactionPool; env: EnvSource; signal: AbortSignal },
 ) => Promise<void>;
 
 export type RecoveryRunSummary = {
@@ -50,7 +50,7 @@ async function runClaim(
     database,
     env,
     signal,
-  }: { database: DbPool; env: EnvSource; signal: AbortSignal },
+  }: { database: TransactionPool; env: EnvSource; signal: AbortSignal },
 ): Promise<boolean> {
   const lease = new AbortController();
   let heartbeat: Promise<void> | null = null;

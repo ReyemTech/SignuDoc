@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { type Branding } from "./branding.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueEmail } from "./recovery/email.ts";
@@ -21,7 +22,7 @@ function buildRenewalEmail(
   { envelope, evidenceUrl, signedUrl, signer }: RenewalEmailData,
   branding: Branding,
 ) {
-  const subject = `New download links for "${envelope.title}"`;
+  const subject = emailSubject`New download links for "${envelope.title}"`;
   const textBody = [
     `Hi ${signer.name},`,
     "",

@@ -95,7 +95,8 @@ export const manualNudgeResponseSchema = z.object({
   envelopeId: idSchema,
   nextAvailableAt: unixTimestampSchema,
   nextAvailableAtLabel: z.string().trim().min(1),
-  sentAt: unixTimestampSchema,
+  sentAt: unixTimestampSchema.nullable(),
+  requestedAt: unixTimestampSchema.optional(),
   signerId: idSchema,
   signerName: z.string().trim().min(1).max(160),
 });

@@ -1,4 +1,4 @@
-import type { DbPool } from "../db/connection.ts";
+import type { TransactionPool } from "../db/connection.ts";
 import type { EnvSource } from "../utils/env.ts";
 import { randomUUID } from "node:crypto";
 
@@ -75,7 +75,11 @@ const defaultSealer: PdfSealer = (pdfDocument, purpose) =>
  * without waiting on a pool that its own concurrent requests have filled.
  */
 export async function loadInstallSealer(
-  options: { database?: DbPool; env?: EnvSource; signal?: AbortSignal } = {},
+  options: {
+    database?: TransactionPool;
+    env?: EnvSource;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<PdfSealer> {
   const identity = await getSealIdentity(options);
   const branding = await getBranding(options.env, options.database);

@@ -1,3 +1,4 @@
+import { emailSubject } from "../services/email-subject.ts";
 import { createHash } from "node:crypto";
 
 import { APIError, betterAuth } from "better-auth";
@@ -131,7 +132,7 @@ function buildEmailVerificationMessage(input: {
 
   return {
     htmlBody: legalFooter.htmlBody,
-    subject: `Verify your ${productName} email`,
+    subject: emailSubject`Verify your ${productName} email`,
     template: "email_verification" as const,
     textBody: legalFooter.textBody,
   };
@@ -168,7 +169,7 @@ function buildChangeEmailConfirmationMessage(input: {
 
   return {
     htmlBody: legalFooter.htmlBody,
-    subject: `Confirm your ${productName} email change`,
+    subject: emailSubject`Confirm your ${productName} email change`,
     template: "change_email_confirmation" as const,
     textBody: legalFooter.textBody,
   };
@@ -204,7 +205,7 @@ function buildPasswordResetMessage(input: {
 
   return {
     htmlBody: legalFooter.htmlBody,
-    subject: `Reset your ${productName} password`,
+    subject: emailSubject`Reset your ${productName} password`,
     template: "password_reset" as const,
     textBody: legalFooter.textBody,
   };

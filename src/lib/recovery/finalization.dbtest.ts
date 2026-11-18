@@ -18,6 +18,7 @@ import {
   deletePendingFile,
   listEnvelopeStorageKeys,
 } from "../retention.ts";
+import { setPersonRole, findRecordKeeper } from "../people.ts";
 import { verifyAuditChain } from "../services/audit.ts";
 import { readCms } from "../services/pdf-ltv.ts";
 import { sha256Hex } from "../services/pdf-seal.ts";
@@ -819,3 +820,163 @@ for (const phase of ["data-rename", "metadata-rename"]) {
     assert.equal((await local.headObject(winner)).exists, true);
   });
 }
+
+for (const when of ["before publication", "after publication"] as const) {
+  test(`purging a former keeper ${when} preserves retained recipients and finalization`, async () => {
+    const f = await fixture();
+    const copy = randomUUID() + "@example.test";
+    await database.query(
+      "INSERT INTO signers(id,envelope_id,name,email,sign_order,role,status) VALUES($1,$2,'Copy recipient',$3,2,'cc','pending')",
+      [randomUUID(), f.envelopeId, copy],
+    );
+    const admins: string[] = [randomUUID(), randomUUID()];
+    users.push(...admins);
+    for (const [index, id] of admins.entries())
+      await database.query(
+        `INSERT INTO "user"(id,name,email,role,"emailVerified","createdAt") VALUES($1,'Keeper',$1||'@example.test','admin', true, $2)`,
+        [id, new Date(1000 + index)],
+      );
+    const purge = async (id: string) => {
+      await database.query(
+        "INSERT INTO account_closure_requests(user_id,requested_at,export_expires_at,purge_after_at,updated_at) VALUES($1,1,1,1,1)",
+        [id],
+      );
+      const summary = await runRetentionSweep({
+        database,
+        storageService: storage,
+      });
+      assert.ok(!summary.accountPurgeFailures.includes(id));
+      assert.equal(
+        (await database.query('SELECT 1 FROM "user" WHERE id=$1', [id]))
+          .rowCount,
+        0,
+      );
+    };
+    const keeper = await findRecordKeeper(f.userId, database);
+    assert.ok(keeper && admins.includes(keeper));
+    const successor = admins.find((id) => id !== keeper)!;
+    try {
+      await purge(f.userId);
+      await submitSigningForToken(f.token, f.submission, {
+        database,
+        verifiedMethods: ["account"],
+        verifyPassword: async () => true,
+      });
+      const jobId = (
+        await database.query(
+          "SELECT id FROM recovery_jobs WHERE kind='finalize_envelope' AND envelope_id=$1",
+          [f.envelopeId],
+        )
+      ).rows[0].id;
+      await database.query(
+        "UPDATE recovery_jobs SET purge_with_user=NULL WHERE id=$1",
+        [jobId],
+      );
+      if (when === "before publication") {
+        await setPersonRole(successor, keeper, "user", database);
+        await purge(keeper);
+      }
+      assert.equal((await runRecoveryJobs({ database, jobId })).processed, 1);
+      if (when === "after publication") {
+        await database.query(
+          "UPDATE recovery_jobs SET purge_with_user=NULL WHERE envelope_id=$1 AND dedupe_key LIKE 'completion/%/copy/%'",
+          [f.envelopeId],
+        );
+        await purge(keeper);
+      }
+      const recipientJobs = (
+        await database.query(
+          "SELECT id FROM recovery_jobs WHERE envelope_id=$1 AND kind='email' ORDER BY dedupe_key",
+          [f.envelopeId],
+        )
+      ).rows;
+      const recipients: string[] = [];
+      for (const job of recipientJobs)
+        await runRecoveryJobs({
+          database,
+          jobId: job.id,
+          emailService: {
+            async send(message) {
+              recipients.push(message.to);
+              return {
+                accepted: [message.to],
+                rejected: [],
+                messageId: "fixture",
+              };
+            },
+            async sendBatch() {
+              throw new Error("unexpected");
+            },
+          },
+        });
+      assert.ok(recipients.includes(f.email));
+      assert.ok(recipients.includes(copy));
+      assert.ok(!recipients.includes(keeper + "@example.test"));
+      if (when === "before publication")
+        assert.ok(recipients.includes(successor + "@example.test"));
+    } finally {
+      for (const key of await listEnvelopeStorageKeys(f.envelopeId, database))
+        keys.add(key);
+      await database.query("DELETE FROM envelopes WHERE id=$1", [f.envelopeId]);
+      await database.query('DELETE FROM "user" WHERE id=ANY($1)', [admins]);
+    }
+  });
+}
+test("a legacy multiline envelope publishes after durable recovery activates", async () => {
+  const f = await fixture();
+  const title = "Approved\r\nrecord";
+  await database.query("UPDATE envelopes SET title=$2 WHERE id=$1", [
+    f.envelopeId,
+    title,
+  ]);
+  await submitSigningForToken(f.token, f.submission, {
+    database,
+    verifiedMethods: ["account"],
+    verifyPassword: async () => true,
+  });
+  const jobId = (
+    await database.query("SELECT id FROM recovery_jobs WHERE envelope_id=$1", [
+      f.envelopeId,
+    ])
+  ).rows[0].id;
+  assert.equal((await runRecoveryJobs({ database, jobId })).failed, 0);
+  assert.deepEqual(
+    (
+      await database.query("SELECT title,status FROM envelopes WHERE id=$1", [
+        f.envelopeId,
+      ])
+    ).rows,
+    [{ title, status: "completed" }],
+  );
+  const mail = await database.query(
+    "SELECT id FROM recovery_jobs WHERE kind='email' AND envelope_id=$1",
+    [f.envelopeId],
+  );
+  assert.equal(mail.rowCount, 2);
+  for (const { id } of mail.rows) {
+    await runRecoveryJobs({
+      database,
+      jobId: id,
+      emailService: {
+        async send(message) {
+          assert.equal(message.subject, '"Approved record" is fully signed');
+          assert.ok(message.textBody.includes(title));
+          return { accepted: [message.to], rejected: [], messageId: "fixture" };
+        },
+        async sendBatch() {
+          throw new Error("unexpected");
+        },
+      },
+    });
+    assert.equal(
+      (
+        await database.query("SELECT state FROM recovery_jobs WHERE id=$1", [
+          id,
+        ])
+      ).rows[0].state,
+      "succeeded",
+    );
+  }
+  for (const key of await listEnvelopeStorageKeys(f.envelopeId, database))
+    keys.add(key);
+});

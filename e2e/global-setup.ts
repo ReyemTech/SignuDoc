@@ -1,4 +1,5 @@
-import { rm } from "node:fs/promises";
+import path from "node:path";
+import { mkdir, readdir, rm } from "node:fs/promises";
 
 import pg from "pg";
 
@@ -65,5 +66,9 @@ export default async function globalSetup() {
 
   await runMigrations({ connectionString: e2eDatabaseUrl });
 
-  await rm(e2eDataDir, { force: true, recursive: true });
+  // A running browser container binds this inode. Clear only its contents.
+  await mkdir(e2eDataDir, { recursive: true });
+  for (const child of await readdir(e2eDataDir)) {
+    await rm(path.join(e2eDataDir, child), { force: true, recursive: true });
+  }
 }

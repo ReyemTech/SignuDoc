@@ -1,7 +1,9 @@
+import { emailSubject } from "./services/email-subject.ts";
 import {
   RETENTION_WARNING_DAYS,
   RETENTION_MIN_NOTICE_DAYS,
   readRetentionPolicy,
+  retentionNoticeKeySql,
   type RetentionPolicy,
 } from "./recovery/retention-policy.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
@@ -667,8 +669,11 @@ async function deleteAccountRows(
     database,
   );
 
-  // The relation can predate this checkout in a legacy install. Existing
-  // recovery rows still belong to the account when the flag is off.
+  // The relation may be absent on a legacy install.
+  // Account mail and owner notices go with the account. A retained envelope
+  // keeps its sealing snapshot, recipient mail and tombstones. The frozen
+  // user_id remains part of their authenticated identity. Removed envelopes
+  // cascade all their jobs, including when the feature flag is off.
   if (
     isDurableJobsEnabled(env) ||
     (
@@ -679,7 +684,13 @@ async function deleteAccountRows(
     )?.present
   ) {
     await database.query(
-      "DELETE FROM public.recovery_jobs WHERE user_id = $1",
+      `DELETE FROM public.recovery_jobs WHERE user_id = $1 AND COALESCE(purge_with_user,
+        -- Backups and encrypted jobs created before explicit lifetime tracking.
+        envelope_id IS NULL OR dedupe_key IN (
+          'completion/' || envelope_id || '/sender', 'decline/' || envelope_id || '/sender'
+        ) OR starts_with(dedupe_key, 'expiry-notice/' || envelope_id || '/')
+          OR starts_with(dedupe_key, 'retention-notice/' || envelope_id || '/')
+      )`,
       [userId],
     );
   }
@@ -805,7 +816,7 @@ async function listFinishedEnvelopesToHandle(
   database: DbExecutor,
 ): Promise<FinishedEnvelopeRow[]> {
   const warnedAt = policy
-    ? "CASE WHEN e.retention_warning_policy_generation = $4 THEN e.retention_warned_at END"
+    ? `CASE WHEN e.retention_warning_key = ${retentionNoticeKeySql("$4")} THEN e.retention_warned_at END`
     : "e.retention_warned_at";
   return queryMany<FinishedEnvelopeRow>(
     database,
@@ -835,7 +846,7 @@ async function listFinishedEnvelopesToHandle(
             ${
               policy
                 ? `AND NOT EXISTS (
-              SELECT 1 FROM recovery_jobs r WHERE r.dedupe_key = 'retention-notice/' || e.id || '/' || $4::bigint::text
+              SELECT 1 FROM recovery_jobs r WHERE r.dedupe_key = ${retentionNoticeKeySql("$4")}
             )`
                 : ""
             }
@@ -873,7 +884,7 @@ function buildRetentionWarning(
   const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
 
   return {
-    subject: `"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
+    subject: emailSubject`"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
     template: "retention_notice" as const,
     textBody: [
       `Hello ${envelope.ownerName},`,
@@ -910,6 +921,8 @@ async function enqueueRetentionWarning(
   database: DbExecutor,
 ): Promise<string | undefined> {
   const enqueue = async (tx: DbExecutor) => {
+    const policy = await readRetentionPolicy(tx, true);
+    if (!policy) return;
     const current = await queryOne<
       Pick<
         FinishedEnvelopeRow,
@@ -920,32 +933,29 @@ async function enqueueRetentionWarning(
         | "title"
         | "finishedAt"
         | "retentionWarnedAt"
-      > & { warningGeneration: number | null }
+      > & { warningKey: string | null; noticeKey: string }
     >(
       tx,
       `SELECT e.id, e.title, e.user_id AS "userId", u.email AS "ownerEmail", u.name AS "ownerName",
         COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt",
         e.retention_warned_at AS "retentionWarnedAt",
-        e.retention_warning_policy_generation AS "warningGeneration"
+        e.retention_warning_key AS "warningKey", ${retentionNoticeKeySql("$2")} AS "noticeKey"
       FROM envelopes e JOIN "user" u ON u.id = e.user_id
       WHERE e.id = $1 AND e.status IN ('completed', 'declined', 'voided') AND NOT e.part11
-      FOR NO KEY UPDATE OF e`,
-      [envelopeId],
+      FOR NO KEY UPDATE OF e FOR SHARE OF u`,
+      [envelopeId, policy.generation],
     );
     if (!current) return;
 
-    const policy = await readRetentionPolicy(tx, true);
     if (
-      !policy ||
       (current.retentionWarnedAt !== null &&
-        current.warningGeneration === policy.generation) ||
+        current.warningKey === current.noticeKey) ||
       current.finishedAt >=
         now - (policy.days - RETENTION_WARNING_DAYS) * DAY_IN_SECONDS
     )
       return;
 
-    // Each policy generation has one frozen warning.
-    const dedupeKey = `retention-notice/${current.id}/${policy.generation}`;
+    const dedupeKey = current.noticeKey;
     const existing = await queryOne<{ id: string }>(
       tx,
       "SELECT id FROM recovery_jobs WHERE dedupe_key = $1",
@@ -966,6 +976,7 @@ async function enqueueRetentionWarning(
         acknowledgement: {
           kind: "retention_warning",
           policyGeneration: policy.generation,
+          noticeKey: dedupeKey,
         },
       },
       { database: tx },
@@ -984,24 +995,24 @@ async function deleteUnderRetentionPolicy(
   storageService: StorageService,
 ): Promise<boolean> {
   const remove = async (tx: DbExecutor) => {
+    const policy = await readRetentionPolicy(tx, true);
+    if (!policy) return null;
     const current = await queryOne<{
       finishedAt: number;
       warnedAt: number;
-      generation: number;
     }>(
       tx,
-      `SELECT retention_warned_at AS "warnedAt", retention_warning_policy_generation AS generation,
-          COALESCE(completed_at, declined_at, voided_at, updated_at) AS "finishedAt"
-        FROM envelopes WHERE id = $1 AND status IN ('completed', 'declined', 'voided')
+      `SELECT retention_warned_at AS "warnedAt",
+          COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt"
+        FROM envelopes e JOIN "user" u ON u.id=e.user_id
+        WHERE e.id = $1 AND status IN ('completed', 'declined', 'voided')
           AND NOT part11 AND retention_warned_at IS NOT NULL
-        FOR NO KEY UPDATE`,
-      [envelopeId],
+          AND retention_warning_key = ${retentionNoticeKeySql("$2")}
+        FOR NO KEY UPDATE OF e FOR SHARE OF u`,
+      [envelopeId, policy.generation],
     );
     if (!current) return null;
-    const policy = await readRetentionPolicy(tx, true);
     if (
-      !policy ||
-      policy.generation !== current.generation ||
       current.warnedAt > now - RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS ||
       current.finishedAt >= now - policy.days * DAY_IN_SECONDS
     )

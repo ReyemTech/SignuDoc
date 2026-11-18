@@ -1028,8 +1028,12 @@ test("a certificate in someone else's name does not sign for the invited signer"
   ]);
 });
 
-test("durable first invitation rolls back with the send transaction", async () => {
+test("durable first invitation for a multiline title rolls back with the send transaction", async () => {
   const draft = await createDraft();
+  await database.query("UPDATE envelopes SET title=$2 WHERE id=$1", [
+    draft.envelopeId,
+    "Supply\r\nagreement",
+  ]);
   setEnv({
     DURABLE_JOBS_ENABLED: "true",
     BETTER_AUTH_SECRET: "fixture-secret-for-durable-workflow",

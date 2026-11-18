@@ -1,3 +1,4 @@
+import { emailSubject } from "./email-subject.ts";
 import { type Branding } from "../branding.ts";
 import { formatDeadline } from "../envelope-deadline.ts";
 import { escapeHtml } from "../utils/html.ts";
@@ -31,7 +32,7 @@ export function buildSigningInvitationEmail(
   input: SigningInvitationEmailInput,
 ): TransactionalEmailMessage {
   const { productName } = input.branding;
-  const subject = `${input.senderName} requested your signature on "${input.envelopeTitle}"`;
+  const subject = emailSubject`${input.senderName} requested your signature on "${input.envelopeTitle}"`;
   const deadlineLine = buildDeadlineLine(input.expiresAt, input.durable);
   const textBody = [
     `Hi ${input.signerName},`,

@@ -291,15 +291,21 @@ test("a malformed provider result stays retryable and cannot start retention gra
   );
   const policy = await readRetentionPolicy(database);
   assert.ok(policy);
+  const recipient = userId + "@example.test";
+  const notice = await database.query(
+    'SELECT public.retention_notice_key(e.id, $2, e.retention_custody_revision, u.retention_mailbox_revision) AS key FROM envelopes e JOIN "user" u ON u.id=e.user_id WHERE e.id=$1',
+    [envelopeId, policy.generation],
+  );
   const { id } = await enqueueEmail(
     {
-      message: { ...message, template: "retention_notice" },
+      message: { ...message, to: recipient, template: "retention_notice" },
       dedupeKey: dedupeKey(),
       envelopeId,
       userId,
       acknowledgement: {
         kind: "retention_warning",
         policyGeneration: policy.generation,
+        noticeKey: notice.rows[0].key,
       },
     },
     { database, env, addresses },
@@ -311,7 +317,7 @@ test("a malformed provider result stays retryable and cannot start retention gra
     );
   const emailService: EmailService = {
     ...sendNever,
-    send: async () => ({ accepted: [message.to], rejected: [] }),
+    send: async () => ({ accepted: [recipient], rejected: [] }),
   };
   await runRecoveryJobs({ database, env, jobId: id, emailService });
   assert.deepEqual((await warning()).rows, [{ warned: null }]);
@@ -335,7 +341,7 @@ test("a malformed provider result stays retryable and cannot start retention gra
     emailService: {
       ...emailService,
       send: async () => ({
-        accepted: [message.to],
+        accepted: [recipient],
         rejected: [],
         messageId: "confirmed-id",
       }),
@@ -622,9 +628,8 @@ test("a successful guard crossing the retry cutoff cannot reach the provider", a
   const delayed = afterStatement(
     database,
     (sql, values) =>
-      sql.includes(
-        'retention_warning_policy_generation AS "warningGeneration"',
-      ) && values[0] === envelopeId,
+      sql.includes('e.retention_warning_key AS "warningKey"') &&
+      values[0] === envelopeId,
     async () => {
       guardReads += 1;
       await database.query(

@@ -9,7 +9,7 @@ import {
 
 import {
   type DbExecutor,
-  type DbPool,
+  type TransactionPool,
   withTransaction,
 } from "../db/connection.ts";
 import { canonicalJson } from "../utils/canonical-json.ts";
@@ -95,6 +95,8 @@ type EnqueueRecoveryJobInput = {
   envelopeId?: string;
   userId?: string;
   expiresAt?: number;
+  /** Owner-directed mail is erased with its account even if the envelope survives. */
+  purgeWithUser?: boolean;
   /** Mutable effective expiry for a signing credential. */
   signingExpiresAt?: number;
 };
@@ -202,8 +204,8 @@ export async function enqueueRecoveryJob(
   const ciphertext = encryptPayload(payload, { id, ...parent }, env);
   const { rowCount } = await database.query(
     `INSERT INTO recovery_jobs (
-        id, kind, dedupe_key, envelope_id, user_id, expires_at, payload_digest, payload_ciphertext, signing_expires_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        id, kind, dedupe_key, envelope_id, user_id, expires_at, payload_digest, payload_ciphertext, signing_expires_at, purge_with_user
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
       ON CONFLICT (dedupe_key) DO NOTHING`,
     [
       id,
@@ -215,6 +217,7 @@ export async function enqueueRecoveryJob(
       digest,
       ciphertext,
       input.signingExpiresAt ?? null,
+      !input.envelopeId || input.purgeWithUser === true,
     ],
   );
   if (rowCount === 1) return { id, created: true };
@@ -239,7 +242,7 @@ export async function enqueueRecoveryJob(
 }
 
 type ClaimOptions = {
-  database: DbPool;
+  database: TransactionPool;
   env?: EnvSource;
   jobId?: string;
   kinds?: readonly RecoveryJobKind[];
@@ -386,7 +389,10 @@ export async function completeRecoveryJob(
   {
     database,
     onCommit,
-  }: { database: DbPool; onCommit?: (tx: DbExecutor) => Promise<void> },
+  }: {
+    database: TransactionPool;
+    onCommit?: (tx: DbExecutor) => Promise<void>;
+  },
 ): Promise<boolean> {
   const values = [job.id, job.leaseToken];
 

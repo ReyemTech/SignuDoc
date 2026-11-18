@@ -3,7 +3,7 @@ import { z } from "zod";
 
 import {
   type DbExecutor,
-  type DbPool,
+  type TransactionPool,
   queryOne,
   withTransaction,
 } from "../db/connection.ts";
@@ -28,6 +28,7 @@ import {
   RETENTION_DAY_SECONDS,
   RETENTION_WARNING_DAYS,
   readRetentionPolicy,
+  retentionNoticeKeySql,
 } from "./retention-policy.ts";
 import { assertRecoveryConfigured, isDurableJobsEnabled } from "./config.ts";
 import {
@@ -84,7 +85,12 @@ const acknowledgementSchema = z.discriminatedUnion("kind", [
   emailAudit.extend({ kind: z.literal("email_audit") }),
   z.object({
     kind: z.literal("retention_warning"),
-    policyGeneration: z.number().int().positive().optional(),
+    // Numeric snapshots predate recipient-specific notice identities. They
+    // decode so the worker can retire them without granting grace.
+    policyGeneration: z
+      .union([z.uuid(), z.number().int().positive()])
+      .optional(),
+    noticeKey: id.optional(),
     audit: emailAudit.optional(),
   }),
   z.object({
@@ -150,6 +156,19 @@ function hasGuardAssociation(
     : Boolean(job.envelopeId);
 }
 
+function isEnvelopeOwnerNotice({
+  guard,
+  acknowledgement,
+}: Pick<EnqueueEmailInput, "guard" | "acknowledgement">) {
+  return (
+    acknowledgement?.kind === "retention_warning" ||
+    acknowledgement?.kind === "expiry_notice" ||
+    (guard?.kind === "envelope_status" &&
+      acknowledgement?.kind === "email_audit" &&
+      !acknowledgement.signerId)
+  );
+}
+
 export async function enqueueEmail(
   { message, guard, acknowledgement, ...job }: EnqueueEmailInput,
   {
@@ -166,7 +185,9 @@ export async function enqueueEmail(
     (message.template === "password_reset" &&
       guard?.kind !== "password_reset") ||
     (acknowledgement?.kind === "retention_warning" &&
-      acknowledgement.policyGeneration === undefined)
+      (typeof acknowledgement.policyGeneration !== "string" ||
+        !acknowledgement.noticeKey ||
+        !job.userId))
   ) {
     throw new RecoveryJobError("payload_invalid", true);
   }
@@ -197,7 +218,12 @@ export async function enqueueEmail(
   if (!payload.success) throw new RecoveryJobError("payload_invalid", true);
 
   return enqueueRecoveryJob(
-    { ...job, kind: "email", payload: payload.data },
+    {
+      ...job,
+      kind: "email",
+      payload: payload.data,
+      purgeWithUser: isEnvelopeOwnerNotice({ guard, acknowledgement }),
+    },
     { database, env },
   );
 }
@@ -211,7 +237,10 @@ type EnvelopeGuardRow = {
   part11: boolean;
   now: number;
   finishedAt: number;
-  warningGeneration: number | null;
+  warningKey: string | null;
+  noticeKey: string | null;
+  ownerId: string;
+  ownerEmail: string;
 };
 
 async function emailGuardMatches(
@@ -263,12 +292,27 @@ async function emailGuardMatches(
     database,
     `SELECT status, finalization_pending AS "finalizationPending",expires_at AS "expiresAt", expiry_notified_at AS "expiryNotifiedAt",
         retention_warned_at AS "retentionWarnedAt", part11, ${DATABASE_SECONDS} AS now,
-        COALESCE(completed_at, declined_at, voided_at, updated_at) AS "finishedAt",
-        retention_warning_policy_generation AS "warningGeneration"
-      FROM envelopes WHERE id = $1`,
-    [job.envelopeId],
+        COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt",
+        e.retention_warning_key AS "warningKey", ${retentionNoticeKeySql("$2")} AS "noticeKey",
+        u.id AS "ownerId", u.email AS "ownerEmail"
+      FROM envelopes e JOIN "user" u ON u.id=e.user_id WHERE e.id = $1`,
+    [
+      job.envelopeId,
+      acknowledgement?.kind === "retention_warning" &&
+      typeof acknowledgement.policyGeneration === "string"
+        ? acknowledgement.policyGeneration
+        : null,
+    ],
   );
   if (!envelope) return false;
+
+  // Owner notices cannot disclose a retained record to a former keeper.
+  if (
+    isEnvelopeOwnerNotice({ guard, acknowledgement }) &&
+    job.userId &&
+    (job.userId !== envelope.ownerId || message.to !== envelope.ownerEmail)
+  )
+    return false;
 
   if (
     acknowledgement?.kind === "expiry_notice" &&
@@ -285,10 +329,12 @@ async function emailGuardMatches(
     if (
       !policy ||
       policy.generation !== acknowledgement.policyGeneration ||
+      !acknowledgement.noticeKey ||
+      acknowledgement.noticeKey !== envelope.noticeKey ||
       !FINAL_ENVELOPE_STATUSES.has(envelope.status) ||
       envelope.part11 ||
       (envelope.retentionWarnedAt !== null &&
-        envelope.warningGeneration === policy.generation) ||
+        envelope.warningKey === envelope.noticeKey) ||
       envelope.finishedAt >=
         envelope.now -
           (policy.days - RETENTION_WARNING_DAYS) * RETENTION_DAY_SECONDS
@@ -341,6 +387,7 @@ async function emailGuardMatches(
 
 async function acknowledgeEmail(
   envelopeId: string,
+  userId: string | null,
   { message, acknowledgement }: FrozenEmail,
   messageId: string,
   database: DbExecutor,
@@ -351,14 +398,20 @@ async function acknowledgeEmail(
     const policy = await readRetentionPolicy(database, true);
     if (policy && policy.generation === acknowledgement.policyGeneration) {
       await database.query(
-        `UPDATE envelopes SET retention_warned_at = ${DATABASE_SECONDS}, retention_warning_policy_generation = $2
-          WHERE id = $1 AND status IN ('completed', 'declined', 'voided') AND NOT part11
-            AND (retention_warned_at IS NULL OR retention_warning_policy_generation IS DISTINCT FROM $2)
-            AND COALESCE(completed_at, declined_at, voided_at, updated_at) < ${DATABASE_SECONDS} - $3`,
+        `UPDATE envelopes e SET retention_warned_at = ${DATABASE_SECONDS}, retention_warning_key = $4
+          FROM "user" u
+          WHERE e.id = $1 AND status IN ('completed', 'declined', 'voided') AND NOT part11
+            AND u.id=e.user_id AND u.id=$5 AND u.email=$6
+            AND ${retentionNoticeKeySql("$2")} = $4
+            AND (retention_warned_at IS NULL OR retention_warning_key IS DISTINCT FROM $4)
+            AND COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) < ${DATABASE_SECONDS} - $3`,
         [
           envelopeId,
           policy.generation,
           (policy.days - RETENTION_WARNING_DAYS) * RETENTION_DAY_SECONDS,
+          acknowledgement.noticeKey,
+          userId,
+          message.to,
         ],
       );
     }
@@ -458,7 +511,7 @@ export async function processEmailJob(
     emailService,
     signal,
   }: {
-    database: DbPool;
+    database: TransactionPool;
     env?: EnvSource;
     emailService?: EmailService;
     signal?: AbortSignal;
@@ -479,7 +532,11 @@ export async function processEmailJob(
     throw new RecoveryJobError("payload_invalid", true);
   }
 
-  if (job.userId && payload.guard?.kind !== "password_reset") {
+  if (
+    !job.envelopeId &&
+    job.userId &&
+    payload.guard?.kind !== "password_reset"
+  ) {
     const user = await database.query('SELECT 1 FROM "user" WHERE id = $1', [
       job.userId,
     ]);
@@ -564,7 +621,8 @@ export async function processEmailJob(
     database,
     onCommit:
       envelopeId && payload.acknowledgement
-        ? (tx) => acknowledgeEmail(envelopeId, payload, messageId, tx)
+        ? (tx) =>
+            acknowledgeEmail(envelopeId, job.userId, payload, messageId, tx)
         : undefined,
   });
 }

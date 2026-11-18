@@ -1,3 +1,4 @@
+import { emailSubject } from "./services/email-subject.ts";
 import { randomUUID } from "node:crypto";
 
 import { isDurableJobsEnabled } from "./recovery/config.ts";
@@ -1566,7 +1567,7 @@ function buildVoidNotificationEmail(input: {
   signerEmail: string;
   signerName: string;
 }) {
-  const subject = `"${input.envelopeTitle}" was voided by ${input.senderName}`;
+  const subject = emailSubject`"${input.envelopeTitle}" was voided by ${input.senderName}`;
   const textBody = [
     `Hi ${input.signerName},`,
     "",
@@ -1690,9 +1691,13 @@ function buildTimelineDescription(event: AuditEventRecord): string {
         ? `Declined by ${targetLabel} — ${declineReason}`
         : `Declined by ${targetLabel}`;
     case "reminded_manual":
-      return `Manual reminder sent to ${targetLabel}`;
+      return event.metadata?.delivery === "requested"
+        ? `Manual reminder requested for ${targetLabel}`
+        : `Manual reminder sent to ${targetLabel}`;
     case "reminded_auto":
-      return `Automatic reminder sent to ${targetLabel}`;
+      return event.metadata?.delivery === "requested"
+        ? `Automatic reminder requested for ${targetLabel}`
+        : `Automatic reminder sent to ${targetLabel}`;
     case "consented":
       return `${targetLabel} agreed to use electronic records and signatures`;
     case "verified":

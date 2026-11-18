@@ -1,4 +1,8 @@
-import { queryOne, withTransaction, type DbPool } from "../db/connection.ts";
+import {
+  queryOne,
+  withTransaction,
+  type TransactionPool,
+} from "../db/connection.ts";
 import { recordAuditEvent } from "../services/audit.ts";
 import {
   finalizeEnvelope,
@@ -27,7 +31,7 @@ export async function processFinalizationJob(
     signal,
     storageService: injectedStorage,
   }: {
-    database: DbPool;
+    database: TransactionPool;
     env: EnvSource;
     signal: AbortSignal;
     storageService?: StorageService;

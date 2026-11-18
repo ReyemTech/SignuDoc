@@ -15,7 +15,7 @@ export function containerApp(
   if (!uid || gid === undefined) {
     throw new Error("Container browser tests require a non-root host user.");
   }
-  const data = path.dirname(path.dirname(outbox));
+  const data = path.dirname(outbox);
   mkdirSync(data, { recursive: true });
   const host = "host.docker.internal";
   const hostNetwork = process.platform === "linux";
@@ -72,7 +72,7 @@ export function containerApp(
     "--tmpfs",
     `/app/.next/cache:rw,uid=${uid},gid=${gid},size=256m`,
     "--mount",
-    `type=bind,source=${data},target=/app/.data`,
+    `type=bind,source=${data},target=/app/.data/e2e`,
     ...[...Object.keys(containerEnv), ...inherited].flatMap((name) => [
       "--env",
       name,
