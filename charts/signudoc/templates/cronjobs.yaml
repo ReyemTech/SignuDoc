@@ -1,4 +1,4 @@
-{{- range $job := list "retention" "backup" }}
+{{- range $job := list "retention" "backup" "recovery" }}
 {{- $settings := index $.Values.cron $job }}
 {{- if $settings.enabled }}
 ---

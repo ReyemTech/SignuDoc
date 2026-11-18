@@ -82,6 +82,19 @@ for (const [setting, error] of [
   assert.throws(() => render("--set", setting), error);
 }
 
+assert.throws(
+  () => render("--set", "cron.recovery.enabled=true"),
+  /cron.recovery requires config.DURABLE_JOBS_ENABLED=true/,
+);
+assert.throws(
+  () =>
+    render(
+      "--set",
+      "cron.recovery.enabled=true,config.DURABLE_JOBS_ENABLED=true,extraEnv[0].name=DURABLE_JOBS_ENABLED,extraEnv[0].value=false",
+    ),
+  /DURABLE_JOBS_ENABLED is managed by the chart/,
+);
+
 const external = render(...s3);
 assert.ok(!external.some(({ kind }) => kind === "PersistentVolumeClaim"));
 assert.deepEqual(workload(external, "Deployment").spec.strategy, {
@@ -232,7 +245,7 @@ assert.ok(
 
 const scheduled = render(
   "--set",
-  "storage.driver=blob,cron.backup.enabled=true,cron.retention.enabled=true,cron.retention.schedule=15 2 * * *,existingSecret=deployment-env",
+  "storage.driver=blob,cron.backup.enabled=true,cron.retention.enabled=true,cron.recovery.enabled=true,config.DURABLE_JOBS_ENABLED=true,cron.retention.schedule=15 2 * * *,existingSecret=deployment-env",
 );
 const longRelease = renderRelease(
   "production.signudoc-in-a-longer-named-namespace",
@@ -246,16 +259,34 @@ assert.match(
 assert.ok(workload(longRelease, "CronJob").metadata.name.length <= 52);
 
 const jobs = scheduled.filter(({ kind }) => kind === "CronJob");
-assert.equal(jobs.length, 2);
-const [retention, backup] = ["retention", "backup"].map((name) =>
-  jobs.find(({ metadata }) => metadata.name.endsWith(`-${name}`)),
+assert.equal(jobs.length, 3);
+const [retention, backup, recovery] = ["retention", "backup", "recovery"].map(
+  (name) => jobs.find(({ metadata }) => metadata.name.endsWith(`-${name}`)),
 );
 assert.equal(retention.spec.schedule, "15 2 * * *");
 assert.notEqual(retention.spec.schedule, backup.spec.schedule);
+assert.equal(recovery.spec.schedule, "* * * * *");
+assert.equal(
+  workload(scheduled, "ConfigMap").data.DURABLE_JOBS_ENABLED,
+  "true",
+);
+const [scheduledApp] = workload(scheduled, "Deployment").spec.template.spec
+  .containers;
+const [recoveryCaller] =
+  recovery.spec.jobTemplate.spec.template.spec.containers;
+assert.equal(recoveryCaller.image, scheduledApp.image);
+assert.deepEqual(
+  scheduledApp.env.find(({ name }) => name === "CRON_SECRET"),
+  recoveryCaller.env.find(({ name }) => name === "CRON_SECRET"),
+);
+assert.equal(recovery.spec.jobTemplate.spec.activeDeadlineSeconds, 300);
+assert.equal(recovery.spec.successfulJobsHistoryLimit, 1);
+assert.equal(recovery.spec.failedJobsHistoryLimit, 3);
 const service = workload(scheduled, "Service");
 for (const [job, route] of [
   [retention, "retention"],
   [backup, "backup"],
+  [recovery, "recovery"],
 ]) {
   assert.equal(job.spec.concurrencyPolicy, "Forbid");
   const { activeDeadlineSeconds, backoffLimit, template } =
@@ -309,7 +340,77 @@ const backupReport = {
   filesUnchanged: 0,
   stoppedEarly: false,
 };
+const recoveryReport = {
+  status: "ran",
+  enabled: true,
+  processed: 0,
+  failed: 0,
+  budgetExhausted: false,
+  health: {
+    counts: {
+      pending: 0,
+      running: 0,
+      succeeded: 10,
+      needs_attention: 0,
+      cancelled: 0,
+    },
+    attention: [],
+    pendingSigningLockAlerts: 0,
+  },
+};
 const cases = [
+  ["recovery", 200, recoveryReport, 0],
+  ["recovery", 200, { ...recoveryReport, processed: 5 }, 0],
+  ["recovery", 200, { status: "disabled", enabled: false }, 1],
+  ["recovery", 200, { ...recoveryReport, status: "skipped" }, 1],
+  ["recovery", 200, { ...recoveryReport, enabled: "true" }, 1],
+  ["recovery", 200, { ...recoveryReport, processed: -1 }, 1],
+  ["recovery", 200, { ...recoveryReport, processed: 21 }, 1],
+  ["recovery", 200, { ...recoveryReport, processed: 0.5 }, 1],
+  ["recovery", 200, { ...recoveryReport, failed: 1, processed: 1 }, 1],
+  ["recovery", 200, { ...recoveryReport, budgetExhausted: true }, 1],
+  ["recovery", 200, { ...recoveryReport, health: null }, 1],
+  [
+    "recovery",
+    200,
+    {
+      ...recoveryReport,
+      health: { ...recoveryReport.health, counts: { needs_attention: 0 } },
+    },
+    1,
+  ],
+  [
+    "recovery",
+    200,
+    {
+      ...recoveryReport,
+      health: {
+        ...recoveryReport.health,
+        counts: { ...recoveryReport.health.counts, needs_attention: 1 },
+      },
+    },
+    1,
+  ],
+  [
+    "recovery",
+    200,
+    {
+      ...recoveryReport,
+      health: { ...recoveryReport.health, attention: ["private-body"] },
+    },
+    1,
+  ],
+  [
+    "recovery",
+    200,
+    {
+      ...recoveryReport,
+      health: { ...recoveryReport.health, pendingSigningLockAlerts: 1 },
+    },
+    1,
+  ],
+  ["recovery", 200, "private-body", 1],
+  ["recovery", 503, { error: "private-body" }, 1],
   ["retention", 200, { ...retentionReport, futureCounter: 1 }, 0],
   ["backup", 200, { ...backupReport, futureCounter: 1 }, 0],
   ["retention", 200, { ...retentionReport, stoppedEarly: true }, 1],
@@ -378,8 +479,8 @@ try {
       typeof responseBody === "string"
         ? responseBody
         : JSON.stringify(responseBody);
-    const [caller] = (route === "retention" ? retention : backup).spec
-      .jobTemplate.spec.template.spec.containers;
+    const [caller] = { retention, backup, recovery }[route].spec.jobTemplate
+      .spec.template.spec.containers;
     const command = spawn(
       caller.command[0],
       [...caller.command.slice(1), ...caller.args],

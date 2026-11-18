@@ -26,16 +26,16 @@ The runner handles `SIGTERM` directly. The chart allows 30 seconds to drain requ
 
 Create the namespace and provision a Secret there before installing. The default Secret name is `signudoc-env`. Use your usual secret management tooling and keep credentials out of Helm values. These keys apply to a typical deployment.
 
-| Secret key                     | Use                                                                                                                                                                      |
-| ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `DATABASE_URL`                 | Required PostgreSQL URL. Use a role that can apply migrations if this is also the migration connection.                                                                  |
-| `DATABASE_URL_UNPOOLED`        | Direct migration connection if `DATABASE_URL` uses a transaction pooler.                                                                                                 |
-| `BETTER_AUTH_SECRET`           | Stable secret of at least 32 characters. Generate it once with `openssl rand -hex 32` and back it up. The default PDF seal key is encrypted using a key derived from it. |
-| `SETUP_TOKEN`                  | Secret required to claim the first administrator account when set. Set this before exposing a new install.                                                               |
-| `RESEND_API_KEY`               | Required to send email. Verify your sending domain in Resend.                                                                                                            |
-| `CRON_SECRET`                  | Required when enabling a chart CronJob. Use a randomly generated secret.                                                                                                 |
-| `BLOB_READ_WRITE_TOKEN`        | Required when using a private Vercel Blob store from Kubernetes.                                                                                                         |
-| `BACKUP_BLOB_READ_WRITE_TOKEN` | Required when enabling the backup CronJob. Use a separate private Vercel Blob store.                                                                                     |
+| Secret key                     | Use                                                                                                                                                                         |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                 | Required PostgreSQL URL. Use a role that can apply migrations if this is also the migration connection.                                                                     |
+| `DATABASE_URL_UNPOOLED`        | Direct migration connection if `DATABASE_URL` uses a transaction pooler.                                                                                                    |
+| `BETTER_AUTH_SECRET`           | Stable secret of at least 32 characters. Generate it once with `openssl rand -hex 32` and back it up. Required for durable recovery. The default PDF seal key also uses it. |
+| `SETUP_TOKEN`                  | Secret required to claim the first administrator account when set. Set this before exposing a new install.                                                                  |
+| `RESEND_API_KEY`               | Required to send email. Verify your sending domain in Resend.                                                                                                               |
+| `CRON_SECRET`                  | Required when enabling a chart CronJob. Use a randomly generated secret.                                                                                                    |
+| `BLOB_READ_WRITE_TOKEN`        | Required when using a private Vercel Blob store from Kubernetes.                                                                                                            |
+| `BACKUP_BLOB_READ_WRITE_TOKEN` | Required when enabling the backup CronJob. Use a separate private Vercel Blob store.                                                                                        |
 
 If you use your own PDF seal, also back up `SEAL_P12_BASE64` and `SEAL_P12_PASSWORD`. See the [self-hosting guide](self-hosting.md#signed-pdfs-and-the-seal) for seal options and the [environment reference](../.env.example) for more settings.
 
@@ -108,15 +108,17 @@ With `migration.mode: helm`, a blocking `pre-install` and `pre-upgrade` Job runs
 
 For Argo CD, set `migration.mode: argocd`. A `PreSync` Job at wave `-1` must complete before the app sync. Provision the database, CA and credentials before a full sync, such as in a separate infrastructure application. Selective sync skips hooks. If you manage an equivalent migration gate elsewhere, `migration.mode: disabled` omits the Job. [Argo CD sync phases and waves](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-waves/).
 
-Back up the database and documents before upgrading. Old app pods may still be serving while new migrations run, so check schema compatibility or take a maintenance window. A Helm rollback changes workloads without undoing applied SQL. For recovery, restore a compatible database and document snapshot together and reuse the backed-up auth and seal secrets.
+Back up the database and documents before upgrading. Old app pods may still be serving while new migrations run, so check schema compatibility or take a maintenance window. A Helm rollback changes workloads without undoing applied SQL. Restore compatible database and document snapshots together with the backed-up auth and seal secrets. Follow the [durable recovery runbook](durable-recovery.md#disable-restore-or-change-a-dependency) before restarting producers and schedulers after a restore.
 
 Use your database provider or operator for database backups and test restores. With S3, enable object versioning and set retention appropriate for your restore window. For local storage, include the PVC in your backups. Helm retains a chart-created claim on uninstall, and the chart marks the claim for retention during Argo CD pruning and application deletion. A retained claim can leave an Argo CD application OutOfSync until you manage or remove it. Check the PVC and volume reclaim policy before removing the namespace. [Argo CD sync options](https://argo-cd.readthedocs.io/en/stable/user-guide/sync-options/#no-prune-resources).
 
 ## Scheduled maintenance
 
-Both schedules are disabled by default. Enable `cron.retention.enabled` to run one daily request to `/api/internal/retention`. It handles retention, reminders and notices for missed signing deadlines. On Blob storage, optionally enable `cron.backup.enabled` to call `/api/internal/backup` with a second Blob store configured. See [backup and restore](backup-and-restore.md) for the contents and limits of that backup.
+All three schedules are disabled by default. Enable `cron.retention.enabled` to run one daily request to `/api/internal/retention`. It handles retention, reminders and notices for missed signing deadlines. On Blob storage, optionally enable `cron.backup.enabled` to call `/api/internal/backup` with a second Blob store configured. See [backup and restore](backup-and-restore.md) for the contents and limits of that backup.
 
-Each CronJob calls the internal Service by HTTP POST using `Authorization: Bearer` with `CRON_SECRET` from the existing Secret. The caller requires a completed run summary. An HTTP error, skipped run, or run that stops early fails the Job. Requests have a deadline, and each CronJob forbids overlapping runs. Set `cron.retention.schedule`, `cron.backup.schedule`, and `cron.timeZone` to change the schedules. Enable only one scheduler for each endpoint when moving from Vercel or using another scheduler against the same data.
+To enable [durable recovery](durable-recovery.md#activate), set `config.DURABLE_JOBS_ENABLED: "true"` and `cron.recovery.enabled: true` after migrating and retiring older app pods. The recovery job calls `/api/internal/recovery` every minute. The existing Secret must provide both `CRON_SECRET` and the stable `BETTER_AUTH_SECRET`. The recovery job uses the same image as the app. A failed run can report unsuccessful work, elapsed budget, jobs requiring attention or unresolved signing lock alerts. Inspect the authenticated status endpoint when a run fails.
+
+Each CronJob calls the internal Service by HTTP POST using `Authorization: Bearer` with `CRON_SECRET` from the existing Secret. The caller requires a completed run summary. An HTTP error, skipped run, or run that stops early fails the Job. Requests have a deadline, and each CronJob forbids overlapping runs. Set `cron.retention.schedule`, `cron.backup.schedule`, `cron.recovery.schedule`, and `cron.timeZone` to change the schedules. Enable only one scheduler for each endpoint when moving from Vercel or using another scheduler against the same data.
 
 ## Validate chart changes
 

@@ -1,7 +1,11 @@
 import { expect, test, type Page } from "@playwright/test";
 import pg from "pg";
 
-import { e2eDatabaseUrl, e2eSetupToken } from "../playwright.config";
+import {
+  e2eDatabaseUrl,
+  e2eRecoveryEnabled,
+  e2eSetupToken,
+} from "../playwright.config";
 import { extractLink, extractLinks, waitForEmail } from "./support/outbox";
 import { totpCode } from "./support/totp";
 import { writeSamplePdf } from "./support/sample-pdf";
@@ -579,6 +583,18 @@ test("a new install is set up, a sender sends a PDF and a recipient signs it", a
       .click();
     await expect(recipientPage).toHaveURL(/\/sign\/[^/]+\/done/);
 
+    if (e2eRecoveryEnabled) {
+      const path = `/envelopes/${envelopeId}`;
+      await page.goto(path);
+      await expect(
+        page.getByText("Preparing final documents", { exact: true }),
+      ).toBeVisible();
+      const pending = await page.request.get(
+        `/api${path}/download?type=signed`,
+      );
+      expect(pending.status()).toBe(409);
+    }
+
     const completionEmail = await waitForEmail({
       template: "completion_notification",
       to: signerEmail,
@@ -1024,7 +1040,11 @@ test("in Part 11 mode a verified account signs, with its password and a stated m
   });
 
   await test.step("the audit trails record it and export as CSV", async () => {
-    await waitForEmail({ template: "completion_notification", to: adminEmail });
+    await waitForEmail({
+      template: "completion_notification",
+      to: adminEmail,
+      linkPath: `/envelopes/${envelopeId}`,
+    });
 
     const envelopeCsv = await (
       await page.request.get(`/api/envelopes/${envelopeId}/audit`)
@@ -1193,7 +1213,11 @@ test("a signer signs with a qualified signature in their own name, through the s
   });
 
   await test.step("the signed PDF carries the signer's own signature", async () => {
-    await waitForEmail({ template: "completion_notification", to: adminEmail });
+    await waitForEmail({
+      template: "completion_notification",
+      to: adminEmail,
+      linkPath: `/envelopes/${envelopeId}`,
+    });
 
     const signed = await page.request.get(
       `/api/envelopes/${envelopeId}/download?type=signed`,

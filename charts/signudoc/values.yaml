@@ -85,3 +85,6 @@ cron:
   backup:
     enabled: false # Vercel Blob only.
     schedule: "15 4 * * *"
+  recovery:
+    enabled: false # Requires config.DURABLE_JOBS_ENABLED: "true".
+    schedule: "* * * * *"

@@ -24,6 +24,7 @@ config:
   EMAIL_DRIVER: resend
   RESEND_FROM_EMAIL: signudoc@example.com
   RESEND_REGION: us-east-1
+  DURABLE_JOBS_ENABLED: "true"
 
 extraEnv:
   - name: DATABASE_URL
@@ -52,6 +53,8 @@ migration:
 cron:
   retention:
     enabled: false
+  recovery:
+    enabled: true
 
 ingress:
   enabled: false

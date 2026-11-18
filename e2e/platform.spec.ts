@@ -3,7 +3,11 @@ import { createHash } from "node:crypto";
 import { expect, test } from "@playwright/test";
 import pg from "pg";
 
-import { e2eDatabaseUrl } from "../playwright.config";
+import {
+  e2eCronSecret,
+  e2eDatabaseUrl,
+  e2eRecoveryEnabled,
+} from "../playwright.config";
 
 // The cleanup route and the sign-in limit, as the running app serves them.
 // What sits underneath (the rate limit statement, the job's lock and its
@@ -23,7 +27,7 @@ test.afterAll(async () => {
   await database.end();
 });
 
-test("the cleanup route runs for Vercel's cron call and tells a stranger nothing", async ({
+test("the cleanup route runs for the deployment cron and tells a stranger nothing", async ({
   request,
 }) => {
   await database.query("delete from public.rate_limits where key = $1", [
@@ -33,12 +37,20 @@ test("the cleanup route runs for Vercel's cron call and tells a stranger nothing
     "insert into public.rate_limits (key, count, expires_at) values ('e2e-finished-window', 3, 1)",
   );
 
-  // This deployment has no CRON_SECRET, like one made with the Deploy
-  // button, so Vercel's call arrives with no proof of who it is.
-  const first = await request.get("/api/internal/retention");
+  // The legacy fixture models an anonymous Vercel scheduler. Recovery
+  // requires a secret, which secures the retention route too.
+  const headers = e2eRecoveryEnabled
+    ? { Authorization: `Bearer ${e2eCronSecret}` }
+    : undefined;
+  const first = await request.get("/api/internal/retention", { headers });
 
-  expect(first.status()).toBe(204);
-  expect(await first.text()).toBe("");
+  if (e2eRecoveryEnabled) {
+    expect(first.status()).toBe(200);
+    expect((await first.json()).ranAt).toBeGreaterThan(0);
+  } else {
+    expect(first.status()).toBe(204);
+    expect(await first.text()).toBe("");
+  }
 
   // It did the work: the finished window is gone.
   const leftover = await database.query(
@@ -50,16 +62,17 @@ test("the cleanup route runs for Vercel's cron call and tells a stranger nothing
   // A second call inside the hour looks exactly the same from outside.
   const second = await request.post("/api/internal/retention");
 
-  expect(second.status()).toBe(204);
-  expect(await second.text()).toBe("");
+  expect(second.status()).toBe(e2eRecoveryEnabled ? 401 : 204);
 
-  // Both were counted against the hourly ration.
+  if (!e2eRecoveryEnabled) expect(await second.text()).toBe("");
+
+  // Only the legacy mode rations anonymous requests.
   const ration = await database.query<{ count: number }>(
     "select count from public.rate_limits where key = $1",
     [RETENTION_RATION_KEY],
   );
 
-  expect(ration.rows[0]?.count).toBe(2);
+  expect(ration.rows[0]?.count).toBe(e2eRecoveryEnabled ? undefined : 2);
 });
 
 test("sign-in attempts are limited, and counted in the database", async ({

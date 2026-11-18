@@ -36,8 +36,10 @@ jobs:
           NEXT_TELEMETRY_DISABLED: "1"
 
   e2e:
-    name: End-to-end test
+    name: Database and browser tests
     runs-on: ubuntu-latest
+    env:
+      E2E_DATABASE_URL: postgres://signudoc:signudoc@127.0.0.1:5432/signudoc_e2e
     services:
       postgres:
         image: postgres:17
@@ -59,15 +61,15 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      # The tests that need a real Postgres: the rate limit statement and
-      # the cleanup job's lock.
-      - run: npm run test:db
-        env:
-          E2E_DATABASE_URL: postgres://signudoc:signudoc@127.0.0.1:5432/signudoc_e2e
+      - name: Test database workflows and worker interruption
+        run: npm run test:db
       - run: npx playwright install --with-deps chromium
-      - run: npm run test:e2e
+      - name: Run the browser suite in legacy mode
+        run: npm run test:e2e
+      - name: Run the browser suite with durable recovery
+        run: npm run test:e2e
         env:
-          E2E_DATABASE_URL: postgres://signudoc:signudoc@127.0.0.1:5432/signudoc_e2e
+          E2E_DURABLE_JOBS: "1"
       - uses: actions/upload-artifact@v6
         if: failure()
         with:

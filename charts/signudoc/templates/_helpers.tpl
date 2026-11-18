@@ -65,10 +65,24 @@ capabilities:
 {{- if and .Values.cron.backup.enabled (ne .Values.storage.driver "blob") -}}
   {{- fail "backup requires blob storage" -}}
 {{- end -}}
+{{- if .Values.cron.recovery.enabled -}}
+  {{- if ne (toString .Values.config.DURABLE_JOBS_ENABLED) "true" -}}
+    {{- fail "cron.recovery requires config.DURABLE_JOBS_ENABLED=true" -}}
+  {{- end -}}
+  {{- if not (trim .Values.existingSecret) -}}
+    {{- fail "cron.recovery requires existingSecret with CRON_SECRET and BETTER_AUTH_SECRET" -}}
+  {{- end -}}
+{{- end -}}
 {{- if not (has .Values.migration.mode (list "helm" "argocd" "disabled")) -}}
   {{- fail "migration.mode must be helm, argocd, or disabled" -}}
 {{- end -}}
 {{- range .Values.extraEnv -}}
+  {{- if and (eq .name "DURABLE_JOBS_ENABLED") (hasKey $.Values.config "DURABLE_JOBS_ENABLED") -}}
+    {{- fail "DURABLE_JOBS_ENABLED is managed by the chart when set in config" -}}
+  {{- end -}}
+  {{- if and (eq .name "BETTER_AUTH_SECRET") $.Values.cron.recovery.enabled -}}
+    {{- fail "BETTER_AUTH_SECRET is managed by the chart when cron.recovery is enabled" -}}
+  {{- end -}}
   {{- if has .name (list "NODE_ENV" "PORT" "HOSTNAME" "STORAGE_DRIVER" "STORAGE_LOCAL_DIR" "CRON_SECRET") -}}
     {{- fail (printf "%s is managed by the chart and cannot be set via extraEnv" .name) -}}
   {{- end -}}
