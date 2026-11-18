@@ -15,10 +15,17 @@ FROM base AS production-dependencies
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
+# Standalone tracing can omit notices from packages that supply runtime code.
+FROM production-dependencies AS dependency-notices
+RUN mkdir -p /app/LICENSES/npm && cd node_modules \
+    && find . -type f \( -iname 'license*' -o -iname 'notice*' -o -iname 'copying*' \
+      -o -iname 'copyright*' -o -iname 'unlicense*' -o -iname 'patents*' \) \
+      -exec cp --parents -t /app/LICENSES/npm -- {} +
+
 FROM base AS migrate
 ENV NODE_ENV=production
 COPY --from=production-dependencies /app/node_modules ./node_modules
-COPY package.json ./
+COPY package.json LICENSE ./
 COPY db ./db
 USER node
 CMD ["node", "db/migrate.mjs"]
@@ -28,6 +35,9 @@ ENV NODE_ENV=production HOSTNAME=0.0.0.0 PORT=3000
 COPY --from=build /app/.next/standalone ./
 COPY --from=build /app/.next/static ./.next/static
 COPY --from=build /app/public ./public
+COPY LICENSE THIRD_PARTY_NOTICES.md ./
+COPY LICENSES/Apache-2.0.txt LICENSES/HarfBuzz-COPYING.txt ./LICENSES/
+COPY --from=dependency-notices /app/LICENSES/npm ./LICENSES/npm
 # These files are read at runtime, outside the JS bundle.
 COPY --from=build /app/src/assets/fonts ./src/assets/fonts
 COPY --from=build /app/node_modules/harfbuzzjs/dist/harfbuzz-subset.wasm ./node_modules/harfbuzzjs/dist/harfbuzz-subset.wasm

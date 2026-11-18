@@ -40,7 +40,10 @@ for (const option of ["affinity", "nodeSelector", "tolerations"]) {
   assert.equal(localPod[option], undefined);
 }
 assert.equal(localDeployment.spec.replicas, 1);
-assert.equal(localDeployment.spec.strategy.type, "Recreate");
+assert.deepEqual(localDeployment.spec.strategy, {
+  type: "Recreate",
+  rollingUpdate: null,
+});
 const localClaim = workload(local, "PersistentVolumeClaim");
 assert.deepEqual(localClaim.spec.accessModes, ["ReadWriteOnce"]);
 assert.equal(
@@ -81,10 +84,14 @@ for (const [setting, error] of [
 
 const external = render(...s3);
 assert.ok(!external.some(({ kind }) => kind === "PersistentVolumeClaim"));
-assert.equal(
-  workload(external, "Deployment").spec.strategy.type,
-  "RollingUpdate",
-);
+assert.deepEqual(workload(external, "Deployment").spec.strategy, {
+  type: "RollingUpdate",
+});
+const externalRecreate = render(...s3, "--set", "strategy=Recreate");
+assert.deepEqual(workload(externalRecreate, "Deployment").spec.strategy, {
+  type: "Recreate",
+  rollingUpdate: null,
+});
 assert.equal(workload(external, "HorizontalPodAutoscaler").spec.minReplicas, 1);
 assert.equal(
   workload(render("--set", "storage.driver=blob,replicaCount=3"), "Deployment")

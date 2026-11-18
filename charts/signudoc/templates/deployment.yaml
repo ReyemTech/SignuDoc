@@ -10,7 +10,12 @@ spec:
   replicas: {{ .Values.replicaCount }}
   {{- end }}
   strategy:
-    type: {{ include "signudoc.strategy" . }}
+    {{- $strategy := include "signudoc.strategy" . }}
+    type: {{ $strategy }}
+    {{- if eq $strategy "Recreate" }}
+    # Clear any server-defaulted settings on a Helm upgrade from RollingUpdate.
+    rollingUpdate: null
+    {{- end }}
   selector:
     matchLabels:
       {{- include "signudoc.selectorLabels" . | nindent 6 }}
@@ -43,7 +48,7 @@ spec:
       {{- end }}
       containers:
         - name: app
-          image: {{ printf "%s:%s" .Values.image.repository (include "signudoc.appTag" .) | quote }}
+          image: {{ printf "%s:%s" .Values.image.repository (include "signudoc.imageTag" .) | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           securityContext:
             {{- include "signudoc.containerSecurityContext" . | nindent 12 }}

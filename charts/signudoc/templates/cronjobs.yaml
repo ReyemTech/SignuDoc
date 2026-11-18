@@ -28,7 +28,7 @@ spec:
           {{- end }}
           containers:
             - name: request
-              image: {{ printf "%s:%s" $.Values.image.repository (include "signudoc.appTag" $) | quote }}
+              image: {{ printf "%s:%s" $.Values.image.repository (include "signudoc.imageTag" $) | quote }}
               imagePullPolicy: {{ $.Values.image.pullPolicy }}
               securityContext:
                 {{- include "signudoc.containerSecurityContext" $ | nindent 16 }}

@@ -28,7 +28,7 @@ spec:
       {{- end }}
       containers:
         - name: migrate
-          image: {{ printf "%s:%s" (default .Values.image.repository .Values.migration.image.repository) (default (printf "%s-migrate" (include "signudoc.appTag" .)) .Values.migration.image.tag) | quote }}
+          image: {{ printf "%s:%s" (default .Values.image.repository .Values.migration.image.repository) (default (printf "%s-migrate" (include "signudoc.imageTag" .)) .Values.migration.image.tag) | quote }}
           imagePullPolicy: {{ .Values.migration.image.pullPolicy }}
           securityContext:
             {{- include "signudoc.containerSecurityContext" . | nindent 12 }}

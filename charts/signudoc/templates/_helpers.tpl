@@ -17,7 +17,7 @@ app.kubernetes.io/name: {{ .Chart.Name }}
 app.kubernetes.io/instance: {{ .Release.Name | quote }}
 {{- end -}}
 
-{{- define "signudoc.appTag" -}}
+{{- define "signudoc.imageTag" -}}
 {{- default .Chart.AppVersion .Values.image.tag -}}
 {{- end -}}
 
