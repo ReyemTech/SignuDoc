@@ -4,6 +4,8 @@ import { getDb } from "../../../../lib/db/connection.ts";
 import {
   assertRecoveryConfigured,
   isDurableJobsEnabled,
+  readRecoveryAuthorization,
+  readRecoveryCronSecret,
 } from "../../../../lib/recovery/config.ts";
 import { getRecoveryQueueHealth } from "../../../../lib/recovery/jobs.ts";
 import {
@@ -11,7 +13,6 @@ import {
   createRecoveryBudget,
 } from "../../../../lib/recovery/worker-database.ts";
 import { runRecoveryJobs } from "../../../../lib/recovery/worker.ts";
-import { readEnv } from "../../../../lib/utils/env.ts";
 
 export const runtime = "nodejs";
 export const maxDuration = 240;
@@ -28,10 +29,8 @@ function json(body: object, status = 200) {
 }
 
 function isAuthorized(request: Request) {
-  const secret = readEnv(process.env, "CRON_SECRET");
-  const token = /^Bearer ([A-Za-z0-9._~+\/-]+=*)$/.exec(
-    request.headers.get("authorization") ?? "",
-  )?.[1];
+  const secret = readRecoveryCronSecret();
+  const token = readRecoveryAuthorization(request.headers.get("authorization"));
 
   if (!secret || !token) return false;
 

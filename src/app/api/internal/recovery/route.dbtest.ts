@@ -11,7 +11,7 @@ import { enqueueEmail } from "../../../../lib/recovery/email.ts";
 import { enqueueRecoveryJob } from "../../../../lib/recovery/jobs.ts";
 import { GET, POST } from "./route.ts";
 
-const cronSecret = "fixture-secret-for-cron";
+const cronSecret = "fixture_secret-._~+/==";
 const dedupePrefix = `recovery-route/${randomUUID()}/`;
 const env = {
   BETTER_AUTH_SECRET: "fixture-auth-secret-only-for-recovery-route",

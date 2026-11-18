@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
+import { assertRecoveryConfigured } from "../../../../lib/recovery/config.ts";
 import { GET, POST } from "./route.ts";
 
 const secret = "fixture-secret-for-cron";
@@ -92,4 +93,20 @@ test("authenticated invalid feature configuration fails closed with a fixed erro
       });
     }
   }
+});
+
+test("a Cron secret rejected at the HTTP boundary also blocks enabled producers", async () => {
+  const unusable = "fixture:colon";
+  configure({
+    BETTER_AUTH_SECRET: "fixture-auth-secret-for-recovery-only",
+    CRON_SECRET: unusable,
+    DURABLE_JOBS_ENABLED: "true",
+  });
+
+  for (const route of [GET, POST]) {
+    const response = await route(request(route.name, `Bearer ${unusable}`));
+    assert.equal(response.status, 401);
+    assert.deepEqual(await response.json(), { error: "unauthorized" });
+  }
+  assert.throws(() => assertRecoveryConfigured(), /CRON_SECRET/);
 });

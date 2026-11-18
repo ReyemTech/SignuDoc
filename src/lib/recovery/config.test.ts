@@ -40,3 +40,32 @@ test("durable jobs require an explicit boolean opt-in and stable credentials", (
     }),
   );
 });
+
+test("enabled recovery requires a Cron secret that fits a single Bearer token", () => {
+  const env = {
+    DURABLE_JOBS_ENABLED: "true",
+    BETTER_AUTH_SECRET: "x".repeat(32),
+  };
+  for (const secret of [
+    "name:value",
+    "two words",
+    "invalid=middle",
+    "x,y",
+    "replace-with-secret",
+  ]) {
+    assert.throws(
+      () => assertRecoveryConfigured({ ...env, CRON_SECRET: secret }),
+      /CRON_SECRET/,
+    );
+  }
+  assert.doesNotThrow(() =>
+    assertRecoveryConfigured({ ...env, CRON_SECRET: "  e2e_token-._~+/==  " }),
+  );
+
+  assert.doesNotThrow(() =>
+    assertRecoveryConfigured({
+      DURABLE_JOBS_ENABLED: "false",
+      CRON_SECRET: "legacy:secret",
+    }),
+  );
+});
