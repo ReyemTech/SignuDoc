@@ -1,8 +1,6 @@
-import path from "node:path";
-import { mkdir, readdir, rm } from "node:fs/promises";
-
 import pg from "pg";
 
+import { clearFixtureDirectory } from "./support/fixture-directory";
 import { e2eDataDir, e2eDatabaseUrl } from "../playwright.config";
 
 function assertDisposableDatabase(connectionString: string) {
@@ -45,6 +43,7 @@ async function ensureDatabaseExists(connectionString: string) {
 
 export default async function globalSetup() {
   assertDisposableDatabase(e2eDatabaseUrl);
+  await clearFixtureDirectory(e2eDataDir);
   await ensureDatabaseExists(e2eDatabaseUrl);
 
   const client = new pg.Client({ connectionString: e2eDatabaseUrl });
@@ -65,10 +64,4 @@ export default async function globalSetup() {
   const { runMigrations } = await import("../db/migrate.mjs");
 
   await runMigrations({ connectionString: e2eDatabaseUrl });
-
-  // A running browser container binds this inode. Clear only its contents.
-  await mkdir(e2eDataDir, { recursive: true });
-  for (const child of await readdir(e2eDataDir)) {
-    await rm(path.join(e2eDataDir, child), { force: true, recursive: true });
-  }
 }

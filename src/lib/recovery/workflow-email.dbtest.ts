@@ -1163,3 +1163,99 @@ for (const identity of ["mailbox", "keeper"] as const) {
     });
   }
 }
+
+for (const when of ["before dispatch", "before acknowledgement"] as const) {
+  test("overdue notice follows verified mailbox change " + when, async () => {
+    const f = await fixture({ deadline: clock() - 60 });
+    const changed = f.userId + "-changed@example.test";
+    const sweep = (emailService: EmailService) =>
+      runEnvelopeSchedule({ database, emailService });
+    const move = () =>
+      database.query(
+        'UPDATE "user" SET email=$2, "emailVerified"=true WHERE id=$1',
+        [f.userId, changed],
+      );
+    const outage = mail(true);
+    await sweep(outage.emailService);
+    const first = await jobFor(f.envelopeId);
+    assert.equal(first?.state, "pending");
+    if (when === "before dispatch") await move();
+    const delivery = mail();
+    await retry(first.id, {
+      ...delivery.emailService,
+      async send(message, options) {
+        const accepted = await delivery.emailService.send(message, options);
+        if (when === "before acknowledgement") await move();
+        return accepted;
+      },
+    });
+    if (when === "before dispatch") assert.equal(delivery.sent.length, 0);
+    const ack = () =>
+      database.query("SELECT expiry_notified_at FROM envelopes WHERE id=$1", [
+        f.envelopeId,
+      ]);
+    assert.equal((await ack()).rows[0].expiry_notified_at, null);
+    const newOutage = mail(true);
+    await sweep(newOutage.emailService);
+    const second = await jobFor(f.envelopeId);
+    assert.notEqual(second.id, first.id);
+    assert.equal(
+      newOutage.sent.filter((entry) => entry.message.to === changed).length,
+      1,
+    );
+    await sweep(newOutage.emailService);
+    assert.equal((await jobFor(f.envelopeId)).id, second.id);
+    const confirmed = mail();
+    await retry(second.id, confirmed.emailService);
+    assert.deepEqual(
+      confirmed.sent,
+      newOutage.sent.filter((entry) => entry.message.to === changed),
+    );
+    assert.ok((await ack()).rows[0].expiry_notified_at);
+    assert.equal(
+      (
+        await database.query(
+          "SELECT count(*) FROM audit_events WHERE envelope_id=$1 AND event='expired'",
+          [f.envelopeId],
+        )
+      ).rows[0].count,
+      1,
+    );
+  });
+}
+
+test("an unresolved legacy overdue notice keeps its provider key until the recipient changes", async () => {
+  const f = await fixture({ deadline: clock() - 60 });
+  const address = f.userId + "@example.test";
+  const old = await enqueueEmail(
+    {
+      message: {
+        subject: "Overdue",
+        template: "expiry_notice",
+        textBody: "Expired",
+        to: address,
+      },
+      dedupeKey: "expiry-notice/" + f.envelopeId + "/" + f.deadline,
+      envelopeId: f.envelopeId,
+      userId: f.userId,
+      acknowledgement: { kind: "expiry_notice", expiresAt: f.deadline },
+    },
+    { database },
+  );
+  const outage = mail(true);
+  await retry(old.id, outage.emailService);
+  const fresh = mail();
+  await runEnvelopeSchedule({ database, emailService: fresh.emailService });
+  assert.equal((await jobFor(f.envelopeId)).id, old.id);
+  assert.ok(!fresh.sent.some((entry) => entry.message.to === address));
+  const changed = f.userId + "-new@example.test";
+  await database.query(
+    'UPDATE "user" SET email=$2,"emailVerified"=true WHERE id=$1',
+    [f.userId, changed],
+  );
+  await retry(old.id, fresh.emailService);
+  assert.equal((await jobFor(f.envelopeId)).state, "cancelled");
+  await runEnvelopeSchedule({ database, emailService: fresh.emailService });
+  assert.ok(fresh.sent.some((entry) => entry.message.to === changed));
+  assert.notEqual((await jobFor(f.envelopeId)).id, old.id);
+});

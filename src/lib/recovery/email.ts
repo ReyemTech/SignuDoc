@@ -42,6 +42,9 @@ import {
 
 const EMAIL_REQUEST_TIMEOUT_MS = 25_000;
 const DATABASE_SECONDS = "floor(extract(epoch from clock_timestamp()))::bigint";
+/** Stable for one deadline and recipient, including a return to an earlier mailbox. */
+export const EXPIRY_NOTICE_KEY_SQL =
+  "('expiry-notice/' || e.id || '/' || e.expires_at::text || '/' || e.retention_custody_revision::text || '/' || u.retention_mailbox_revision::text)";
 const FINAL_ENVELOPE_STATUSES = new Set(["completed", "declined", "voided"]);
 
 const tokenHash = z.string().regex(/^[a-f0-9]{64}$/);
@@ -96,6 +99,7 @@ const acknowledgementSchema = z.discriminatedUnion("kind", [
   z.object({
     kind: z.literal("expiry_notice"),
     expiresAt: expiry,
+    noticeKey: id.optional(),
     audit: emailAudit.optional(),
   }),
 ]);
@@ -233,6 +237,7 @@ type EnvelopeGuardRow = {
   status: (typeof envelopeStatuses)[number];
   expiresAt: number | null;
   expiryNotifiedAt: number | null;
+  expiryNoticeKey: string | null;
   retentionWarnedAt: number | null;
   part11: boolean;
   now: number;
@@ -294,7 +299,7 @@ async function emailGuardMatches(
         retention_warned_at AS "retentionWarnedAt", part11, ${DATABASE_SECONDS} AS now,
         COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) AS "finishedAt",
         e.retention_warning_key AS "warningKey", ${retentionNoticeKeySql("$2")} AS "noticeKey",
-        u.id AS "ownerId", u.email AS "ownerEmail"
+        u.id AS "ownerId", u.email AS "ownerEmail", ${EXPIRY_NOTICE_KEY_SQL} AS "expiryNoticeKey"
       FROM envelopes e JOIN "user" u ON u.id=e.user_id WHERE e.id = $1`,
     [
       job.envelopeId,
@@ -319,6 +324,8 @@ async function emailGuardMatches(
     (envelope.status !== "sent" ||
       envelope.finalizationPending ||
       envelope.expiresAt !== acknowledgement.expiresAt ||
+      (acknowledgement.noticeKey !== undefined &&
+        envelope.expiryNoticeKey !== acknowledgement.noticeKey) ||
       envelope.expiresAt > envelope.now ||
       envelope.expiryNotifiedAt !== null)
   )
@@ -416,12 +423,23 @@ async function acknowledgeEmail(
       );
     }
   } else if (acknowledgement.kind === "expiry_notice") {
+    // Publication already holds the envelope. Let a conflicting account edit
+    // finish first, without waiting in reverse purge lock order.
     const recorded = await queryOne<{ notifiedAt: number }>(
       database,
-      `UPDATE envelopes SET expiry_notified_at = ${DATABASE_SECONDS}
-        WHERE id = $1 AND status = 'sent' AND expires_at = $2 AND NOT finalization_pending AND expiry_notified_at IS NULL
-        RETURNING expiry_notified_at AS "notifiedAt"`,
-      [envelopeId, acknowledgement.expiresAt],
+      `UPDATE envelopes e SET expiry_notified_at = ${DATABASE_SECONDS}
+        FROM (SELECT id, retention_mailbox_revision FROM "user" WHERE id = $3 AND email = $4 FOR SHARE NOWAIT) u
+        WHERE e.id = $1 AND e.user_id = u.id AND e.status = 'sent' AND e.expires_at = $2
+          AND NOT e.finalization_pending AND e.expiry_notified_at IS NULL
+          AND ($5::text IS NULL OR ${EXPIRY_NOTICE_KEY_SQL} = $5)
+        RETURNING e.expiry_notified_at AS "notifiedAt"`,
+      [
+        envelopeId,
+        acknowledgement.expiresAt,
+        userId,
+        message.to,
+        acknowledgement.noticeKey ?? null,
+      ],
     );
     if (recorded) {
       await recordAuditEvent(

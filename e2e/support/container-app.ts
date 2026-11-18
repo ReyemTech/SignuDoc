@@ -1,5 +1,5 @@
-import { mkdirSync } from "node:fs";
 import path from "node:path";
+import { ensureFixtureDirectory } from "./fixture-directory.ts";
 
 /** Use the container entrypoint and an isolated capture/storage directory. */
 export function containerApp(
@@ -16,7 +16,7 @@ export function containerApp(
     throw new Error("Container browser tests require a non-root host user.");
   }
   const data = path.dirname(outbox);
-  mkdirSync(data, { recursive: true });
+  ensureFixtureDirectory(data);
   const host = "host.docker.internal";
   const hostNetwork = process.platform === "linux";
 

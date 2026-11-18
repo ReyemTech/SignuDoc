@@ -481,6 +481,16 @@ test("logical restore splits recovery rows within a small byte budget and preser
       "INSERT INTO recovery_jobs(id,kind,dedupe_key,user_id,payload_digest,payload_ciphertext) VALUES($1::uuid,'email',$1::uuid::text,$2,decode('ab','hex'),decode(repeat('cd',800),'hex'))",
       [id, user],
     );
+  const cleared = Array.from({ length: 1200 }, () => randomUUID());
+  t.after(() =>
+    database
+      .query("DELETE FROM recovery_jobs WHERE id=ANY($1)", [cleared])
+      .then(() => {}),
+  );
+  await database.query(
+    "INSERT INTO recovery_jobs(id,kind,dedupe_key,user_id,payload_digest,state) SELECT id,'email',id::text,$2,decode('ab','hex'),'succeeded' FROM unnest($1::uuid[]) AS id",
+    [cleared, user],
+  );
   const target = memoryStore();
   let cursor = "";
   const fetches: number[] = [];
@@ -502,15 +512,25 @@ test("logical restore splits recovery rows within a small byte budget and preser
     target,
   });
   assert.ok(
-    fetches.length >= ids.length && fetches.every((size) => size === 1),
+    fetches.filter((size) => size === 1).length >= ids.length,
+    "live snapshots must use individual fetches",
+  );
+  assert.ok(
+    fetches.length <= 3 + ids.length + 1,
+    "cleared rows must be fetched in batches",
   );
   await clearTables();
   const sizes: number[] = [];
   const measured = afterStatement(
     database,
     (sql, values) => {
-      if (sql.startsWith('INSERT INTO "recovery_jobs"'))
-        sizes.push(JSON.parse(String(values[0])).length);
+      if (sql.startsWith('INSERT INTO "recovery_jobs"')) {
+        const rows = JSON.parse(String(values[0])) as {
+          payload_ciphertext: string | null;
+        }[];
+        if (rows.some((row) => row.payload_ciphertext !== null))
+          sizes.push(rows.length);
+      }
       return false;
     },
     async () => {},
@@ -522,6 +542,15 @@ test("logical restore splits recovery rows within a small byte budget and preser
     maxBatchBytes: 2048,
   });
   assert.deepEqual(sizes, [1, 1, 1, 1]);
+  assert.equal(
+    (
+      await database.query(
+        "SELECT count(*) FROM recovery_jobs WHERE id=ANY($1) AND state='succeeded' AND payload_ciphertext IS NULL",
+        [cleared],
+      )
+    ).rows[0].count,
+    cleared.length,
+  );
   assert.deepEqual(
     (
       await database.query(

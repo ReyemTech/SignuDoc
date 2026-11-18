@@ -274,28 +274,43 @@ export async function* exportDatabaseLines(
 
       const cursorName = `backup_${String(tables.indexOf(table))}`;
 
-      await client.query(
-        `DECLARE ${cursorName} NO SCROLL CURSOR FOR SELECT row_to_json(t)::text AS row FROM ${quoteIdentifier(table)} t`,
-      );
-
-      // Each encrypted recovery job may contain 25 MiB of attachments,
-      // base64 inside ciphertext, then hex in row_to_json. Fetch one at a time.
-      const fetchRows = table === "recovery_jobs" ? 1 : EXPORT_BATCH_ROWS;
-      for (;;) {
-        const batch = await client.query<{ row: string }>(
-          `FETCH ${String(fetchRows)} FROM ${cursorName}`,
+      // The snapshot is shared by both cursors. Cleared jobs are small;
+      // a live encrypted snapshot can contain 25 MiB of base64-encoded
+      // attachments, hex-encoded again by row_to_json.
+      const scans =
+        table === "recovery_jobs"
+          ? [
+              {
+                predicate: " WHERE t.payload_ciphertext IS NULL",
+                fetchRows: EXPORT_BATCH_ROWS,
+              },
+              {
+                predicate: " WHERE t.payload_ciphertext IS NOT NULL",
+                fetchRows: 1,
+              },
+            ]
+          : [{ predicate: "", fetchRows: EXPORT_BATCH_ROWS }];
+      for (const { predicate, fetchRows } of scans) {
+        await client.query(
+          `DECLARE ${cursorName} NO SCROLL CURSOR FOR SELECT row_to_json(t)::text AS row FROM ${quoteIdentifier(table)} t${predicate}`,
         );
 
-        for (const { row } of batch.rows) {
-          yield `{"table":${JSON.stringify(table)},"row":${row}}\n`;
+        for (;;) {
+          const batch = await client.query<{ row: string }>(
+            `FETCH ${String(fetchRows)} FROM ${cursorName}`,
+          );
+
+          for (const { row } of batch.rows) {
+            yield `{"table":${JSON.stringify(table)},"row":${row}}\n`;
+          }
+
+          if (batch.rows.length < fetchRows) {
+            break;
+          }
         }
 
-        if (batch.rows.length < fetchRows) {
-          break;
-        }
+        await client.query(`CLOSE ${cursorName}`);
       }
-
-      await client.query(`CLOSE ${cursorName}`);
     }
 
     await client.query("COMMIT");

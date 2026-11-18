@@ -1,6 +1,6 @@
 import { emailSubject } from "./services/email-subject.ts";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
-import { enqueueEmail } from "./recovery/email.ts";
+import { enqueueEmail, EXPIRY_NOTICE_KEY_SQL } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbPool,
@@ -75,6 +75,15 @@ type ExpiredEnvelopeRow = {
   userId: string;
 };
 
+// An unresolved pre-recipient-key notice keeps its original provider
+// idempotency key. Its worker can confirm it, retire a stale recipient, or
+// leave an ambiguous outcome for operator reconciliation.
+function existingExpiryNoticeSql(currentKey: string, legacyKey: string) {
+  return `SELECT 1 FROM recovery_jobs r
+    WHERE r.dedupe_key = ${currentKey}
+      OR (r.dedupe_key = ${legacyKey} AND r.state IN ('pending','running','needs_attention'))`;
+}
+
 async function listExpiredEnvelopesToNotify(
   now: number,
   database: DbPool,
@@ -104,8 +113,7 @@ async function listExpiredEnvelopesToNotify(
         ${
           durable
             ? `AND NOT EXISTS (
-          SELECT 1 FROM recovery_jobs r
-          WHERE r.dedupe_key = 'expiry-notice/' || e.id || '/' || e.expires_at::text
+          ${existingExpiryNoticeSql(EXPIRY_NOTICE_KEY_SQL, "'expiry-notice/' || e.id || '/' || e.expires_at::text")}
         )`
             : ""
         }
@@ -211,12 +219,12 @@ async function enqueueExpiryNotice(
   database: DbPool,
 ): Promise<string | undefined> {
   return withTransaction(async (tx) => {
-    const current = await queryOne<ExpiredEnvelopeRow>(
+    const current = await queryOne<ExpiredEnvelopeRow & { noticeKey: string }>(
       tx,
       `
       SELECT e.id, e.title, e.user_id AS "userId", e.expires_at AS "expiresAt",
         u.email AS "ownerEmail", u.name AS "ownerName",
-        NULL AS "signerEmail", NULL AS "signerName"
+        NULL AS "signerEmail", NULL AS "signerName", ${EXPIRY_NOTICE_KEY_SQL} AS "noticeKey"
       FROM envelopes e JOIN "user" u ON u.id = e.user_id
       WHERE e.id = $1 AND e.status = 'sent' AND NOT e.finalization_pending AND e.expires_at = $2
         AND e.expiry_notified_at IS NULL
@@ -226,12 +234,11 @@ async function enqueueExpiryNotice(
       [envelope.id, envelope.expiresAt],
     );
     if (!current) return;
-    const dedupeKey = `expiry-notice/${current.id}/${current.expiresAt}`;
-    const existing = await queryOne<{ id: string }>(
-      tx,
-      "SELECT id FROM recovery_jobs WHERE dedupe_key = $1",
-      [dedupeKey],
-    );
+    const legacyKey = `expiry-notice/${current.id}/${current.expiresAt}`;
+    const existing = await queryOne(tx, existingExpiryNoticeSql("$1", "$2"), [
+      current.noticeKey,
+      legacyKey,
+    ]);
     if (existing) return;
 
     // The deadline is the event. Its message stays applicable if the sender
@@ -239,12 +246,13 @@ async function enqueueExpiryNotice(
     const { id } = await enqueueEmail(
       {
         message: buildExpiryNotice(current),
-        dedupeKey,
+        dedupeKey: current.noticeKey,
         envelopeId: current.id,
         userId: current.userId,
         acknowledgement: {
           kind: "expiry_notice",
           expiresAt: current.expiresAt,
+          noticeKey: current.noticeKey,
         },
       },
       { database: tx },

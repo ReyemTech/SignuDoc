@@ -17,7 +17,7 @@ Keep the auth secret stable across rollouts, backups and restores. It protects q
 
 A retained envelope keeps its accepted signature and its signer and copy-recipient jobs when custody changes. Closing an account clears its account mail and pending owner notices. The worker checks current custody before sending an owner notice. A provider request already in flight can still reach its original recipient.
 
-A retention warning starts deletion grace only for the acknowledged mailbox, keeper and policy period. Each change creates a fresh notice identity. Logical restores preserve these identities when present. Restoring a backup from before the UUID migration requires a fresh warning and grace period. The logical exporter reads recovery jobs individually, and the importer bounds its batches by row count and serialized bytes.
+A retention warning starts deletion grace only for the acknowledged mailbox, keeper and policy period. Each change creates a fresh notice identity. Logical restores preserve these identities when present. Restoring a backup from before the UUID migration requires a fresh warning and grace period. The logical exporter reads ciphertext-bearing recovery jobs individually and cleared jobs in bulk, and the importer bounds its batches by row count and serialized bytes.
 
 ## Check status
 
