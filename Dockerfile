@@ -26,6 +26,7 @@ FROM base AS migrate
 ENV NODE_ENV=production
 COPY --from=production-dependencies /app/node_modules ./node_modules
 COPY package.json LICENSE ./
+COPY LICENSES/HarfBuzz-COPYING.txt ./LICENSES/HarfBuzz-COPYING.txt
 COPY db ./db
 USER node
 CMD ["node", "db/migrate.mjs"]
