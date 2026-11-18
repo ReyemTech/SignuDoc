@@ -1,3 +1,5 @@
+import { runRecoveryJobs } from "./recovery/worker.ts";
+import { type TransactionalEmailMessage } from "./services/email.ts";
 import assert from "node:assert/strict";
 import { createHmac, randomUUID } from "node:crypto";
 import { registerHooks } from "node:module";
@@ -656,4 +658,149 @@ test("confirming an authenticator with a leftover challenge cookie is recorded a
   assert.equal(verified.status, 200, JSON.stringify(verified.payload));
   assert.equal((await events("two_factor_enabled"))[0]?.actorUserId, userId);
   assert.equal((await events("sign_in_succeeded")).length, before);
+});
+
+test("Better Auth awaits encrypted verification, reset and email-change intents before returning", async () => {
+  const { createAppAuth } = await import("./auth/server.ts");
+  const localEnv = {
+    ...env,
+    DURABLE_JOBS_ENABLED: "true",
+    CRON_SECRET: "test-cron",
+  };
+  const original = auth;
+  const attempted: TransactionalEmailMessage[] = [];
+  const accelerators: (() => Promise<void>)[] = [];
+  auth = createAppAuth({
+    afterResponse: (deliver) => {
+      accelerators.push(deliver);
+    },
+    database,
+    env: localEnv,
+    includeNextCookies: false,
+    emailService: {
+      async send(message) {
+        attempted.push(message);
+        throw new Error("fixture provider offline");
+      },
+      async sendBatch() {
+        throw new Error("unexpected batch");
+      },
+    },
+  });
+  await createVerifiedUser("setup-admin@example.test", "admin");
+  const email = "queued-auth@example.test";
+  let userId: string | undefined;
+  try {
+    assert.equal(
+      (
+        await call("/sign-up/email", {
+          email,
+          password: PASSWORD,
+          name: "Queued Auth",
+        })
+      ).status,
+      200,
+    );
+    userId = (
+      await database.query('SELECT id FROM "user" WHERE email = $1', [email])
+    ).rows[0]?.id;
+    assert.ok(userId);
+
+    const intents = async () =>
+      (
+        await database.query<{
+          id: string;
+          expires_at: number;
+          payload_ciphertext: Buffer;
+        }>(
+          "SELECT id, expires_at, payload_ciphertext FROM recovery_jobs WHERE user_id = $1 ORDER BY created_at",
+          [userId],
+        )
+      ).rows;
+    assert.equal((await intents()).length, 1);
+    assert.equal(
+      (await call("/request-password-reset", { email, redirectTo: BASE_URL }))
+        .status,
+      200,
+    );
+    const [verify, reset] = await intents();
+    assert.ok(verify && reset);
+    const validity = await database.query(
+      "SELECT floor(extract(epoch FROM \"expiresAt\"))::bigint AS expires FROM verification WHERE value = $1 AND identifier LIKE 'reset-password:%'",
+      [userId],
+    );
+    assert.equal(reset.expires_at, validity.rows[0]?.expires);
+    assert.equal(reset.payload_ciphertext.includes(Buffer.from(email)), false);
+    assert.equal(
+      reset.payload_ciphertext.includes(Buffer.from(PASSWORD)),
+      false,
+    );
+    assert.ok(verify.expires_at > Math.floor(Date.now() / 1000));
+
+    await database.query(
+      'UPDATE "user" SET "emailVerified" = true WHERE id = $1',
+      [userId],
+    );
+    const session = await signIn(email);
+    assert.equal(session.status, 200);
+    const changed = await call(
+      "/change-email",
+      { newEmail: "next-auth@example.test" },
+      session.cookies,
+    );
+    assert.equal(changed.status, 200);
+    const [, , change] = await intents();
+    assert.ok(change);
+
+    assert.equal(attempted.length, 0);
+    assert.equal(accelerators.length, 3);
+    for (const deliver of accelerators) await deliver();
+    assert.deepEqual(
+      attempted.map((message) => message.template),
+      ["email_verification", "password_reset", "change_email_confirmation"],
+    );
+    const delivered: TransactionalEmailMessage[] = [];
+    for (const job of [verify, reset, change]) {
+      await database.query(
+        "UPDATE recovery_jobs SET available_at = clock_timestamp() WHERE id = $1",
+        [job.id],
+      );
+      await runRecoveryJobs({
+        database,
+        env: localEnv,
+        jobId: job.id,
+        emailService: {
+          async send(message) {
+            delivered.push(message);
+            return { accepted: [message.to], rejected: [], messageId: job.id };
+          },
+          async sendBatch() {
+            throw new Error("unexpected batch");
+          },
+        },
+      });
+    }
+    assert.deepEqual(
+      delivered.map((message) => message.template),
+      ["email_verification", "password_reset", "change_email_confirmation"],
+    );
+    for (const [job, message] of [
+      [verify, delivered[0]!],
+      [change, delivered[2]!],
+    ] as const) {
+      const token = message.textBody.match(/token=([^&\s]+)/)?.[1];
+      assert.ok(token);
+      const { exp } = JSON.parse(
+        Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"),
+      );
+      assert.equal(job.expires_at, exp);
+    }
+    assert.ok(attempted.every((message) => message.to === email));
+  } finally {
+    auth = original;
+    if (userId)
+      await database.query("DELETE FROM recovery_jobs WHERE user_id = $1", [
+        userId,
+      ]);
+  }
 });

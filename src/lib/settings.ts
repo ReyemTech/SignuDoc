@@ -329,8 +329,13 @@ export async function getSettings(
 /** What this install calls itself, for pages and emails. */
 export async function getBranding(
   env: EnvSource = process.env,
+  database?: DbExecutor,
 ): Promise<Branding> {
-  return buildBranding(await getSettings(env));
+  return buildBranding(
+    database
+      ? resolveSettings(await readStoredSettings(database), env)
+      : await getSettings(env),
+  );
 }
 
 export function toSignupPolicy(settings: AppSettings): SignupPolicy {

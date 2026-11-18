@@ -1,3 +1,6 @@
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbExecutor,
   type DbPool,
@@ -348,6 +351,8 @@ export async function checkSigningCredentials(
     verifyPassword?: PasswordVerifier;
   } = {},
 ): Promise<SigningPasswordResult> {
+  const durable = isDurableJobsEnabled();
+  const jobs: string[] = [];
   const outcome = await withTransaction(async (tx) => {
     const account = await queryOne<{
       email: string;
@@ -431,7 +436,7 @@ export async function checkSigningCredentials(
       `,
       [failedAttempts, locked ? now : null, input.userId],
     );
-    await recordSystemAuditEvent(
+    const event = await recordSystemAuditEvent(
       {
         actorEmail: account.email,
         actorUserId: input.userId,
@@ -445,6 +450,28 @@ export async function checkSigningCredentials(
       tx,
     );
 
+    if (durable && locked) {
+      const admins = await queryMany<{ email: string; id: string }>(
+        tx,
+        `SELECT id, email FROM "user" WHERE role = 'admin' ORDER BY id`,
+      );
+      if (admins.length) {
+        const { productName } = await getBranding(process.env, tx);
+        for (const admin of admins) {
+          const { id } = await enqueueEmail(
+            {
+              message: buildSigningLockAlert(account, productName, admin.email),
+              dedupeKey: `signing-lock/${event.id}/${admin.id}`,
+              userId: input.userId,
+              guard: { kind: "signing_lock", adminId: admin.id, lockedAt: now },
+            },
+            { database: tx },
+          );
+          jobs.push(id);
+        }
+      }
+    }
+
     return {
       account,
       attemptsLeft: Math.max(0, MAX_SIGNING_PASSWORD_ATTEMPTS - failedAttempts),
@@ -453,7 +480,9 @@ export async function checkSigningCredentials(
     };
   }, database);
 
-  if (
+  if (durable) {
+    await tryDeliverWorkflowEmails(jobs, { database, emailService });
+  } else if (
     !outcome.ok &&
     "account" in outcome &&
     outcome.account &&
@@ -479,6 +508,26 @@ export async function checkSigningCredentials(
   };
 }
 
+function buildSigningLockAlert(
+  person: { email: string; name: string },
+  productName: string,
+  recipient: string,
+) {
+  const textBody = [
+    `${person.name} <${person.email}> gave the wrong password ${MAX_SIGNING_PASSWORD_ATTEMPTS} times in a row while signing on ${productName}.`,
+    "",
+    "Their account can no longer sign until an administrator unlocks it under Settings, People.",
+    "If this was not them, someone may be trying to sign in their name. Check with them before unlocking.",
+  ].join("\n");
+
+  return {
+    subject: `Signing locked for ${person.name}`,
+    template: "signing_lock_alert",
+    textBody,
+    to: recipient,
+  } as const;
+}
+
 /** Tells every administrator that an account was locked for signing. */
 async function alertAdministrators(
   person: { email: string; name: string },
@@ -497,22 +546,12 @@ async function alertAdministrators(
       .then((branding) => branding.productName)
       .catch(() => SIGNUDOC_NAME);
     const service = emailService ?? createEmailService();
-    const textBody = [
-      `${person.name} <${person.email}> gave the wrong password ${MAX_SIGNING_PASSWORD_ATTEMPTS} times in a row while signing on ${productName}.`,
-      "",
-      "Their account can no longer sign until an administrator unlocks it under Settings, People.",
-      "If this was not them, someone may be trying to sign in their name. Check with them before unlocking.",
-    ].join("\n");
-
     // One failed delivery must not keep the alert from the others.
     for (const admin of admins) {
       try {
-        await service.send({
-          subject: `Signing locked for ${person.name}`,
-          template: "signing_lock_alert",
-          textBody,
-          to: admin.email,
-        });
+        await service.send(
+          buildSigningLockAlert(person, productName, admin.email),
+        );
       } catch (error) {
         console.error("Failed to send a signing lock alert:", error);
       }

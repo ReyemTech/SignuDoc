@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import { APIError, betterAuth } from "better-auth";
 import { createAuthMiddleware } from "better-auth/api";
 import { nextCookies } from "better-auth/next-js";
@@ -9,7 +11,10 @@ import type { Pool } from "pg";
 import { cache } from "react";
 
 import { type Branding } from "../branding.ts";
-import { getDb } from "../db/connection.ts";
+import { getDb, queryOne } from "../db/connection.ts";
+import { isDurableJobsEnabled } from "../recovery/config.ts";
+import { enqueueEmail } from "../recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "../recovery/workflow-email.ts";
 import {
   createEmailService,
   type EmailService,
@@ -49,7 +54,9 @@ import { recordSystemAuditEvent } from "../services/system-audit.ts";
 type CreateAppAuthOptions = {
   database?: Pool;
   env?: EnvSource;
+  emailService?: EmailService;
   includeNextCookies?: boolean;
+  afterResponse?: (deliver: () => Promise<void>) => void;
 };
 
 type AppAuth = ReturnType<typeof createAppAuth>;
@@ -204,6 +211,53 @@ function buildPasswordResetMessage(input: {
 }
 
 type AuthEmailContent = Omit<TransactionalEmailMessage, "to">;
+type AuthEmailTemplate =
+  "email_verification" | "password_reset" | "change_email_confirmation";
+type AuthEmailInput = {
+  buildContent: (branding: Branding) => AuthEmailContent;
+  template: AuthEmailTemplate;
+  to: string;
+  token: string;
+  url: string;
+  userId: string;
+};
+
+function emailVerificationExpiry(token: string): number {
+  // Better Auth generated and signed this JWT before calling us.
+  const [, body] = token.split(".");
+  const payload: unknown = JSON.parse(
+    Buffer.from(body ?? "", "base64url").toString("utf8"),
+  );
+  if (
+    !payload ||
+    typeof payload !== "object" ||
+    !("exp" in payload) ||
+    typeof payload.exp !== "number" ||
+    !Number.isSafeInteger(payload.exp) ||
+    payload.exp <= 0
+  ) {
+    throw new Error("Missing Better Auth verification expiry.");
+  }
+  return payload.exp;
+}
+
+async function resetPasswordExpiry(
+  token: string,
+  userId: string,
+  database: Pool,
+) {
+  // The native password-reset endpoint inserts this opaque token before
+  // invoking the callback. Use its actual expiry rather than restarting
+  // the clock after enqueue or depending on Better Auth's default TTL.
+  const reset = await queryOne<{ expiresAt: number }>(
+    database,
+    `SELECT floor(extract(epoch from "expiresAt"))::bigint AS "expiresAt"
+      FROM verification WHERE identifier = $1 AND value = $2`,
+    [`reset-password:${token}`, userId],
+  );
+  if (!reset) throw new Error("Missing Better Auth password reset expiry.");
+  return reset.expiresAt;
+}
 
 // Auth emails are sent after the response, so sign-in is never slowed down
 // by the mail provider, and a message that cannot be sent (email that is not
@@ -269,7 +323,9 @@ const PASSWORD_PATHS = new Set([
 export function createAppAuth({
   database = getDb(),
   env = process.env,
+  emailService: injectedEmailService,
   includeNextCookies = true,
+  afterResponse = after,
 }: CreateAppAuthOptions = {}) {
   const appEnv = getEnv(env);
   const authEnv = appEnv.auth;
@@ -283,12 +339,53 @@ export function createAppAuth({
     "BETTER_AUTH_URL",
     authEnv.betterAuthUrl,
   );
-  let cachedEmailService: EmailService | null = null;
+  const durable = isDurableJobsEnabled(env);
+  let cachedEmailService: EmailService | null = injectedEmailService ?? null;
   const emailService = () => {
     cachedEmailService ??= createEmailService({ env });
 
     return cachedEmailService;
   };
+  async function sendAuthEmail(input: AuthEmailInput) {
+    if (!durable) {
+      sendAuthEmailInBackground({
+        ...input,
+        env,
+        getEmailService: emailService,
+      });
+      return;
+    }
+
+    // The adapter owns its user/verification writes. Await this independent
+    // queue commit inside the callback; only delivery belongs in after().
+    const expiresAt =
+      input.template === "password_reset"
+        ? await resetPasswordExpiry(input.token, input.userId, database)
+        : emailVerificationExpiry(input.token);
+    const requestDigest = createHash("sha256").update(input.url).digest("hex");
+    const branding = await getBranding(env, database);
+    const { id } = await enqueueEmail(
+      {
+        message: { ...input.buildContent(branding), to: input.to },
+        dedupeKey: `auth/${input.template}/${input.userId}/${requestDigest}`,
+        userId: input.userId,
+        expiresAt,
+      },
+      { database, env },
+    );
+
+    try {
+      afterResponse(async () => {
+        await tryDeliverWorkflowEmails([id], {
+          database,
+          env,
+          emailService: injectedEmailService,
+        });
+      });
+    } catch {
+      // Outside a Next request the scheduled worker can deliver the intent.
+    }
+  }
   const sso = readSsoConfig(env);
   const passwordPolicy = readPasswordSignInPolicy(env);
   const plugins = [
@@ -382,24 +479,25 @@ export function createAppAuth({
     emailVerification: {
       sendOnSignIn: true,
       sendOnSignUp: true,
-      sendVerificationEmail: async ({ url, user }) => {
+      sendVerificationEmail: async ({ token, url, user }) => {
         // The administrator created by first-run setup is verified by
         // setup itself; there is no working email to send through yet.
         if (isRunningSetup()) {
           return;
         }
 
-        sendAuthEmailInBackground({
+        await sendAuthEmail({
           buildContent: (branding) =>
             buildEmailVerificationMessage({
               branding,
               name: user.name,
               url,
             }),
-          env,
-          getEmailService: emailService,
           template: "email_verification",
           to: user.email,
+          token,
+          url,
+          userId: user.id,
         });
       },
     },
@@ -423,18 +521,19 @@ export function createAppAuth({
           console.error("[auth] Could not record a password reset:", error);
         }
       },
-      sendResetPassword: async ({ url, user }) => {
-        sendAuthEmailInBackground({
+      sendResetPassword: async ({ token, url, user }) => {
+        await sendAuthEmail({
           buildContent: (branding) =>
             buildPasswordResetMessage({
               branding,
               name: user.name,
               url,
             }),
-          env,
-          getEmailService: emailService,
           template: "password_reset",
           to: user.email,
+          token,
+          url,
+          userId: user.id,
         });
       },
     },
@@ -518,8 +617,8 @@ export function createAppAuth({
     user: {
       changeEmail: {
         enabled: true,
-        sendChangeEmailConfirmation: async ({ newEmail, url, user }) => {
-          sendAuthEmailInBackground({
+        sendChangeEmailConfirmation: async ({ newEmail, token, url, user }) => {
+          await sendAuthEmail({
             buildContent: (branding) =>
               buildChangeEmailConfirmationMessage({
                 branding,
@@ -527,10 +626,11 @@ export function createAppAuth({
                 newEmail,
                 url,
               }),
-            env,
-            getEmailService: emailService,
             template: "change_email_confirmation",
             to: user.email,
+            token,
+            url,
+            userId: user.id,
           });
         },
         updateEmailWithoutVerification: false,

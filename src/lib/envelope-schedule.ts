@@ -1,3 +1,6 @@
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbPool,
   queryMany,
@@ -22,14 +25,18 @@ import { resolveAppUrl } from "./utils/env.ts";
 // an install needs no second schedule, and that call's lock means two runs
 // never work at once.
 //
-// A notice about a passed deadline is sent first and noted afterwards. So a
+// Durable mode freezes each due notice under the envelope lock and stamps
+// the notice time on provider acceptance. Pending notices and reminders
+// then follow the recovery worker's retry schedule.
+//
+// In legacy mode a passed-deadline notice is sent first and noted afterwards. So a
 // notice that did not go out, because the email failed or because the run
 // was cut off, is simply still due on the next run. The cost is that a run
 // cut off between the two can send the notice a second time; the mail
 // provider drops a repeat that reaches it within its idempotency window.
 //
-// A reminder changes the signer's link, so it is saved first and undone if
-// its email fails (see reminders.ts).
+// A legacy reminder changes the signer's link before sending and restores
+// the previous link if email fails (see reminders.ts).
 
 const BATCH_SIZE = 200;
 // The job shares one function call with the cleanup, and a mail provider
@@ -48,7 +55,9 @@ export type EnvelopeScheduleSummary = {
 
 type ScheduleRun = {
   database: DbPool;
+  durable: boolean;
   emailService: () => EmailService;
+  injectedEmailService?: EmailService;
   now: number;
   outOfTime: () => boolean;
   summary: EnvelopeScheduleSummary;
@@ -62,11 +71,13 @@ type ExpiredEnvelopeRow = {
   signerEmail: string | null;
   signerName: string | null;
   title: string;
+  userId: string;
 };
 
 async function listExpiredEnvelopesToNotify(
   now: number,
   database: DbPool,
+  durable: boolean,
 ): Promise<ExpiredEnvelopeRow[]> {
   return queryMany<ExpiredEnvelopeRow>(
     database,
@@ -74,6 +85,7 @@ async function listExpiredEnvelopesToNotify(
       SELECT
         e.id,
         e.title,
+        e.user_id AS "userId",
         e.expires_at AS "expiresAt",
         u.email AS "ownerEmail",
         u.name AS "ownerName",
@@ -88,6 +100,14 @@ async function listExpiredEnvelopesToNotify(
         AND e.expires_at IS NOT NULL
         AND e.expires_at <= $1
         AND e.expiry_notified_at IS NULL
+        ${
+          durable
+            ? `AND NOT EXISTS (
+          SELECT 1 FROM recovery_jobs r
+          WHERE r.dedupe_key = 'expiry-notice/' || e.id || '/' || e.expires_at::text
+        )`
+            : ""
+        }
       ORDER BY e.expires_at ASC, e.id ASC
       LIMIT ${BATCH_SIZE}
     `,
@@ -185,14 +205,63 @@ function buildExpiryNotice(envelope: ExpiredEnvelopeRow) {
   };
 }
 
+async function enqueueExpiryNotice(
+  envelope: ExpiredEnvelopeRow,
+  database: DbPool,
+): Promise<string | undefined> {
+  return withTransaction(async (tx) => {
+    const current = await queryOne<ExpiredEnvelopeRow>(
+      tx,
+      `
+      SELECT e.id, e.title, e.user_id AS "userId", e.expires_at AS "expiresAt",
+        u.email AS "ownerEmail", u.name AS "ownerName",
+        NULL AS "signerEmail", NULL AS "signerName"
+      FROM envelopes e JOIN "user" u ON u.id = e.user_id
+      WHERE e.id = $1 AND e.status = 'sent' AND e.expires_at = $2
+        AND e.expiry_notified_at IS NULL
+        AND e.expires_at <= floor(extract(epoch from clock_timestamp()))
+      FOR NO KEY UPDATE OF e
+    `,
+      [envelope.id, envelope.expiresAt],
+    );
+    if (!current) return;
+    const dedupeKey = `expiry-notice/${current.id}/${current.expiresAt}`;
+    const existing = await queryOne<{ id: string }>(
+      tx,
+      "SELECT id FROM recovery_jobs WHERE dedupe_key = $1",
+      [dedupeKey],
+    );
+    if (existing) return;
+
+    // The deadline is the event. Its message stays applicable if the sender
+    // corrects the waiting recipient without moving that deadline.
+    const { id } = await enqueueEmail(
+      {
+        message: buildExpiryNotice(current),
+        dedupeKey,
+        envelopeId: current.id,
+        userId: current.userId,
+        acknowledgement: {
+          kind: "expiry_notice",
+          expiresAt: current.expiresAt,
+        },
+      },
+      { database: tx },
+    );
+    return id;
+  }, database);
+}
+
 async function sendExpiryNotices({
   database,
+  durable,
   emailService,
+  injectedEmailService,
   now,
   outOfTime,
   summary,
 }: ScheduleRun): Promise<void> {
-  const expired = await listExpiredEnvelopesToNotify(now, database);
+  const expired = await listExpiredEnvelopesToNotify(now, database, durable);
 
   for (const envelope of expired) {
     if (outOfTime()) {
@@ -201,6 +270,21 @@ async function sendExpiryNotices({
     }
 
     try {
+      if (durable) {
+        const id = await enqueueExpiryNotice(envelope, database);
+        if (
+          id &&
+          (
+            await tryDeliverWorkflowEmails([id], {
+              database,
+              emailService: injectedEmailService,
+            })
+          ).has(id)
+        ) {
+          summary.expiryNoticesSent += 1;
+        }
+        continue;
+      }
       if (!(await isExpiryNoticeDue(envelope, database))) {
         continue;
       }
@@ -262,7 +346,9 @@ async function listEnvelopesDueForReminder(
 
 async function sendAutomaticReminders({
   database,
+  durable,
   emailService,
+  injectedEmailService,
   now,
   outOfTime,
   summary,
@@ -276,7 +362,7 @@ async function sendAutomaticReminders({
     try {
       const sent = await sendAutomaticEnvelopeReminder(envelopeId, {
         database,
-        emailService: emailService(),
+        emailService: durable ? injectedEmailService : emailService(),
         nowUnixTimestamp: now,
       });
 
@@ -319,7 +405,9 @@ export async function runEnvelopeSchedule({
 
   const run: ScheduleRun = {
     database,
+    durable: isDurableJobsEnabled(),
     emailService: getEmailService,
+    injectedEmailService: emailService,
     now,
     outOfTime: () => Date.now() >= stopAt,
     summary,

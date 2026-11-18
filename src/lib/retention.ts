@@ -1,3 +1,6 @@
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import {
   type DbExecutor,
   getDb,
@@ -646,6 +649,11 @@ async function deleteAccountRows(
     database,
   );
 
+  // Auth and other account-owned jobs deliberately have no user FK.
+  await database.query("DELETE FROM recovery_jobs WHERE user_id = $1", [
+    userId,
+  ]);
+
   await database.query(
     `
       DELETE FROM "user"
@@ -742,9 +750,15 @@ type FinishedEnvelopeRow = EnvelopeArtifactRow & {
 async function listFinishedEnvelopesToHandle(
   {
     deleteBefore,
+    durable,
     warnBefore,
     warnedBefore,
-  }: { deleteBefore: number; warnBefore: number; warnedBefore: number },
+  }: {
+    deleteBefore: number;
+    durable: boolean;
+    warnBefore: number;
+    warnedBefore: number;
+  },
   database: DbExecutor,
 ): Promise<FinishedEnvelopeRow[]> {
   return queryMany<FinishedEnvelopeRow>(
@@ -772,6 +786,13 @@ async function listFinishedEnvelopesToHandle(
         AND (
           (
             e.retention_warned_at IS NULL
+            ${
+              durable
+                ? `AND NOT EXISTS (
+              SELECT 1 FROM recovery_jobs r WHERE r.dedupe_key = 'retention-notice/' || e.id
+            )`
+                : ""
+            }
             AND COALESCE(e.completed_at, e.declined_at, e.voided_at, e.updated_at) < $1
           )
           OR (
@@ -790,6 +811,31 @@ function formatDay(timestamp: number): string {
   return new Date(timestamp * 1000).toISOString().slice(0, 10);
 }
 
+function buildRetentionWarning(
+  envelope: Pick<
+    FinishedEnvelopeRow,
+    "id" | "ownerEmail" | "ownerName" | "title"
+  >,
+  deleteOn: number,
+) {
+  const appUrl = resolveAppUrl();
+  const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
+
+  return {
+    subject: `"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
+    template: "retention_notice" as const,
+    textBody: [
+      `Hello ${envelope.ownerName},`,
+      "",
+      `Your organization keeps finished documents for a set time. "${envelope.title}" and its audit trail will be deleted on or after ${formatDay(deleteOn)}.`,
+      "",
+      "Download the signed PDF and the certificate now if you need to keep them.",
+      ...(link ? ["", link] : []),
+    ].join("\n"),
+    to: envelope.ownerEmail,
+  };
+}
+
 async function warnBeforeRetentionDeletion(
   envelope: FinishedEnvelopeRow,
   deleteOn: number,
@@ -797,30 +843,64 @@ async function warnBeforeRetentionDeletion(
   database: DbExecutor,
   emailService: EmailService,
 ) {
-  const appUrl = resolveAppUrl();
-  const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
-
-  await emailService.send(
-    {
-      subject: `"${envelope.title}" will be deleted on ${formatDay(deleteOn)}`,
-      template: "retention_notice",
-      textBody: [
-        `Hello ${envelope.ownerName},`,
-        "",
-        `Your organization keeps finished documents for a set time. "${envelope.title}" and its audit trail will be deleted on or after ${formatDay(deleteOn)}.`,
-        "",
-        "Download the signed PDF and the certificate now if you need to keep them.",
-        ...(link ? ["", link] : []),
-      ].join("\n"),
-      to: envelope.ownerEmail,
-    },
-    { idempotencyKey: `retention-notice/${envelope.id}` },
-  );
+  await emailService.send(buildRetentionWarning(envelope, deleteOn), {
+    idempotencyKey: `retention-notice/${envelope.id}`,
+  });
 
   await database.query(
     `UPDATE envelopes SET retention_warned_at = $1 WHERE id = $2`,
     [now, envelope.id],
   );
+}
+
+async function enqueueRetentionWarning(
+  envelope: FinishedEnvelopeRow,
+  deleteOn: number,
+  database: DbExecutor,
+): Promise<string | undefined> {
+  const enqueue = async (tx: DbExecutor) => {
+    const current = await queryOne<
+      Pick<
+        FinishedEnvelopeRow,
+        "id" | "ownerEmail" | "ownerName" | "userId" | "title"
+      >
+    >(
+      tx,
+      `SELECT e.id, e.title, e.user_id AS "userId", u.email AS "ownerEmail", u.name AS "ownerName"
+      FROM envelopes e JOIN "user" u ON u.id = e.user_id
+      WHERE e.id = $1 AND e.status IN ('completed', 'declined', 'voided')
+        AND NOT e.part11 AND e.retention_warned_at IS NULL
+      FOR NO KEY UPDATE OF e`,
+      [envelope.id],
+    );
+    if (!current) return;
+
+    // Sweeps can run with a later date while the first warning is pending.
+    // Leave the original message and its provider key intact.
+    const dedupeKey = `retention-notice/${current.id}`;
+    const existing = await queryOne<{ id: string }>(
+      tx,
+      "SELECT id FROM recovery_jobs WHERE dedupe_key = $1",
+      [dedupeKey],
+    );
+    if (existing) return;
+
+    const { id } = await enqueueEmail(
+      {
+        message: buildRetentionWarning(current, deleteOn),
+        dedupeKey,
+        envelopeId: current.id,
+        userId: current.userId,
+        acknowledgement: { kind: "retention_warning" },
+      },
+      { database: tx },
+    );
+    return id;
+  };
+
+  return isPool(database)
+    ? withTransaction(enqueue, database)
+    : enqueue(database);
 }
 
 /**
@@ -834,13 +914,16 @@ async function applyRetentionPeriod(
   database: DbExecutor,
   storageService: StorageService,
   emailService: () => EmailService,
+  injectedEmailService: EmailService | undefined,
   summary: RetentionSweepSummary,
 ) {
+  const durable = isDurableJobsEnabled();
   const warnBefore =
     now - (retentionDays - RETENTION_WARNING_DAYS) * DAY_IN_SECONDS;
   const candidates = await listFinishedEnvelopesToHandle(
     {
       deleteBefore: now - retentionDays * DAY_IN_SECONDS,
+      durable,
       warnBefore,
       warnedBefore: now - RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
     },
@@ -851,19 +934,33 @@ async function applyRetentionPeriod(
     database,
   );
 
+  const jobs: string[] = [];
   for (const envelope of candidates) {
     const deleteOn = envelope.finishedAt + retentionDays * DAY_IN_SECONDS;
 
     try {
       if (envelope.retentionWarnedAt === null) {
-        await warnBeforeRetentionDeletion(
-          envelope,
-          Math.max(deleteOn, now + RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS),
-          now,
-          database,
-          emailService(),
+        const earliestDeleteOn = Math.max(
+          deleteOn,
+          now + RETENTION_MIN_NOTICE_DAYS * DAY_IN_SECONDS,
         );
-        summary.finishedEnvelopeWarningsSent += 1;
+        if (durable) {
+          const id = await enqueueRetentionWarning(
+            envelope,
+            earliestDeleteOn,
+            database,
+          );
+          if (id) jobs.push(id);
+        } else {
+          await warnBeforeRetentionDeletion(
+            envelope,
+            earliestDeleteOn,
+            now,
+            database,
+            emailService(),
+          );
+          summary.finishedEnvelopeWarningsSent += 1;
+        }
         continue;
       }
 
@@ -900,6 +997,13 @@ async function applyRetentionPeriod(
         error,
       );
     }
+  }
+  if (isPool(database)) {
+    const sent = await tryDeliverWorkflowEmails(jobs, {
+      database,
+      emailService: injectedEmailService,
+    });
+    summary.finishedEnvelopeWarningsSent += sent.size;
   }
 }
 
@@ -1185,6 +1289,7 @@ export async function runRetentionSweep({
       database,
       storageService,
       () => (service ??= createEmailService()),
+      emailService,
       summary,
     );
   }

@@ -16,6 +16,7 @@ import {
   extractEmailAddress,
   type EmailAddresses,
 } from "../services/email-addresses.ts";
+import { EMAIL_CODE_MAX_ATTEMPTS } from "../signer-checks.ts";
 import { emailTemplateKinds, envelopeStatuses } from "../types/domain.ts";
 import { readEnv, type EnvSource } from "../utils/env.ts";
 import { assertRecoveryConfigured, isDurableJobsEnabled } from "./config.ts";
@@ -47,6 +48,7 @@ const guardSchema = z.discriminatedUnion("kind", [
     allowedStatuses: z.array(z.enum(envelopeStatuses)).nonempty(),
   }),
   z.object({ kind: z.literal("signer_token"), signerId: id, tokenHash }),
+  z.object({ kind: z.literal("signing_lock"), adminId: id, lockedAt: expiry }),
   z.object({
     kind: z.literal("signing_code"),
     signerId: id,
@@ -126,7 +128,10 @@ export async function enqueueEmail(
 ): Promise<{ id: string; created: boolean }> {
   if (!isDurableJobsEnabled(env)) throw new Error("Durable jobs are disabled.");
   assertRecoveryConfigured(env);
-  if ((guard || acknowledgement) && !job.envelopeId) {
+  if (
+    (acknowledgement && !job.envelopeId) ||
+    (guard && (guard.kind === "signing_lock" ? !job.userId : !job.envelopeId))
+  ) {
     throw new RecoveryJobError("payload_invalid", true);
   }
 
@@ -172,9 +177,22 @@ type EnvelopeGuardRow = {
 
 async function envelopeGuardMatches(
   job: ClaimedRecoveryJob,
-  { guard, acknowledgement }: FrozenEmail,
+  { guard, acknowledgement, message }: FrozenEmail,
   database: DbExecutor,
 ): Promise<boolean> {
+  if (guard?.kind === "signing_lock") {
+    const admin = await queryOne<{ id: string }>(
+      database,
+      `
+      SELECT a.id FROM "user" a
+      JOIN "user" person ON person.id = $1 AND person.signing_locked_at = $2
+      WHERE a.id = $3 AND a.role = 'admin' AND a.email = $4
+    `,
+      [job.userId, guard.lockedAt, guard.adminId, message.to],
+    );
+    return admin !== null;
+  }
+
   if (!guard && (!acknowledgement || acknowledgement.kind === "email_audit"))
     return true;
 
@@ -229,9 +247,20 @@ async function envelopeGuardMatches(
   const codeHash = guard.kind === "signing_code" ? guard.codeHash : null;
   const result = await database.query(
     `SELECT 1 FROM signers WHERE envelope_id = $1 AND id = $2 AND status = 'notified'
-      AND signing_token_hash = $3 AND signing_token_expires_at > ${DATABASE_SECONDS}
-      AND ($4::text IS NULL OR (email_code_hash = $4 AND email_code_expires_at > ${DATABASE_SECONDS}))`,
-    [job.envelopeId, guard.signerId, guard.tokenHash, codeHash],
+      AND signing_token_hash = $3
+      AND (signing_token_expires_at IS NULL OR signing_token_expires_at >= ${DATABASE_SECONDS})
+      AND ($4::text IS NULL OR (
+        email_code_hash = $4
+        AND email_code_expires_at >= ${DATABASE_SECONDS}
+        AND email_code_attempts < $5
+      ))`,
+    [
+      job.envelopeId,
+      guard.signerId,
+      guard.tokenHash,
+      codeHash,
+      EMAIL_CODE_MAX_ATTEMPTS,
+    ],
   );
   return result.rowCount === 1;
 }
@@ -357,7 +386,11 @@ export async function processEmailJob(
   if (job.kind !== "email" || !parsed.success)
     throw new RecoveryJobError("payload_invalid", true);
   const payload = parsed.data;
-  if ((payload.guard || payload.acknowledgement) && !job.envelopeId) {
+  if (
+    (payload.acknowledgement && !job.envelopeId) ||
+    (payload.guard &&
+      (payload.guard.kind === "signing_lock" ? !job.userId : !job.envelopeId))
+  ) {
     throw new RecoveryJobError("payload_invalid", true);
   }
 

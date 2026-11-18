@@ -1,3 +1,6 @@
+import { isDurableJobsEnabled } from "./recovery/config.ts";
+import { enqueueEmail } from "./recovery/email.ts";
+import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
 import {
   formatDeadline,
@@ -88,6 +91,7 @@ type PersistedReminder = {
   envelopeId: string;
   envelopeTitle: string;
   issuedLink: IssuedSigningLink;
+  jobId?: string;
   nextAvailableAt: number;
   previousEnvelopeUpdatedAt: number;
   previousSigner: Pick<
@@ -291,6 +295,7 @@ async function persistReminder(
   dispatchedAt: number,
   database: DbPool,
 ): Promise<PersistedReminder> {
+  const durable = isDurableJobsEnabled();
   const userId = request.kind === "manual" ? request.userId : null;
   const envelope = await getReminderEnvelope(envelopeId, userId, database);
 
@@ -465,7 +470,7 @@ async function persistReminder(
       tx,
     );
 
-    return {
+    const persisted: PersistedReminder = {
       auditEventId: auditEvent.id,
       envelopeExpiresAt: persistedEnvelope.expiresAt,
       envelopeId,
@@ -490,7 +495,52 @@ async function persistReminder(
       signerName: persistedSigner.name,
       userId: persistedEnvelope.userId,
     };
+    if (durable) {
+      const { id } = await enqueueEmail(
+        {
+          message: reminderMessage(
+            persisted,
+            request.kind,
+            await getBranding(process.env, tx),
+          ),
+          dedupeKey: `reminder/${auditEvent.id}`,
+          envelopeId,
+          userId: persisted.userId,
+          expiresAt: persistedEnvelope.expiresAt ?? issuedLink.exp + 1,
+          guard: {
+            kind: "signer_token",
+            signerId: persisted.signerId,
+            tokenHash: issuedLink.tokenHash,
+          },
+          acknowledgement: {
+            kind: "email_audit",
+            signerId: persisted.signerId,
+          },
+        },
+        { database: tx },
+      );
+      persisted.jobId = id;
+    }
+    return persisted;
   }, database);
+}
+
+function reminderMessage(
+  persisted: PersistedReminder,
+  kind: ReminderRequest["kind"],
+  branding: Branding,
+) {
+  return buildReminderEmail({
+    branding,
+    envelopeId: persisted.envelopeId,
+    envelopeTitle: persisted.envelopeTitle,
+    expiresAt: persisted.envelopeExpiresAt,
+    kind,
+    senderName: persisted.senderName,
+    signerEmail: persisted.signerEmail,
+    signerName: persisted.signerName,
+    signingUrl: persisted.issuedLink.url,
+  });
 }
 
 /**
@@ -509,17 +559,7 @@ async function deliverReminder(
   try {
     reminderMessageId = (
       await emailService.send(
-        buildReminderEmail({
-          branding: await getBranding(),
-          envelopeId: persisted.envelopeId,
-          envelopeTitle: persisted.envelopeTitle,
-          expiresAt: persisted.envelopeExpiresAt,
-          kind,
-          senderName: persisted.senderName,
-          signerEmail: persisted.signerEmail,
-          signerName: persisted.signerName,
-          signingUrl: persisted.issuedLink.url,
-        }),
+        reminderMessage(persisted, kind, await getBranding()),
       )
     ).messageId;
   } catch (error) {
@@ -625,10 +665,11 @@ export async function sendManualEnvelopeNudge(
 ) {
   // Before the reminder is saved: saving retires the signer's current link,
   // so with no email to carry the new one the signer would be left with none.
-  let service: EmailService;
+  const durable = isDurableJobsEnabled();
+  let service = emailService;
 
   try {
-    service = emailService ?? createEmailService();
+    if (!durable) service ??= createEmailService();
   } catch (error) {
     if (isEmailNotConnectedError(error)) {
       throw new ReminderMutationError(EMAIL_NOT_CONNECTED_MESSAGE, 503);
@@ -644,7 +685,14 @@ export async function sendManualEnvelopeNudge(
     database,
   );
 
-  await deliverReminder(persisted, "manual", database, service);
+  if (persisted.jobId) {
+    await tryDeliverWorkflowEmails([persisted.jobId], {
+      database,
+      emailService: service,
+    });
+  } else {
+    await deliverReminder(persisted, "manual", database, service!);
+  }
 
   return manualNudgeResponseSchema.parse({
     envelopeId: persisted.envelopeId,
@@ -687,6 +735,14 @@ export async function sendAutomaticEnvelopeReminder(
     }
 
     throw error;
+  }
+
+  if (persisted.jobId) {
+    const sent = await tryDeliverWorkflowEmails([persisted.jobId], {
+      database,
+      emailService,
+    });
+    return sent.has(persisted.jobId);
   }
 
   await deliverReminder(
