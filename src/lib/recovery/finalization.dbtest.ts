@@ -2,10 +2,12 @@ import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, before, test, type TestContext } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
+import { Pool } from "pg";
 import { PDFDocument } from "pdf-lib";
 
 import { afterStatement, openTestDatabase } from "../db/test-database.ts";
@@ -65,7 +67,7 @@ after(async () => {
   await rm(directory, { force: true, recursive: true });
 });
 
-async function fixture() {
+async function fixture(sourceStorage = storage) {
   const [user, account, envelope, signer, field] = Array.from(
     { length: 5 },
     () => randomUUID(),
@@ -77,7 +79,7 @@ async function fixture() {
   const body = await source.save();
   const key = "recovery-fixtures/" + envelope + "/original.pdf";
   keys.add(key);
-  await storage.putObject({ key, body, contentType: "application/pdf" });
+  await sourceStorage.putObject({ key, body, contentType: "application/pdf" });
   const link = await issueSigningLink({ expiresInSeconds: 3600 });
   await database.query(
     `INSERT INTO "user"(id,name,email,"emailVerified",identity_verified_at) VALUES($1,'Owner',$1||'@example.test',true,1),($2,'Signing Person',$3,true,1)`,
@@ -135,13 +137,14 @@ async function pausedProcess(
     token?: string;
     submission?: unknown;
   },
+  env: NodeJS.ProcessEnv = process.env,
 ) {
   const child = fork(
     new URL("./fixtures/finalization-process.ts", import.meta.url),
     [],
     {
       execArgv: ["--disable-warning=MODULE_TYPELESS_PACKAGE_JSON"],
-      env: { ...process.env, DATABASE_URL: process.env.E2E_DATABASE_URL },
+      env: { ...env, DATABASE_URL: process.env.E2E_DATABASE_URL },
       stdio: ["ignore", "ignore", "pipe", "ipc"],
     },
   );
@@ -620,3 +623,199 @@ test("hosted account purge queues an interrupted attempt before discarding its m
     assert.equal((await storage.headObject(key)).exists, false);
   }
 });
+
+test("hosted purge waits for live publication and retries the winning files after storage failure", async (t) => {
+  const f = await fixture();
+  await submitSigningForToken(f.token, f.submission, {
+    database,
+    verifiedMethods: ["account"],
+    verifyPassword: async () => true,
+  });
+  const jobId = (
+    await database.query("SELECT id FROM recovery_jobs WHERE envelope_id=$1", [
+      f.envelopeId,
+    ])
+  ).rows[0].id;
+  await database.query(
+    "INSERT INTO account_closure_requests(user_id,requested_at,export_expires_at,purge_after_at,updated_at) VALUES($1,1,1,1,1)",
+    [f.userId],
+  );
+  const publishing = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const publication = runRecoveryJobs({
+    database: afterStatement(
+      database,
+      (sql) => sql.includes("UPDATE envelopes SET status = 'completed'"),
+      async () => {
+        publishing.resolve();
+        await release.promise;
+      },
+    ),
+    jobId,
+  });
+  await Promise.race([
+    publishing.promise,
+    publication.then(() =>
+      assert.fail("publisher never acquired the envelope"),
+    ),
+  ]);
+  const attempt = (
+    await database.query(
+      "SELECT storage_keys FROM finalization_attempts WHERE job_id=$1",
+      [jobId],
+    )
+  ).rows[0].storage_keys as string[];
+  for (const key of attempt) keys.add(key);
+  const applicationName = "purge-" + randomUUID();
+  const purgePool = new Pool({
+    connectionString: process.env.E2E_DATABASE_URL,
+    application_name: applicationName,
+  });
+  const previous = process.env.HOSTED_MODE;
+  process.env.HOSTED_MODE = "true";
+  const outputError = console.error;
+  const errors = t.mock.method(console, "error", (...args: unknown[]) => {
+    if (
+      !args.some((value) =>
+        String(value).includes("fixture storage temporarily offline"),
+      )
+    )
+      outputError(...args);
+  });
+  let queueAtFirstDelete: string[] | undefined;
+  const purging = runRetentionSweep({
+    database: purgePool,
+    storageService: {
+      ...storage,
+      async deleteObject(key) {
+        const first =
+          key.includes(f.envelopeId) && queueAtFirstDelete === undefined;
+        if (first) {
+          queueAtFirstDelete = (
+            await database.query(
+              "SELECT storage_key FROM pending_file_deletions WHERE envelope_id=$1",
+              [f.envelopeId],
+            )
+          ).rows.map((row) => row.storage_key);
+        }
+        if (first || attempt.includes(key))
+          throw new Error("fixture storage temporarily offline");
+        return storage.deleteObject(key);
+      },
+    },
+  });
+  try {
+    let blocked = false;
+    for (let count = 0; count < 300 && !blocked; count++) {
+      blocked =
+        (
+          await database.query(
+            "SELECT 1 FROM pg_stat_activity WHERE application_name=$1 AND wait_event_type='Lock'",
+            [applicationName],
+          )
+        ).rowCount === 1;
+      if (!blocked) await delay(10);
+    }
+    assert.equal(
+      blocked,
+      true,
+      "purge overlapped the fenced publication transaction",
+    );
+    release.resolve();
+    assert.equal((await publication).failed, 0);
+    assert.ok(!(await purging).accountPurgeFailures.includes(f.userId));
+    assert.equal(
+      (
+        await database.query("SELECT id FROM envelopes WHERE id=$1", [
+          f.envelopeId,
+        ])
+      ).rowCount,
+      0,
+    );
+    assert.deepEqual(
+      queueAtFirstDelete?.filter((key) => attempt.includes(key)).sort(),
+      [...attempt].sort(),
+    );
+    assert.ok(
+      errors.mock.calls.some((call) =>
+        call.arguments.some((value) =>
+          String(value).includes("fixture storage temporarily offline"),
+        ),
+      ),
+    );
+    for (const key of attempt)
+      assert.ok((await storage.headObject(key)).exists);
+    const result = await runRetentionSweep({
+      database,
+      storageService: storage,
+    });
+    assert.ok(result.pendingFileDeletionsDone >= 3);
+    for (const key of attempt)
+      assert.equal((await storage.headObject(key)).exists, false);
+  } finally {
+    release.resolve();
+    await Promise.allSettled([publication, purging]);
+    if (previous === undefined) delete process.env.HOSTED_MODE;
+    else process.env.HOSTED_MODE = previous;
+    await purgePool.end();
+  }
+});
+
+for (const phase of ["data-rename", "metadata-rename"]) {
+  test(`local SIGKILL during ${phase} leaves no staged files after recovery cleanup`, async (t) => {
+    const env = { ...process.env, STORAGE_DRIVER: "local" };
+    const local = createStorageService({ env });
+    const f = await fixture(local);
+    await submitSigningForToken(f.token, f.submission, {
+      database,
+      storageService: local,
+      verifiedMethods: ["account"],
+      verifyPassword: async () => true,
+    });
+    const jobId = (
+      await database.query(
+        "SELECT id FROM recovery_jobs WHERE envelope_id=$1",
+        [f.envelopeId],
+      )
+    ).rows[0].id;
+    const child = await pausedProcess(
+      t,
+      { phase, envelopeId: f.envelopeId, jobId },
+      env,
+    );
+    const attempt = (
+      await database.query(
+        "SELECT storage_keys FROM finalization_attempts WHERE job_id=$1",
+        [jobId],
+      )
+    ).rows[0].storage_keys as string[];
+    const root = path.dirname(path.join(directory, attempt[0]));
+    const raw = await readdir(root);
+    const tmp = raw.find((name) => name.endsWith(".tmp"));
+    assert.ok(tmp);
+    const bytes = await readFile(path.join(root, tmp));
+    if (phase === "data-rename")
+      assert.equal(bytes.subarray(0, 5).toString(), "%PDF-");
+    else
+      assert.equal(JSON.parse(bytes.toString()).contentType, "application/pdf");
+    await child.kill();
+    await expire(jobId);
+    assert.equal((await runRecoveryJobs({ database, env, jobId })).failed, 0);
+    const queued = (
+      await database.query(
+        "SELECT storage_key FROM pending_file_deletions WHERE envelope_id=$1",
+        [f.envelopeId],
+      )
+    ).rows.map((row) => row.storage_key);
+    assert.deepEqual(queued.sort(), attempt.sort());
+    for (const key of queued)
+      assert.ok(await deletePendingFile(key, database, local));
+    assert.deepEqual(await readdir(root, { recursive: true }), []);
+    const winner = (
+      await database.query("SELECT signed_pdf_key FROM envelopes WHERE id=$1", [
+        f.envelopeId,
+      ])
+    ).rows[0].signed_pdf_key;
+    assert.equal((await local.headObject(winner)).exists, true);
+  });
+}

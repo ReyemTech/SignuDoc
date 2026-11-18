@@ -569,7 +569,7 @@ async function deleteAccountRows(
   keepFinishedEnvelopes: boolean,
   database: DbExecutor,
   env: EnvSource,
-): Promise<string[] | null> {
+): Promise<{ queued: string[]; immediate: string[] } | null> {
   const account = await queryOne<{ id: string }>(
     database,
     `SELECT id FROM "user" WHERE id = $1 FOR UPDATE`,
@@ -580,23 +580,16 @@ async function deleteAccountRows(
     return null;
   }
 
-  if (keepFinishedEnvelopes) {
-    // The account's envelopes are locked before the finished ones are
-    // handed over, and stay locked until the account is gone. Signing,
-    // declining and voiding all change the envelope's row, so one that got
-    // in first has finished and its envelope is handed over here, and one
-    // that comes after waits and then finds no envelope. Without the lock
-    // an envelope could be completed between the hand-over and the delete,
-    // and its signed record would go with the account.
-    //
-    // The lock an UPDATE takes, not FOR UPDATE: a signer's audit event
-    // needs a share of this row for its foreign key, and FOR UPDATE would
-    // make it wait.
-    await database.query(
-      `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
-      [userId],
-    );
+  // Serialize erasure with signature acceptance and publication in both
+  // modes. If publication wins, a fresh enumeration sees its three names.
+  // If purge wins, publication waits and then finds its parent gone.
+  // NO KEY UPDATE remains compatible with audit foreign-key checks.
+  await database.query(
+    `SELECT id FROM envelopes WHERE user_id = $1 FOR NO KEY UPDATE`,
+    [userId],
+  );
 
+  if (keepFinishedEnvelopes) {
     // The JSON lookup also works on a disabled install predating the migration.
     if (
       await queryOne(
@@ -621,14 +614,21 @@ async function deleteAccountRows(
     envelopes.map((envelope) => envelope.id),
     database,
   );
-  const storageKeys = new Set<string>();
+  const immediate = new Set<string>();
+  const queued = new Set<string>();
 
   for (const envelope of envelopes) {
-    for (const key of buildEnvelopeStorageKeys(
+    const keys = buildEnvelopeStorageKeys(
       envelope,
       fieldImagesByEnvelopeId.get(envelope.id) ?? [],
-    )) {
-      storageKeys.add(key);
+    );
+    if (keepFinishedEnvelopes) {
+      for (const key of keys) immediate.add(key);
+    } else {
+      // Account deletion discards these pointers. The daily file cleanup
+      // must be able to finish even if the very first external delete fails.
+      await queueFileDeletions(envelope.id, keys, now, database);
+      for (const key of keys) queued.add(key);
     }
   }
 
@@ -641,7 +641,7 @@ async function deleteAccountRows(
   );
 
   for (const template of templates) {
-    storageKeys.add(template.sourcePdfKey);
+    immediate.add(template.sourcePdfKey);
   }
 
   // The access it ends is worth a line in the install's trail, which lands
@@ -692,7 +692,7 @@ async function deleteAccountRows(
     [userId],
   );
 
-  return [...storageKeys];
+  return { queued: [...queued], immediate: [...immediate] };
 }
 
 async function purgeQueuedAccount(
@@ -726,13 +726,20 @@ async function purgeQueuedAccount(
     return false;
   }
 
-  // Only once the rows are gone for good.
-  await deleteStorageKeys(storageKeys, storageService).catch((error) => {
-    console.error(
-      `Failed to delete storage artifacts for purged account ${userId}:`,
-      error,
-    );
-  });
+  // Only the pool path knows its transaction has committed. A caller
+  // holding a transaction leaves the hosted envelope keys to the next sweep.
+  if (isPool(database)) {
+    for (const key of storageKeys.queued)
+      await deletePendingFile(key, database, storageService);
+  }
+  await deleteStorageKeys(storageKeys.immediate, storageService).catch(
+    (error) => {
+      console.error(
+        `Failed to delete storage artifacts for purged account ${userId}:`,
+        error,
+      );
+    },
+  );
 
   return true;
 }

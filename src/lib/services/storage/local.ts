@@ -4,6 +4,7 @@ import {
   link,
   mkdir,
   readFile,
+  readdir,
   rename,
   rm,
   stat,
@@ -12,6 +13,7 @@ import {
 import path from "node:path";
 import { Readable } from "node:stream";
 
+import { parseFinalizationAttemptKey } from "../storage-keys.ts";
 import { type EnvSource } from "../../utils/env.ts";
 import {
   normalizeStorageKey,
@@ -88,6 +90,30 @@ async function writeFileIfAbsent(
   }
 }
 
+// A killed atomic write can leave either its data or its metadata staging
+// file. A retired lease owns these names exclusively. Never scan the
+// mutable folders used by ordinary local uploads or remove a sibling's file.
+async function removeAttemptStaging(objectPath: string) {
+  const directory = path.dirname(objectPath);
+  const prefix = path.basename(objectPath) + ".";
+  let entries: string[];
+  try {
+    entries = await readdir(directory);
+  } catch (error) {
+    if (isMissingFileError(error)) return;
+    throw error;
+  }
+  const stagingSuffix =
+    /^(?:meta\.json\.)?[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}\.tmp$/;
+  for (const entry of entries) {
+    if (
+      entry.startsWith(prefix) &&
+      stagingSuffix.test(entry.slice(prefix.length))
+    )
+      await rm(path.join(directory, entry), { force: true });
+  }
+}
+
 export function createLocalStorageService({
   env = process.env,
   signal,
@@ -146,7 +172,9 @@ export function createLocalStorageService({
 
   return {
     async deleteObject(key) {
-      const { objectPath } = resolveObjectPath(key);
+      const { normalizedKey, objectPath } = resolveObjectPath(key);
+      if (parseFinalizationAttemptKey(normalizedKey))
+        await removeAttemptStaging(objectPath);
 
       await Promise.all([
         rm(objectPath, { force: true }),

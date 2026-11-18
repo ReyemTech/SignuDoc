@@ -33,7 +33,7 @@ import { enqueueEmail } from "./recovery/email.ts";
 import { runRecoveryJobs } from "./recovery/worker.ts";
 import { getSenderEnvelopeDownload } from "./downloads.ts";
 import { runEnvelopeSchedule } from "./envelope-schedule.ts";
-import { runRetentionSweep } from "./retention.ts";
+import { AccountPurgeDeferredError, runRetentionSweep } from "./retention.ts";
 import { invalidateSettingsCache } from "./settings.ts";
 import { type EmailService } from "./services/email.ts";
 import { verifyAuditChain } from "./services/audit.ts";
@@ -1080,7 +1080,7 @@ test("durable first invitation rolls back with the send transaction", async () =
   }
 });
 
-test("durable completion commits recipient download links and stable mail intents with publication", async () => {
+test("durable completion commits recipient download links and stable mail intents with publication", async (t) => {
   const cc = { name: "Copy Recipient", email: "copy@example.test" };
   const draft = await createDraft([cc]);
   await send(draft, "simple");
@@ -1242,11 +1242,22 @@ test("durable completion commits recipient download links and stable mail intent
       "INSERT INTO account_closure_requests(user_id,requested_at,export_expires_at,purge_after_at,updated_at) VALUES($1,1,1,1,1)",
       [draft.userId],
     );
+    const originalError = console.error;
+    const deferred = t.mock.method(console, "error", (...args: unknown[]) => {
+      if (!(args[1] instanceof AccountPurgeDeferredError))
+        originalError(...args);
+    });
     const sweep = await runRetentionSweep({
       database,
       storageService,
       emailService: failed,
     });
+    deferred.mock.restore();
+    assert.ok(
+      deferred.mock.calls.some(
+        (call) => call.arguments[1] instanceof AccountPurgeDeferredError,
+      ),
+    );
     assert.ok(sweep.accountPurgeFailures.includes(draft.userId));
     await runRecoveryJobs({ database, jobId: finalizer[0].id });
     const jobs = await database.query<{
@@ -1433,7 +1444,7 @@ test("durable decline stays accepted during an outage and audits only delivery",
 });
 
 for (const changed of [false, true]) {
-  test(`recover an accepted qualified signature with ${changed ? "a changed" : "its verified"} revision`, async () => {
+  test(`recover an accepted qualified signature with ${changed ? "a changed" : "its verified"} revision`, async (t) => {
     const draft = await createDraft();
     setEnv({
       DURABLE_JOBS_ENABLED: "true",
@@ -1498,7 +1509,29 @@ for (const changed of [false, true]) {
           contentType: "application/pdf",
           body: Uint8Array.of(1),
         });
+      const expectedWarning = (value: unknown) =>
+        String(value).startsWith(
+          "[seal] Long-term validation is incomplete:",
+        ) &&
+        String(value).includes(
+          "Refused to fetch from a private address (127.0.0.1)",
+        );
+      const originalWarn = console.warn;
+      const validation = t.mock.method(
+        console,
+        "warn",
+        (...args: unknown[]) => {
+          if (!expectedWarning(args[0])) originalWarn(...args);
+        },
+      );
       const run = await runRecoveryJobs({ database, jobId: row.id });
+      validation.mock.restore();
+      assert.equal(
+        validation.mock.calls.some((call) =>
+          expectedWarning(call.arguments[0]),
+        ),
+        !changed,
+      );
       assert.equal(run.failed, Number(changed));
       const terminal = (
         await database.query(

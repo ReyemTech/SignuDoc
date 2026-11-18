@@ -1,5 +1,7 @@
 // Process boundaries for the integration test. All coordination happens in
 // this fixture, while the application runs its ordinary transactions and PUTs.
+import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
 import { getDb } from "../../db/connection.ts";
 import { afterStatement } from "../../db/test-database.ts";
 import { createStorageService } from "../../services/storage.ts";
@@ -21,6 +23,17 @@ const db = getDb();
 async function pause() {
   process.send?.(message.phase);
   await new Promise<void>((resolve) => process.once("message", resolve));
+}
+// Pause the real local adapter between its completed staging write and rename.
+if (message.phase === "data-rename" || message.phase === "metadata-rename") {
+  const original = fs.rename;
+  const suffix =
+    message.phase === "data-rename" ? "/final.pdf" : "/final.pdf.meta.json";
+  fs.rename = async (from, to) => {
+    if (String(to).endsWith(suffix)) await pause();
+    return original(from, to);
+  };
+  syncBuiltinESMExports();
 }
 try {
   if (message.phase === "accept" || message.phase === "published") {
