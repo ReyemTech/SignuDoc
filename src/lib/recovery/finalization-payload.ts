@@ -19,6 +19,10 @@ const objectHash = z.object({
 export const finalizationPayload = z
   .object({
     version: z.literal(1),
+    publicVerificationToken: z
+      .string()
+      .regex(/^[A-Za-z0-9_-]{43}$/)
+      .optional(),
     generatedAt: unixTimestampSchema,
     envelope: envelopeRecordSchema.extend({ status: z.literal("sent") }),
     fields: z.array(fieldRecordSchema),

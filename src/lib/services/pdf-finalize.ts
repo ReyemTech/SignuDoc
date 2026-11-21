@@ -1,8 +1,16 @@
 import type { TransactionPool } from "../db/connection.ts";
 import type { EnvSource } from "../utils/env.ts";
 import { randomUUID } from "node:crypto";
+import { deflateSync } from "node:zlib";
 
-import { PDFDocument, type PDFImage, type PDFPage, rgb } from "pdf-lib";
+import {
+  PDFDocument,
+  PDFString,
+  type PDFImage,
+  type PDFPage,
+  rgb,
+} from "pdf-lib";
+import { encode as encodeQr } from "uqr";
 
 import {
   auditEventRecordSchema,
@@ -27,6 +35,13 @@ import {
 } from "./pdf-page-geometry.ts";
 import { sha256Hex } from "./pdf-seal.ts";
 import { getBranding } from "../settings.ts";
+import { type Branding } from "../branding.ts";
+import { sniffLogoContentType, type BrandLogo } from "../brand-logo.ts";
+import { buildBrandPalette, DEFAULT_BRAND_COLOR } from "../brand-color.ts";
+import {
+  buildPublicVerificationUrl,
+  hashPublicVerificationToken,
+} from "../public-verification.ts";
 import {
   finishSignerSignedPdf,
   getSealIdentity,
@@ -620,8 +635,8 @@ function getEnvelopeStatusLabel(status: EnvelopeRecord["status"]): string {
 
 function getCertificateTitle(envelope: EnvelopeRecord): string {
   return envelope.status === "completed"
-    ? "SignuDoc Certificate of Completion"
-    : "SignuDoc Audit Certificate";
+    ? "Certificate of Completion"
+    : "Audit Certificate";
 }
 
 function getTerminalTimestampLabel(envelope: EnvelopeRecord): string {
@@ -970,7 +985,33 @@ function drawSignatureManifestation(
   });
 }
 
-function buildAuditLines(input: {
+type CertificateParagraph = {
+  lines: WrappedLine[];
+  gapAfter?: number;
+  gapBefore?: number;
+};
+
+type CertificateEventRow = {
+  actor: string;
+  details: string[];
+  event: string;
+  timestamp: string;
+};
+
+type CertificateSignerCard = {
+  details: string[];
+  label: string;
+};
+
+type AuditCertificateContent = {
+  afterSigners: CertificateParagraph[];
+  events: CertificateEventRow[];
+  introduction: CertificateParagraph[];
+  signerCards: CertificateSignerCard[];
+  trailer: CertificateParagraph[];
+};
+
+function buildAuditCertificateContent(input: {
   auditEvents: AuditEventRecord[];
   auditFingerprint?: string | null;
   completedAt: number;
@@ -984,12 +1025,17 @@ function buildAuditLines(input: {
   redactForRecipients?: boolean;
   signedPdfSha256?: string | null;
   signers: SignerRecord[];
+  verificationUrl?: string;
 }) {
   const titleFontSize = 18;
   const sectionFontSize = 11;
   const bodyFontSize = 9.25;
-  const lines: Array<WrappedLine & { gapAfter?: number; gapBefore?: number }> =
-    [];
+  const introduction: CertificateParagraph[] = [];
+  const afterSigners: CertificateParagraph[] = [];
+  const trailer: CertificateParagraph[] = [];
+  const events: CertificateEventRow[] = [];
+  const signerCards: CertificateSignerCard[] = [];
+  let destination = introduction;
 
   const pushParagraph = (
     text: string,
@@ -1003,12 +1049,10 @@ function buildAuditLines(input: {
       return;
     }
 
-    wrapped.forEach((line, index) => {
-      lines.push({
-        ...line,
-        gapAfter: index === wrapped.length - 1 ? options.gapAfter : undefined,
-        gapBefore: index === 0 ? options.gapBefore : undefined,
-      });
+    destination.push({
+      lines: wrapped,
+      gapAfter: options.gapAfter,
+      gapBefore: options.gapBefore,
     });
   };
 
@@ -1103,17 +1147,17 @@ function buildAuditLines(input: {
       ? `${step}. ${signer.name} | ${actionLabel}`
       : `${step}. ${signer.name} <${signer.email}> | ${actionLabel}`;
 
-    pushParagraph(signerLabel, input.fonts.regular, bodyFontSize);
-
-    for (const detail of describeSignerEvidence(
-      signer,
-      input.auditEvents,
-      Boolean(input.redactForRecipients),
-    )) {
-      pushParagraph(`   ${detail}`, input.fonts.regular, bodyFontSize);
-    }
+    signerCards.push({
+      details: describeSignerEvidence(
+        signer,
+        input.auditEvents,
+        Boolean(input.redactForRecipients),
+      ),
+      label: signerLabel,
+    });
   }
 
+  destination = afterSigners;
   if (input.copyRecipients && input.copyRecipients.length > 0) {
     pushParagraph("Copy recipients", input.fonts.bold, sectionFontSize, {
       gapAfter: 4,
@@ -1136,38 +1180,44 @@ function buildAuditLines(input: {
     }
   }
 
-  pushParagraph("Audit events", input.fonts.bold, sectionFontSize, {
-    gapAfter: 4,
-    gapBefore: 10,
-  });
-
   for (const event of auditEvents) {
     const actorLabel = describeAuditActor(event);
     const eventLabel =
       event.event === "signer_corrected" ? "Signer corrected" : event.event;
 
+    events.push({
+      actor: actorLabel,
+      details: describeEventEvidence(event),
+      event: eventLabel,
+      timestamp: formatAuditTimestamp(event.createdAt),
+    });
+  }
+
+  if (!input.verificationUrl) {
+    destination = trailer;
     pushParagraph(
-      `${formatAuditTimestamp(event.createdAt)} | ${eventLabel} | ${actorLabel}`,
+      "How to check this record",
+      input.fonts.bold,
+      sectionFontSize,
+      {
+        gapAfter: 4,
+        gapBefore: 10,
+      },
+    );
+    pushParagraph(
+      "The signed document and this certificate are each sealed with a digital signature. A PDF reader shows the seal as valid only if the file has not changed since it was sealed. The SHA-256 values above can also be checked on this site's Verify page.",
       input.fonts.regular,
       bodyFontSize,
     );
-
-    for (const detail of describeEventEvidence(event)) {
-      pushParagraph(`   ${detail}`, input.fonts.regular, bodyFontSize);
-    }
   }
 
-  pushParagraph("How to check this record", input.fonts.bold, sectionFontSize, {
-    gapAfter: 4,
-    gapBefore: 10,
-  });
-  pushParagraph(
-    "The signed document and this certificate are each sealed with a digital signature. A PDF reader shows the seal as valid only if the file has not changed since it was sealed. The SHA-256 values above can also be checked on this site's Verify page.",
-    input.fonts.regular,
-    bodyFontSize,
-  );
-
-  return lines;
+  return {
+    afterSigners,
+    events,
+    introduction,
+    signerCards,
+    trailer,
+  } satisfies AuditCertificateContent;
 }
 
 const AUTHENTICATION_LABELS: Record<string, string> = {
@@ -1497,9 +1547,11 @@ function getSignerCertificateActionLabel(
   }
 }
 
-function appendAuditTrailPages(input: {
+async function appendAuditTrailPages(input: {
   auditEvents: AuditEventRecord[];
   auditFingerprint?: string | null;
+  branding?: Branding;
+  brandLogo?: BrandLogo | null;
   completedAt: number;
   copyRecipients?: readonly CertificateCopyRecipient[];
   envelope: EnvelopeRecord;
@@ -1511,20 +1563,14 @@ function appendAuditTrailPages(input: {
   redactForRecipients?: boolean;
   signedPdfSha256?: string | null;
   signers: SignerRecord[];
+  verificationUrl?: string;
 }) {
-  const templatePage = input.pdfDocument.getPageCount()
-    ? input.pdfDocument.getPage(0)
-    : null;
-  const pageSize = templatePage
-    ? {
-        height: templatePage.getHeight(),
-        width: templatePage.getWidth(),
-      }
-    : DEFAULT_AUDIT_PAGE_SIZE;
+  // Certificate pages use a consistent letter-sized canvas, even when the
+  // source document is a narrow receipt or another small page format.
+  const pageSize = DEFAULT_AUDIT_PAGE_SIZE;
   const margin = 48;
   const maxWidth = pageSize.width - margin * 2;
-  const lineHeightMultiplier = 1.24;
-  const lines = buildAuditLines({
+  const content = buildAuditCertificateContent({
     auditEvents: input.auditEvents,
     auditFingerprint: input.auditFingerprint,
     completedAt: input.completedAt,
@@ -1535,31 +1581,474 @@ function appendAuditTrailPages(input: {
     redactForRecipients: input.redactForRecipients,
     signedPdfSha256: input.signedPdfSha256,
     signers: input.signers,
+    verificationUrl: input.verificationUrl,
   });
+  const brandingName = input.branding?.hosted
+    ? input.branding.productName
+    : (input.branding?.organizationName ?? input.branding?.productName);
+  const palette = buildBrandPalette(
+    input.branding?.hosted
+      ? DEFAULT_BRAND_COLOR
+      : (input.branding?.brandColor ?? DEFAULT_BRAND_COLOR),
+  );
+  const accent = palette?.accent ?? DEFAULT_BRAND_COLOR;
+  const [red, green, blue] = accent
+    .match(/[0-9a-f]{2}/gi)!
+    .map((part) => Number.parseInt(part, 16) / 255);
+  const logoType = input.brandLogo
+    ? sniffLogoContentType(input.brandLogo.bytes)
+    : null;
+  const logoImage =
+    input.brandLogo && logoType === "image/png"
+      ? await input.pdfDocument.embedPng(input.brandLogo.bytes)
+      : input.brandLogo && logoType === "image/jpeg"
+        ? await input.pdfDocument.embedJpg(input.brandLogo.bytes)
+        : null;
+  const qr = input.verificationUrl
+    ? encodeQr(input.verificationUrl, { border: 2, ecc: "M" })
+    : null;
+  const qrImage = qr
+    ? await input.pdfDocument.embedPng(qrMatrixPng(qr.data, qr.size))
+    : null;
+  const verificationPanelHeight = qrImage ? 132 : 0;
+  const lineHeightMultiplier = 1.28;
+  const bodyColor = rgb(0.14, 0.15, 0.19);
+  const mutedColor = rgb(0.38, 0.4, 0.45);
+  const rowTint = rgb(0.96, 0.97, 0.99);
+  const regular = input.fonts.regular;
+  let page!: PDFPage;
+  let cursorY = 0;
+  let isFirstPage = true;
+  let eventTableStarted = false;
+  const tableHeaderHeight = 21;
+  const columnWidths = [maxWidth * 0.25, maxWidth * 0.22, maxWidth * 0.53];
 
-  let page = input.pdfDocument.addPage([pageSize.width, pageSize.height]);
-  let cursorY = pageSize.height - margin;
+  function drawBrandHeader(target: PDFPage, first: boolean) {
+    target.drawRectangle({
+      color: rgb(red, green, blue),
+      height: 6,
+      width: pageSize.width,
+      x: 0,
+      y: pageSize.height - 6,
+    });
+    if (brandingName && !logoImage) {
+      input.fonts.bold.drawText(target, brandingName, {
+        color: rgb(red, green, blue),
+        size: Math.min(
+          9,
+          ((pageSize.width - margin * 2) /
+            Math.max(1, input.fonts.bold.widthOfTextAtSize(brandingName, 9))) *
+            9,
+        ),
+        x: margin,
+        y: pageSize.height - 30,
+      });
+    }
+    if (first && logoImage) {
+      const scale = Math.min(180 / logoImage.width, 40 / logoImage.height);
+      target.drawImage(logoImage, {
+        x: margin,
+        y: pageSize.height - 84,
+        width: logoImage.width * scale,
+        height: logoImage.height * scale,
+      });
+    }
+  }
 
-  for (const line of lines) {
-    cursorY -= line.gapBefore ?? 0;
+  function drawEventTableHeader() {
+    const labels = ["Time", "Event", "Actor"];
+    const y = cursorY - tableHeaderHeight;
+    page.drawRectangle({
+      color: rgb(red, green, blue),
+      height: tableHeaderHeight,
+      width: maxWidth,
+      x: margin,
+      y,
+    });
+    let x = margin;
+    labels.forEach((label, index) => {
+      input.fonts.bold.drawText(page, label, {
+        color: rgb(1, 1, 1),
+        size: 8,
+        x: x + 6,
+        y: y + 7,
+      });
+      x += columnWidths[index]!;
+    });
+    cursorY = y - 5;
+  }
 
-    const lineHeight = line.size * lineHeightMultiplier;
+  function addPage() {
+    page = input.pdfDocument.addPage([pageSize.width, pageSize.height]);
+    drawBrandHeader(page, isFirstPage);
+    cursorY = pageSize.height - margin - 36;
+    isFirstPage = false;
+    if (eventTableStarted) drawEventTableHeader();
+  }
 
-    if (cursorY - lineHeight < margin) {
-      page = input.pdfDocument.addPage([pageSize.width, pageSize.height]);
-      cursorY = pageSize.height - margin;
+  function ensureSpace(height: number, reserved = 0) {
+    if (cursorY - height < margin + reserved) {
+      addPage();
+    }
+  }
+
+  function drawParagraphs(paragraphs: readonly CertificateParagraph[]) {
+    for (const paragraph of paragraphs) {
+      cursorY -= paragraph.gapBefore ?? 0;
+      for (const line of paragraph.lines) {
+        const lineHeight = line.size * lineHeightMultiplier;
+        ensureSpace(lineHeight);
+        line.font.drawText(page, line.text, {
+          color: bodyColor,
+          size: line.size,
+          x: margin,
+          y: cursorY - line.size,
+        });
+        cursorY -= lineHeight;
+      }
+      cursorY -= paragraph.gapAfter ?? 0;
+    }
+  }
+
+  function drawSignerCards(cards: readonly CertificateSignerCard[]) {
+    if (cards.length === 0) return;
+
+    const gap = 12;
+    const cardWidth = (maxWidth - gap) / 2;
+    const padding = 10;
+    const cardFontSize = 8.5;
+    const detailFontSize = 7.7;
+    const cardLineHeight = 10;
+    const rows = Array.from(
+      { length: Math.ceil(cards.length / 2) },
+      (_, index) => cards.slice(index * 2, index * 2 + 2),
+    );
+
+    for (const row of rows) {
+      const prepared = row.map((card) => ({
+        card,
+        details: card.details.flatMap((detail) =>
+          wrapCell(detail, detailFontSize, cardWidth - padding * 2 - 8).map(
+            (line) => line.text,
+          ),
+        ),
+        label: wrapCell(card.label, cardFontSize, cardWidth - padding * 2 - 8),
+      }));
+      const contentLines = Math.max(
+        ...prepared.map((item) => item.label.length + item.details.length),
+      );
+      const cardHeight = Math.max(
+        54,
+        padding * 2 + contentLines * cardLineHeight + 4,
+      );
+      ensureSpace(cardHeight + 8);
+
+      prepared.forEach((item, index) => {
+        const x = margin + index * (cardWidth + gap);
+        const top = cursorY;
+        const bottom = top - cardHeight;
+        page.drawRectangle({
+          color: index % 2 === 0 ? rowTint : rgb(0.985, 0.987, 0.992),
+          borderColor: rgb(0.87, 0.89, 0.93),
+          borderWidth: 0.7,
+          height: cardHeight,
+          width: cardWidth,
+          x,
+          y: bottom,
+        });
+        page.drawRectangle({
+          color: rgb(red, green, blue),
+          height: cardHeight,
+          width: 3,
+          x,
+          y: bottom,
+        });
+
+        let textY = top - padding - cardFontSize;
+        for (const line of item.label) {
+          input.fonts.bold.drawText(page, line.text, {
+            color: bodyColor,
+            size: cardFontSize,
+            x: x + padding + 3,
+            y: textY,
+          });
+          textY -= cardLineHeight;
+        }
+        for (const line of item.details) {
+          regular.drawText(page, line, {
+            color: mutedColor,
+            size: detailFontSize,
+            x: x + padding + 3,
+            y: textY,
+          });
+          textY -= cardLineHeight;
+        }
+      });
+      cursorY -= cardHeight + 8;
+    }
+  }
+
+  function wrapCell(text: string, size: number, width: number) {
+    return wrapText(regular, size, width, text);
+  }
+
+  function drawEvent(event: CertificateEventRow, index: number, last: boolean) {
+    const fontSize = 7.6;
+    const cellPadding = 6;
+    const lineHeight = 10;
+    const cells = [event.timestamp, event.event, event.actor].map(
+      (value, column) =>
+        wrapCell(value, fontSize, columnWidths[column]! - cellPadding * 2),
+    );
+    const rowLineCount = Math.max(1, ...cells.map((cell) => cell.length));
+    const rowHeight = Math.max(22, rowLineCount * lineHeight + cellPadding * 2);
+    const detailLines = event.details.flatMap((detail) =>
+      wrapCell(`• ${detail}`, 7.5, maxWidth - 18).map((line) => line.text),
+    );
+    const detailHeight = detailLines.length * 10;
+    const reserve = last ? verificationPanelHeight + 8 : 0;
+    if (cursorY - rowHeight - detailHeight < margin + reserve) {
+      addPage();
     }
 
-    line.font.drawText(page, line.text, {
-      color: rgb(0.14, 0.14, 0.14),
-      size: line.size,
+    const rowTop = cursorY;
+    const rowBottom = rowTop - rowHeight;
+    page.drawRectangle({
+      color: index % 2 === 0 ? rowTint : rgb(1, 1, 1),
+      height: rowHeight,
+      width: maxWidth,
       x: margin,
-      y: cursorY - line.size,
+      y: rowBottom,
+    });
+    page.drawLine({
+      color: rgb(0.88, 0.89, 0.92),
+      end: { x: margin + maxWidth, y: rowBottom },
+      start: { x: margin, y: rowBottom },
+      thickness: 0.6,
     });
 
-    cursorY -= lineHeight;
-    cursorY -= line.gapAfter ?? 0;
+    let x = margin;
+    cells.forEach((lines, column) => {
+      lines.forEach((line, lineIndex) => {
+        regular.drawText(page, line.text, {
+          color: column === 0 ? mutedColor : bodyColor,
+          size: fontSize,
+          x: x + cellPadding,
+          y: rowTop - cellPadding - fontSize - lineIndex * lineHeight,
+        });
+      });
+      x += columnWidths[column]!;
+    });
+    cursorY = rowBottom - 2;
+
+    for (
+      let detailIndex = 0;
+      detailIndex < detailLines.length;
+      detailIndex += 1
+    ) {
+      const isLastDetail = detailIndex === detailLines.length - 1;
+      const detailReserve =
+        last && isLastDetail ? verificationPanelHeight + 8 : 0;
+      const previousPage = page;
+      ensureSpace(20, detailReserve);
+      if (page !== previousPage) {
+        const continuation = wrapCell(
+          `${event.timestamp} | ${event.event} (continued)`,
+          7.5,
+          maxWidth - 18,
+        );
+        for (const line of continuation) {
+          regular.drawText(page, line.text, {
+            color: mutedColor,
+            size: 7.5,
+            x: margin + 8,
+            y: cursorY - 7.5,
+          });
+          cursorY -= 10;
+        }
+      }
+      regular.drawText(page, detailLines[detailIndex]!, {
+        color: mutedColor,
+        size: 7.5,
+        x: margin + 12,
+        y: cursorY - 7.5,
+      });
+      cursorY -= 10;
+    }
+    cursorY -= 2;
   }
+
+  function addUriLinkAnnotation(
+    target: PDFPage,
+    url: string,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ) {
+    const context = input.pdfDocument.context;
+    const annotation = context.obj({
+      Type: "Annot",
+      Subtype: "Link",
+      Rect: [x, y, x + width, y + height],
+      Border: [0, 0, 0],
+      A: { S: "URI", URI: PDFString.of(url) },
+    });
+    target.node.addAnnot(context.register(annotation));
+  }
+
+  function drawVerificationPanel() {
+    if (!input.verificationUrl || !qrImage) return;
+    const panelHeight = verificationPanelHeight;
+    const panelY = Math.max(margin, cursorY - panelHeight - 8);
+    page.drawRectangle({
+      color: rgb(0.96, 0.97, 0.99),
+      borderColor: rgb(0.87, 0.89, 0.93),
+      borderWidth: 0.8,
+      height: panelHeight,
+      width: maxWidth,
+      x: margin,
+      y: panelY,
+    });
+    const qrSize = 96;
+    page.drawImage(qrImage, {
+      x: margin + 12,
+      y: panelY + (panelHeight - qrSize) / 2,
+      width: qrSize,
+      height: qrSize,
+    });
+
+    const textX = margin + 122;
+    const textWidth = maxWidth - 134;
+    let textY = panelY + panelHeight - 22;
+    input.fonts.bold.drawText(page, "Verify this record", {
+      color: rgb(red, green, blue),
+      size: 10,
+      x: textX,
+      y: textY,
+    });
+    textY -= 14;
+    for (const line of wrapText(
+      regular,
+      8,
+      textWidth,
+      "Scan the QR code or open the link to view the public completion record and check the PDF fingerprint.",
+    )) {
+      regular.drawText(page, line.text, {
+        color: bodyColor,
+        size: 8,
+        x: textX,
+        y: textY,
+      });
+      textY -= 10;
+    }
+    textY -= 4;
+    const urlLines = wrapText(regular, 8, textWidth, input.verificationUrl);
+    const linkTop = textY + 9;
+    for (const line of urlLines) {
+      regular.drawText(page, line.text, {
+        color: rgb(red, green, blue),
+        size: 8,
+        x: textX,
+        y: textY,
+      });
+      page.drawLine({
+        color: rgb(red, green, blue),
+        end: {
+          x: textX + regular.widthOfTextAtSize(line.text, 8),
+          y: textY - 1,
+        },
+        start: { x: textX, y: textY - 1 },
+        thickness: 0.4,
+      });
+      textY -= 10;
+    }
+    const linkBottom = textY + 2;
+    addUriLinkAnnotation(
+      page,
+      input.verificationUrl,
+      textX,
+      linkBottom,
+      textWidth,
+      linkTop - linkBottom,
+    );
+    cursorY = panelY - 12;
+  }
+
+  addPage();
+  drawParagraphs(content.introduction);
+  drawSignerCards(content.signerCards);
+  drawParagraphs(content.afterSigners);
+  ensureSpace(16 + tableHeaderHeight + 22);
+  input.fonts.bold.drawText(page, "Audit events", {
+    color: bodyColor,
+    size: 11,
+    x: margin,
+    y: cursorY - 11,
+  });
+  cursorY -= 16;
+  eventTableStarted = true;
+  drawEventTableHeader();
+  content.events.forEach((event, index) =>
+    drawEvent(event, index, index === content.events.length - 1),
+  );
+  eventTableStarted = false;
+  drawParagraphs(content.trailer);
+  drawVerificationPanel();
+}
+
+function qrMatrixPng(matrix: boolean[][], size: number): Uint8Array {
+  const scale = 4;
+  const width = size * scale;
+  const stride = width * 3 + 1;
+  const pixels = Buffer.alloc(stride * width, 255);
+  for (let y = 0; y < width; y += 1) {
+    const row = y * stride;
+    pixels[row] = 0;
+    for (let x = 0; x < width; x += 1) {
+      if (matrix[Math.floor(y / scale)]?.[Math.floor(x / scale)]) {
+        const pixel = row + 1 + x * 3;
+        pixels[pixel] = 0;
+        pixels[pixel + 1] = 0;
+        pixels[pixel + 2] = 0;
+      }
+    }
+  }
+
+  function crc32(bytes: Uint8Array) {
+    let crc = 0xffffffff;
+    for (const byte of bytes) {
+      crc ^= byte;
+      for (let bit = 0; bit < 8; bit += 1) {
+        crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0);
+      }
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+  }
+
+  function chunk(type: string, data: Uint8Array) {
+    const name = Buffer.from(type, "ascii");
+    const body = Buffer.from(data);
+    const result = Buffer.alloc(12 + body.length);
+    result.writeUInt32BE(body.length, 0);
+    name.copy(result, 4);
+    body.copy(result, 8);
+    result.writeUInt32BE(crc32(Buffer.concat([name, body])), 8 + body.length);
+    return result;
+  }
+
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(width, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const png = Buffer.concat([
+    Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
+    chunk("IHDR", header),
+    chunk("IDAT", deflateSync(pixels)),
+    chunk("IEND", Buffer.alloc(0)),
+  ]);
+  return new Uint8Array(png);
 }
 
 /** Someone sent a copy of the finished document who did not sign it. */
@@ -1569,7 +2058,10 @@ type CertificateInput = {
   auditEvents: AuditEventRecord[];
   copyRecipients?: readonly CertificateCopyRecipient[];
   envelope: EnvelopeRecord;
+  branding?: Branding;
+  brandLogo?: BrandLogo | null;
   redactForRecipients?: boolean;
+  verificationUrl?: string;
   /** The finished signed PDF's SHA-256, printed when there is one. */
   signedPdfSha256?: string | null;
   signers: SignerRecord[];
@@ -1651,6 +2143,10 @@ export async function renderEnvelopeCertificatePdf(
       input.signers,
       input.auditEvents,
       input.copyRecipients ?? [],
+      input.branding?.organizationName ??
+        input.branding?.productName ??
+        "SignuDoc",
+      input.verificationUrl ?? "",
     ],
     { bold: true, certificate: true },
   );
@@ -1659,13 +2155,15 @@ export async function renderEnvelopeCertificatePdf(
     Math.floor(Date.now() / 1000),
   );
 
-  appendAuditTrailPages({
+  await appendAuditTrailPages({
     auditEvents: input.redactForRecipients
       ? input.auditEvents.map(redactAuditEventForRecipients)
       : input.auditEvents,
     auditFingerprint: computeAuditFingerprint(
       stripCompletedAuditEvents(input.auditEvents),
     ),
+    branding: input.branding,
+    brandLogo: input.brandLogo,
     completedAt: terminalTimestamp,
     copyRecipients: input.copyRecipients,
     envelope: input.envelope,
@@ -1674,6 +2172,7 @@ export async function renderEnvelopeCertificatePdf(
     redactForRecipients: input.redactForRecipients,
     signedPdfSha256: input.signedPdfSha256,
     signers: input.signers,
+    verificationUrl: input.verificationUrl,
   });
   pdfDocument.setTitle(`Audit certificate: ${input.envelope.title}`);
   pdfDocument.setProducer("SignuDoc");
@@ -1698,6 +2197,9 @@ export async function renderFinalizedEnvelopePdf(
     envelope: EnvelopeRecord;
     fields: FieldRecord[];
     includeAuditTrail?: boolean;
+    branding?: Branding;
+    brandLogo?: BrandLogo | null;
+    verificationUrl?: string;
     /** The envelope's stored page sizes, which fields were placed against. */
     pages: readonly StoredPageSize[];
     signers: SignerRecord[];
@@ -1749,6 +2251,10 @@ export async function renderFinalizedEnvelopePdf(
             input.signers,
             input.auditEvents,
             input.copyRecipients ?? [],
+            input.branding?.organizationName ??
+              input.branding?.productName ??
+              "SignuDoc",
+            input.verificationUrl ?? "",
           ]
         : [],
     ],
@@ -1813,14 +2319,20 @@ export async function renderFinalizedEnvelopePdf(
   }
 
   if (input.includeAuditTrail) {
-    appendAuditTrailPages({
-      auditEvents: stripCompletedAuditEvents(input.auditEvents),
+    await appendAuditTrailPages({
+      auditEvents: stripCompletedAuditEvents(input.auditEvents).map(
+        redactAuditEventForRecipients,
+      ),
       completedAt: input.completedAt,
+      branding: input.branding,
+      brandLogo: input.brandLogo,
       copyRecipients: input.copyRecipients,
       envelope: input.envelope,
       fonts: faces,
       pdfDocument,
+      redactForRecipients: true,
       signers: input.signers,
+      verificationUrl: input.verificationUrl,
     });
   }
 
@@ -1833,6 +2345,7 @@ export async function finalizeEnvelope(
     copyRecipients?: readonly CertificateCopyRecipient[];
     envelope: EnvelopeRecord;
     fields: FieldRecord[];
+    publicVerificationToken?: string;
     pages: readonly StoredPageSize[];
     signers: SignerRecord[];
     sourcePdf: StorageObjectRef;
@@ -1844,6 +2357,8 @@ export async function finalizeEnvelope(
     env,
     signal,
     signedRevision,
+    branding,
+    brandLogo,
     storageService = createStorageService(),
   }: SealOption & {
     /**
@@ -1851,6 +2366,8 @@ export async function finalizeEnvelope(
      * certificates: it is the signed document, and gets validation data.
      */
     generatedAt?: number;
+    branding?: Branding;
+    brandLogo?: BrandLogo | null;
     keys?: ReturnType<typeof buildFinalizationAttemptKeys>;
     env?: EnvSource;
     signal?: AbortSignal;
@@ -1862,6 +2379,18 @@ export async function finalizeEnvelope(
     envelopeId: input.envelope.id,
     userId: input.envelope.userId,
   };
+  const completedEnvelope = {
+    ...input.envelope,
+    completedAt: generatedAt,
+    status: "completed" as const,
+    updatedAt: generatedAt,
+    publicVerificationTokenHash: input.publicVerificationToken
+      ? hashPublicVerificationToken(input.publicVerificationToken)
+      : null,
+  };
+  const verificationUrl = input.publicVerificationToken
+    ? buildPublicVerificationUrl(input.publicVerificationToken, env)
+    : undefined;
   const signedPdfBytes = signedRevision
     ? await finishSignerSignedPdf(signedRevision, { env, signal })
     : await renderFinalizedEnvelopePdf(
@@ -1869,11 +2398,15 @@ export async function finalizeEnvelope(
           auditEvents: input.auditEvents,
           completedAt: generatedAt,
           copyRecipients: input.copyRecipients,
-          envelope: input.envelope,
+          envelope: completedEnvelope,
           fields: input.fields,
+          includeAuditTrail: Boolean(verificationUrl),
+          branding,
+          brandLogo,
           pages: input.pages,
           signers: input.signers,
           sourcePdfKey: input.sourcePdf.key,
+          verificationUrl,
         },
         {
           seal,
@@ -1881,12 +2414,6 @@ export async function finalizeEnvelope(
         },
       );
   const signedPdfSha256 = sha256Hex(signedPdfBytes);
-  const completedEnvelope = {
-    ...input.envelope,
-    completedAt: generatedAt,
-    status: "completed" as const,
-    updatedAt: generatedAt,
-  };
   let signedPdf: StoredSealedPdf | null = null;
   let certificate: StoredSealedPdf | null = null;
   let recipientCertificate: StoredSealedPdf | null = null;
@@ -1916,6 +2443,9 @@ export async function finalizeEnvelope(
         },
         copyRecipients: input.copyRecipients,
         envelope: completedEnvelope,
+        branding,
+        brandLogo,
+        verificationUrl,
         signedPdfSha256,
         signers: input.signers,
       },
@@ -1938,6 +2468,9 @@ export async function finalizeEnvelope(
         },
         copyRecipients: input.copyRecipients,
         envelope: completedEnvelope,
+        branding,
+        brandLogo,
+        verificationUrl,
         signedPdfSha256,
         signers: input.signers,
       },

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { PDFDocument } from "pdf-lib";
+import { PDFDict, PDFDocument, PDFName } from "pdf-lib";
 
 import type { AuditEventRecord, EnvelopeRecord } from "../schemas/envelope.ts";
 import type { FieldRecord } from "../schemas/field.ts";
 import type { SignerRecord } from "../schemas/signer.ts";
+import type { Branding } from "../branding.ts";
 import {
   computeAuditFingerprint,
   describeAuditActor,
@@ -48,6 +49,92 @@ async function extractText(pdfBytes: Uint8Array): Promise<string> {
 
   return parts.join("\n");
 }
+
+async function extractPageText(pdfBytes: Uint8Array, pageNumber: number) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const page = await document.getPage(pageNumber);
+  const content = await page.getTextContent();
+  const text = content.items
+    .map((item: { str?: string }) => item.str ?? "")
+    .join(" ");
+
+  await document.destroy();
+
+  return text;
+}
+
+async function getPdfAnnotations(pdfBytes: Uint8Array) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const annotations = [];
+
+  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+    const page = await document.getPage(pageNumber);
+    annotations.push({
+      pageNumber,
+      items: (await page.getAnnotations()) as Array<{ url?: string }>,
+    });
+  }
+
+  await document.destroy();
+
+  return annotations;
+}
+
+async function getFirstPageTextItems(pdfBytes: Uint8Array) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const page = await document.getPage(1);
+  const content = await page.getTextContent();
+  const items = (
+    content.items as Array<{
+      str?: string;
+      transform?: number[];
+      width?: number;
+    }>
+  )
+    .filter((item) => item.str && item.transform)
+    .map((item) => ({
+      left: item.transform![4]!,
+      text: item.str!,
+      y: item.transform![5]!,
+    }));
+
+  await document.destroy();
+
+  return items;
+}
+
+const REYEM_BRANDING: Branding = {
+  brandColor: "#00875a",
+  contactUrl: null,
+  hosted: false,
+  logoUrl: "/api/brand/logo",
+  organizationName: "Reyem Tech",
+  privacyUrl: null,
+  productName: "Reyem Tech",
+  signupAvailable: false,
+  supportAddress: null,
+  termsUrl: null,
+};
+
+const ONE_PIXEL_LOGO = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64",
+);
 
 async function makeFixture() {
   const sourceDocument = await PDFDocument.create();
@@ -227,6 +314,197 @@ test("the certificate prints names, titles and browser strings as they are", asy
   const reloaded = await PDFDocument.load(pdfBytes);
 
   assert.ok(reloaded.getTitle()?.includes("業務委託契約書"));
+});
+
+test("signer evidence is laid out in two-column cards", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const items = await getFirstPageTextItems(pdfBytes);
+  const firstSigner = items.find((item) => item.text.includes(SIGNER_NAME));
+  const secondSigner = items.find((item) =>
+    item.text.includes(SECOND_SIGNER_NAME),
+  );
+
+  assert.ok(firstSigner, "the first signer's card is on the certificate");
+  assert.ok(secondSigner, "the second signer's card is on the certificate");
+  assert.ok(
+    Math.abs(firstSigner.left - secondSigner.left) > 200,
+    "the two signer cards occupy separate columns",
+  );
+});
+
+test("the brand header shows the logo instead of repeating the company name", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      branding: REYEM_BRANDING,
+      brandLogo: {
+        bytes: ONE_PIXEL_LOGO,
+        contentType: "image/png",
+        version: "logo-v1",
+      },
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const text = (await extractText(pdfBytes)).replace(/\s+/g, " ");
+  const pdf = await PDFDocument.load(pdfBytes);
+  const items = await getFirstPageTextItems(pdfBytes);
+  const title = items.find((item) =>
+    item.text.includes("Certificate of Completion"),
+  );
+  const imageObjects = pdf
+    .getPage(0)
+    .node.Resources()!
+    .lookup(PDFName.of("XObject"), PDFDict)
+    .keys();
+
+  assert.ok(!text.includes("Reyem Tech"), text);
+  assert.ok(title, "the certificate title is printed on the first page");
+  assert.ok(title.y > 630, "the title sits close beneath the logo");
+  assert.ok(
+    imageObjects.length >= 1,
+    "the configured logo is embedded as a page image",
+  );
+});
+
+test("the company name appears in the certificate header when there is no logo", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      branding: REYEM_BRANDING,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const text = (await extractText(pdfBytes)).replace(/\s+/g, " ");
+
+  assert.ok(text.includes("Reyem Tech"), text);
+});
+
+test("the verification link and QR share the final certificate page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl = "https://esign.reyem.tech/verify/envelope/token-123";
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      brandLogo: {
+        bytes: ONE_PIXEL_LOGO,
+        contentType: "image/png",
+        version: "logo-v1",
+      },
+      branding: REYEM_BRANDING,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+      verificationUrl,
+    },
+    { seal: saveUnsealed },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+  const finalPageImageObjects = pdf
+    .getPage(pdf.getPageCount() - 1)
+    .node.Resources()!
+    .lookup(PDFName.of("XObject"), PDFDict)
+    .keys();
+
+  assert.equal(pdf.getPageCount(), 1, "no verification-only page is added");
+  assert.ok(link, "the verification URL is a clickable PDF link");
+  assert.equal(link.pageNumber, pdf.getPageCount());
+  assert.ok(
+    finalPageImageObjects.length >= 2,
+    "the final page contains both the brand logo and QR image",
+  );
+  assert.ok((await extractText(pdfBytes)).includes(verificationUrl));
+});
+
+test("a long audit history keeps the verification panel on its last event page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl =
+    "https://esign.reyem.tech/verify/envelope/long-history";
+  const repeatedViews: AuditEventRecord[] = Array.from(
+    { length: 80 },
+    (_, index) => ({
+      ...fixture.auditEvents[0]!,
+      createdAt: fixture.auditEvents[0]!.createdAt + index + 1,
+      event: "viewed",
+      id: `event-viewed-${String(index)}`,
+    }),
+  );
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: [...fixture.auditEvents, ...repeatedViews],
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+      verificationUrl,
+    },
+    { seal: saveUnsealed },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const lastPageNumber = pdf.getPageCount();
+  const lastPageText = await extractPageText(pdfBytes, lastPageNumber);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+
+  assert.ok(lastPageNumber > 1, "the audit history spans multiple pages");
+  assert.ok(lastPageText.includes("viewed"), lastPageText);
+  assert.ok(lastPageText.includes(verificationUrl), lastPageText);
+  assert.equal(link?.pageNumber, lastPageNumber);
+});
+
+test("the signed PDF adds verification to its audit page without a QR-only page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl = "https://esign.reyem.tech/verify/envelope/token-456";
+  const pdfBytes = await renderFinalizedEnvelopePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      completedAt: fixture.envelope.completedAt!,
+      envelope: fixture.envelope,
+      fields: fixture.fields,
+      includeAuditTrail: true,
+      pages: [],
+      signers: fixture.signers,
+      sourcePdfKey: fixture.envelope.sourcePdfKey,
+      verificationUrl,
+    },
+    { seal: saveUnsealed, storageService: fixture.storageService },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+
+  assert.equal(
+    pdf.getPageCount(),
+    2,
+    "one evidence page follows the source PDF",
+  );
+  assert.ok(link, "the signed PDF carries the clickable verification link");
+  assert.equal(link.pageNumber, 2);
+  assert.ok((await extractText(pdfBytes)).includes(verificationUrl));
 });
 
 test("the certificate names the people who were sent a copy", async () => {
@@ -629,11 +907,11 @@ test("a sent row names the sender, not the first signer (issue #52)", async () =
     const text = await render(redacted);
 
     assert.ok(!text.includes(`${SIGNER_NAME} <sam@sender.example>`), text);
-    assert.match(text, /sent \| sam@sender\.example/);
-    assert.match(text, /reminded_auto \| system/);
+    assert.match(text, /sent sam@sender\.example/);
+    assert.match(text, /reminded_auto system/);
     assert.ok(
       text.includes(
-        `viewed | ${SIGNER_NAME} <${redacted ? "signer" : "lukasz@example.com"}>`,
+        `viewed ${SIGNER_NAME} <${redacted ? "signer" : "lukasz@example.com"}>`,
       ),
       text,
     );
@@ -870,10 +1148,15 @@ test("spaces inside an answer are kept as they were typed", async () => {
   );
 });
 
-// Audit rows print "time | event | actor". Returns the events in the order
-// the certificate lists them.
+// Audit table rows print the timestamp and event in separate columns. Returns
+// those event labels in the order the certificate lists them.
 function certificateEventOrder(text: string): string[] {
-  return [...text.matchAll(/UTC \| ([a-z_]+) \|/g)].map((match) => match[1]);
+  const auditEvents = text.split("Audit events").at(-1) ?? "";
+  return [
+    ...auditEvents.matchAll(
+      /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC ([a-z_]+)/g,
+    ),
+  ].map((match) => match[1]);
 }
 
 async function renderCertificateText(

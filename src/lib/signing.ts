@@ -6,10 +6,12 @@ import { randomUUID } from "node:crypto";
 import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueRecoveryJob } from "./recovery/jobs.ts";
 import { finalizationPayload } from "./recovery/finalization-payload.ts";
+import { createPublicVerificationToken } from "./public-verification.ts";
 import { sha256Hex } from "./services/pdf-seal.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
+import { readBrandLogo } from "./brand-logo.ts";
 import { removeUnclaimedEnvelopeCertificates } from "./certificate-cleanup.ts";
 import {
   type DbExecutor,
@@ -162,6 +164,7 @@ type SigningEnvelopeRow = {
   id: string;
   pageCount: number;
   part11: boolean;
+  publicVerificationTokenHash: string | null;
   revisionKey: string | null;
   revisionSha256: string | null;
   sentAt: number | null;
@@ -585,6 +588,7 @@ async function getEnvelopeRow(
           source_pdf_hash AS "sourcePdfHash",
           page_count AS "pageCount",
           part11,
+          public_verification_token_hash AS "publicVerificationTokenHash",
           signature_level AS "signatureLevel",
           signature_provider AS "signatureProvider",
           revision_key AS "revisionKey",
@@ -3229,6 +3233,7 @@ async function submitSigningOnce(
       });
     }
 
+    const publicVerification = createPublicVerificationToken();
     const completedFields = applyFieldUpdatesToRecords(
       context.fields,
       fieldUpdates,
@@ -3295,6 +3300,7 @@ async function submitSigningOnce(
         if (!sender) throw new SigningAccessError("expired");
         const payload = finalizationPayload.parse({
           version: 1,
+          publicVerificationToken: publicVerification.token,
           generatedAt: accepted.generatedAt,
           envelope: mapEnvelopeRow(envelope),
           fields: completedFields,
@@ -3369,6 +3375,10 @@ async function submitSigningOnce(
     // The seal's key and the install's name, read before the transaction:
     // sealing inside it then needs no second connection from the pool.
     const seal = await loadInstallSealer();
+    const finalizationBranding = await getBranding(undefined, database);
+    const finalizationBrandLogo = finalizationBranding.hosted
+      ? null
+      : await readBrandLogo(database);
     // Set once this submission may have stored the final files.
     let finalArtifactsStored = false;
     let finalArtifacts: Awaited<ReturnType<typeof finalizeEnvelope>>;
@@ -3426,6 +3436,7 @@ async function submitSigningOnce(
             envelope: context.envelope,
             fields: completedFields,
             pages: context.pages,
+            publicVerificationToken: publicVerification.token,
             signers: completedSigners,
             sourcePdf: {
               bucketName: sourcePdfHead.bucketName,
@@ -3434,6 +3445,8 @@ async function submitSigningOnce(
           },
           {
             seal,
+            branding: finalizationBranding,
+            brandLogo: finalizationBrandLogo,
             signedRevision: providerSignature?.revision.bytes,
             storageService,
           },
@@ -3461,7 +3474,8 @@ async function submitSigningOnce(
               updated_at = $4,
               signed_pdf_sha256 = $6,
               evidence_sha256 = $7,
-              recipient_evidence_sha256 = $8
+              recipient_evidence_sha256 = $8,
+              public_verification_token_hash = $9
             WHERE id = $5
               AND status = 'sent'
           `,
@@ -3474,6 +3488,7 @@ async function submitSigningOnce(
             artifacts.signedPdf.sha256,
             artifacts.certificate.sha256,
             artifacts.recipientCertificate.sha256,
+            publicVerification.tokenHash,
           ],
         );
 
@@ -3685,7 +3700,9 @@ async function declineSigningOnce(
   const durable = isDurableJobsEnabled();
   const emailService =
     givenEmailService ?? (durable ? undefined : createLazyEmailService());
-  const durableBranding = durable ? await getBranding() : null;
+  const certificateBranding = await getBranding(undefined, database);
+  const certificateLogo = await readBrandLogo(database);
+  const durableBranding = durable ? certificateBranding : null;
   const emailJobs: string[] = [];
   const storageService = createStorageService();
   const currentSignerId = context.signer.id;
@@ -3835,6 +3852,8 @@ async function declineSigningOnce(
         auditEvents,
         certificate: canonicalCertificate,
         envelope: declinedEnvelope,
+        branding: certificateBranding,
+        brandLogo: certificateLogo,
         signers: declinedSigners,
       },
       {
@@ -3855,6 +3874,8 @@ async function declineSigningOnce(
           }),
         },
         envelope: declinedEnvelope,
+        branding: certificateBranding,
+        brandLogo: certificateLogo,
         signers: declinedSigners,
       },
       {

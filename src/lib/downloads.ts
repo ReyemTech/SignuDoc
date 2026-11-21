@@ -20,6 +20,8 @@ import {
   issueRecipientDownloadLink,
 } from "./services/downloads.ts";
 import { hashOpaqueToken } from "./services/opaque-tokens.ts";
+import { readBrandLogo } from "./brand-logo.ts";
+import { getBranding } from "./settings.ts";
 import {
   renderEnvelopeCertificatePdf,
   renderFinalizedEnvelopePdf,
@@ -709,12 +711,18 @@ async function buildCertificateDownload(
     listSignersForEnvelope(envelope.id, database),
     listCopyRecipientsForEnvelope(envelope.id, database),
   ]);
+  const [branding, brandLogo] = await Promise.all([
+    getBranding(undefined, database),
+    readBrandLogo(database),
+  ]);
   const body = await renderEnvelopeCertificatePdf({
     auditEvents,
     // Only a finished envelope sends copies. A declined or voided one
     // never did, so its certificate does not name anyone as having one.
     copyRecipients: envelope.status === "completed" ? copyRecipients : [],
     envelope,
+    branding,
+    brandLogo,
     redactForRecipients,
     signedPdfSha256: envelope.signedPdfSha256,
     signers,

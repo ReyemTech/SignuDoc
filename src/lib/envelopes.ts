@@ -5,6 +5,7 @@ import { isDurableJobsEnabled } from "./recovery/config.ts";
 import { enqueueEmail } from "./recovery/email.ts";
 import { tryDeliverWorkflowEmails } from "./recovery/workflow-email.ts";
 import { type Branding } from "./branding.ts";
+import { readBrandLogo } from "./brand-logo.ts";
 import { removeUnclaimedEnvelopeCertificates } from "./certificate-cleanup.ts";
 import {
   type DbExecutor,
@@ -2876,7 +2877,7 @@ export async function sendDraftEnvelope(
 
   const durable = isDurableJobsEnabled();
   const emailService = durable ? null : createEmailServiceForSending();
-  const branding = durable ? await getBranding() : null;
+  const durableBranding = durable ? await getBranding() : null;
   const jobs: string[] = [];
   const storageService = createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
@@ -3114,13 +3115,13 @@ export async function sendDraftEnvelope(
         tx,
       );
 
-      if (branding && delivery !== "embedded") {
+      if (durableBranding && delivery !== "embedded") {
         for (const signer of firstSigners) {
           const signerLink = issuedLinks.get(signer.id)!;
           const { id } = await enqueueEmail(
             {
               message: buildSigningInvitationEmail({
-                branding,
+                branding: durableBranding,
                 durable: true,
                 envelopeTitle: envelope.title,
                 expiresAt,
@@ -3981,7 +3982,9 @@ async function voidSentEnvelopeOnce(
   const voidedAt = Math.floor(Date.now() / 1000);
   const durable = isDurableJobsEnabled();
   const emailService = durable ? null : createEmailService();
-  const durableBranding = durable ? await getBranding() : null;
+  const certificateBranding = await getBranding(undefined, database);
+  const certificateLogo = await readBrandLogo(database);
+  const durableBranding = durable ? certificateBranding : null;
   const jobs: string[] = [];
   const storageService = createStorageService();
   const sourcePdfHead = await storageService.headObject(envelope.sourcePdfKey);
@@ -4125,6 +4128,8 @@ async function voidSentEnvelopeOnce(
         auditEvents,
         certificate: canonicalCertificate,
         envelope: voidedEnvelope,
+        branding: certificateBranding,
+        brandLogo: certificateLogo,
         signers: voidedSigners,
       },
       {
@@ -4145,6 +4150,8 @@ async function voidSentEnvelopeOnce(
           }),
         },
         envelope: voidedEnvelope,
+        branding: certificateBranding,
+        brandLogo: certificateLogo,
         signers: voidedSigners,
       },
       {
