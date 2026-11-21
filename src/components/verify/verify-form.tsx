@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, type ChangeEvent } from "react";
+import { useState, type ChangeEvent, type DragEvent } from "react";
 
 type VerifyAnswer =
   | { match: false }
@@ -37,16 +37,30 @@ async function sha256OfFile(file: File): Promise<string> {
     .join("");
 }
 
+async function hasPdfSignature(file: File): Promise<boolean> {
+  const header = new Uint8Array(
+    await file.slice(0, 1024).arrayBuffer(),
+  );
+  const marker = [0x25, 0x50, 0x44, 0x46, 0x2d]; // %PDF-
+
+  for (let offset = 0; offset <= header.length - marker.length; offset += 1) {
+    if (marker.every((byte, index) => header[offset + index] === byte)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 export function VerifyForm() {
   const [fileName, setFileName] = useState<string | null>(null);
   const [hash, setHash] = useState<string | null>(null);
   const [answer, setAnswer] = useState<VerifyAnswer | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isChecking, setIsChecking] = useState(false);
+  const [isDragActive, setIsDragActive] = useState(false);
 
-  async function handleFile(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-
+  async function processFile(file: File | null) {
     setAnswer(null);
     setError(null);
     setHash(null);
@@ -60,6 +74,11 @@ export function VerifyForm() {
     setIsChecking(true);
 
     try {
+      if (!(await hasPdfSignature(file))) {
+        setError("Choose a PDF file to verify.");
+        return;
+      }
+
       const sha256 = await sha256OfFile(file);
 
       setHash(sha256);
@@ -85,11 +104,66 @@ export function VerifyForm() {
     }
   }
 
+  function handleFileInputChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0] ?? null;
+
+    // Allow the same file to be selected again after a failed check.
+    event.currentTarget.value = "";
+    void processFile(file);
+  }
+
+  function handleDragOver(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+
+    const isFileDrag = Array.from(event.dataTransfer.types).includes("Files");
+
+    if (!isChecking && isFileDrag) {
+      setIsDragActive(true);
+    }
+  }
+
+  function handleDragLeave(event: DragEvent<HTMLLabelElement>) {
+    const nextTarget = event.relatedTarget;
+
+    if (
+      !(nextTarget instanceof Node) ||
+      !event.currentTarget.contains(nextTarget)
+    ) {
+      setIsDragActive(false);
+    }
+  }
+
+  function handleDrop(event: DragEvent<HTMLLabelElement>) {
+    event.preventDefault();
+    setIsDragActive(false);
+
+    if (isChecking) {
+      return;
+    }
+
+    const file = event.dataTransfer.files?.[0] ?? null;
+
+    if (file) {
+      void processFile(file);
+    }
+  }
+
   return (
     <div className="space-y-6">
-      <label className="block cursor-pointer rounded-[1.25rem] border-2 border-dashed border-(--border-strong) bg-(--surface) px-6 py-8 text-center transition hover:border-(--accent) hover:bg-(--accent-softer)">
+      <label
+        className={`block cursor-pointer rounded-[1.25rem] border-2 border-dashed px-6 py-8 text-center transition ${
+          isDragActive
+            ? "border-(--accent) bg-(--accent-softer)"
+            : "border-(--border-strong) bg-(--surface) hover:border-(--accent) hover:bg-(--accent-softer)"
+        }`}
+        onDragLeave={handleDragLeave}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+      >
         <span className="block text-[0.9375rem] font-bold text-(--fg)">
-          Choose a signed PDF or audit certificate
+          {isDragActive
+            ? "Drop the PDF to verify"
+            : "Choose or drop a signed PDF or audit certificate"}
         </span>
         <span className="mt-1 block text-sm text-(--secondary)">
           The file stays on your device. Only its SHA-256 fingerprint is sent.
@@ -100,7 +174,7 @@ export function VerifyForm() {
           className="mx-auto mt-4 block max-w-full text-sm text-(--secondary) file:mr-3 file:min-h-10 file:cursor-pointer file:rounded-xl file:border-0 file:bg-(--accent) file:px-4 file:text-sm file:font-bold file:text-white hover:file:bg-(--accent-hover)"
           // One file at a time, so a verdict cannot land on the wrong one.
           disabled={isChecking}
-          onChange={handleFile}
+          onChange={handleFileInputChange}
           type="file"
         />
       </label>
