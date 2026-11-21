@@ -39,7 +39,7 @@ Each run writes a `backup_finished` line to the function logs (with the counts),
 
 A restore goes into a **new, empty** database and Blob store, never over a live install. You can then point the install at them, or deploy a new install on them.
 
-You need a computer with Node.js 24 and a copy of this repository at the same version as the install (or newer).
+You need a computer with Node.js 24 or 26 and a copy of this repository at the same version as the install (or newer).
 
 1. Make a new Neon database (a new Neon project, or a new branch with no data) and copy its connection string.
 2. Make a new private Blob store for the restored files and copy its read-write token. Or, if the install's store still exists and only the database was lost, use `--skip-files` and skip this.

@@ -227,7 +227,7 @@ There is nothing to type in Vercel and no terminal to open. Until step 5 is done
 
 ### Try it on your computer
 
-With Node.js 24 and Docker:
+With Node.js 24 or 26 and Docker:
 
 ```bash
 npm install

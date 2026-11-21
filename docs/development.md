@@ -12,7 +12,7 @@ For development, or to try it on your own machine first.
 npm install
 ```
 
-SignuDoc targets Node.js 24 and is built on Next.js 16.
+SignuDoc supports Node.js 24 and 26 and is built on Next.js 16. The repository's `.nvmrc` selects Node.js 26; CI checks both supported versions.
 
 ### 2. Create your environment file
 
