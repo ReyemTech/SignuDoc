@@ -59,13 +59,13 @@ Extend the shared email wrapper used by invitations, reminders, completion notic
 
 ### Signed PDF trail and public verification
 
-For SignuDoc-managed finalization, enable the existing audit-trail rendering path in `renderFinalizedEnvelopePdf`. Render the audit pages with organization name, logo, and brand color, and include a QR that points to a URL shaped like `${APP_URL}/verify/envelope/${token}`. Add the audit pages before `seal(pdfDocument, "signed-document")`; calculate and persist the final PDF hash only after the QR page has been added and the seal operation has completed.
+For SignuDoc-managed finalization, enable the existing audit-trail rendering path in `renderFinalizedEnvelopePdf`. Render recipient-safe audit pages with organization name, logo, and brand color, and include a QR that points to a URL shaped like `${APP_URL}/verify/envelope/${token}`. Add the audit pages before `seal(pdfDocument, "signed-document")`; calculate and persist the final PDF hash only after the QR page has been added and the seal operation has completed. Redact private network and user-agent details as the recipient certificate already does.
 
 Create a random, high-entropy public verification token for completed envelopes and store only a hash of it. The route resolves the token hash and returns a minimal public record: whether the envelope is completed, its title, completion date, signer count, and the recorded signed-PDF hash. It must not expose signer contact details or the private event stream. Unknown, deleted, or non-public records return a generic not-found result.
 
 The existing upload verifier remains the fallback: the browser hashes the uploaded PDF locally and submits only the hash. An exact match identifies a stored signed PDF or certificate. Make the page explain that this confirms an exact recorded artifact match; it is not a generic third-party certificate trust checker. A separate cryptographic PDF-signature validation feature is out of scope unless a future design explicitly adds it.
 
-For envelopes finalized from signer-provided PAdES revisions, do not rewrite the signed content to add the final audit page. Keep the current recipient/internal certificate artifacts and ensure the certificate carries the same branded verification URL and QR where it can be rendered without modifying the signer document.
+For envelopes finalized from signer-provided PAdES revisions, do not rewrite the signed content to add the final audit page. Keep the current recipient/internal certificate artifacts and ensure the certificates carry the same branded verification URL and QR where they can be rendered without modifying the signer document.
 
 ### Field repetition and group copy/paste
 
