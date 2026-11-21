@@ -34,6 +34,7 @@ type SignersShellProps = {
   envelopeId: string;
   initialState?: "error";
   record?: DraftSignerStepData;
+  sender?: { email: string; name: string };
 };
 
 type SignerField = "email" | "name";
@@ -786,6 +787,7 @@ export function SignersShell({
   envelopeId,
   initialState,
   record,
+  sender,
 }: SignersShellProps) {
   const initialModel = buildInitialModel(record);
   const [signers, setSigners] = useState(initialModel.signers);
@@ -810,6 +812,12 @@ export function SignersShell({
   const maxSigners = record?.maxSigners ?? DEFAULT_MAX_SIGNERS_PER_ENVELOPE;
   const part11Mode = record?.part11Mode ?? false;
   const canAddSigner = signers.length < maxSigners;
+  const senderAlreadyAdded = sender
+    ? signers.some(
+        (signer) =>
+          signer.email.trim().toLowerCase() === sender.email.toLowerCase(),
+      )
+    : false;
   const signingSteps = computeSigningSteps(signers, part11Mode);
   const hasSharedStep = new Set(signingSteps).size < signingSteps.length;
 
@@ -970,6 +978,23 @@ export function SignersShell({
     setSigners((currentSigners) => [
       ...currentSigners,
       createSigner(`signer-${nextSignerNumber}`),
+    ]);
+  }
+
+  function handleAddSelfAsSigner() {
+    if (!sender || !canAddSigner || isSubmitting || senderAlreadyAdded) {
+      return;
+    }
+
+    clearSubmitError();
+    const nextSignerNumber = nextSignerNumberRef.current;
+    nextSignerNumberRef.current += 1;
+    setSigners((currentSigners) => [
+      ...currentSigners,
+      createSigner(`signer-${nextSignerNumber}`, {
+        email: sender.email,
+        name: sender.name,
+      }),
     ]);
   }
 
@@ -1157,6 +1182,20 @@ export function SignersShell({
             >
               + Add another signer
             </button>
+            {sender ? (
+              <button
+                className="inline-flex min-h-11 items-center justify-center rounded-[0.875rem] border border-(--border-strong) bg-(--surface) px-4.5 text-sm font-bold text-(--fg) transition hover:bg-(--accent-soft) disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={
+                  !canAddSigner || isSubmitting || senderAlreadyAdded
+                }
+                onClick={handleAddSelfAsSigner}
+                type="button"
+              >
+                {senderAlreadyAdded
+                  ? "You are already a signer"
+                  : "Add myself as a signer"}
+              </button>
+            ) : null}
             {!canAddSigner ? (
               <p className="text-[0.8125rem] font-semibold text-(--tertiary)">
                 Maximum reached
