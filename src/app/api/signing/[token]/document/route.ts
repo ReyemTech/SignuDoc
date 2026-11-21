@@ -30,11 +30,7 @@ export async function GET(
   const { token } = await context.params;
   const rateLimitResponse = await applyPublicLinkRateLimit({
     category: "signing_document_read",
-    key: buildRateLimitKey([
-      "signing-document",
-      token,
-      getClientIpAddress(request.headers) ?? "unknown",
-    ]),
+    key: buildRateLimitKey(["signing-document", token]),
     limit: 60,
     request,
     windowMs: 5 * 60 * 1000,

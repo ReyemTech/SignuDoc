@@ -42,11 +42,7 @@ export async function POST(
   const { token } = await context.params;
   const rateLimitResponse = await applyPublicLinkRateLimit({
     category: "signing_submit",
-    key: buildRateLimitKey([
-      "signing-provider-start",
-      token,
-      getClientIpAddress(request.headers) ?? "unknown",
-    ]),
+    key: buildRateLimitKey(["signing-submit", token]),
     limit: 10,
     request,
     windowMs: 10 * 60 * 1000,

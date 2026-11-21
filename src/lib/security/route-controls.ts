@@ -63,13 +63,19 @@ const PUBLIC_LINK_WINDOW_MS = 10 * 60 * 1000;
 export async function applyPublicLinkRateLimit(
   input: RateLimitInput,
 ): Promise<NextResponse | null> {
+  const ipAddress = getClientIpAddress(input.request.headers);
+
+  if (!ipAddress) {
+    // An unknown address is not a useful shared identity: grouping every
+    // signer under one "unknown" key would let unrelated traffic exhaust
+    // the aggregate limit for the whole installation.
+    return applyRateLimit(input);
+  }
+
   return (
     (await applyRateLimit({
       category: "public_link_address",
-      key: buildRateLimitKey([
-        "public-link",
-        getClientIpAddress(input.request.headers) ?? "unknown",
-      ]),
+      key: buildRateLimitKey(["public-link", ipAddress]),
       limit: PUBLIC_LINK_REQUESTS_PER_ADDRESS,
       request: input.request,
       windowMs: PUBLIC_LINK_WINDOW_MS,

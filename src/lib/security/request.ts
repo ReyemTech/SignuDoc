@@ -1,5 +1,7 @@
 import { isIP } from "node:net";
 
+import { logSecurityEvent } from "./logging.ts";
+
 type IpEnv = Record<string, string | undefined>;
 
 function firstAddress(value: string | null): string | null {
@@ -64,6 +66,43 @@ function forwardedForAddress(value: string | null): string | null {
   return addresses[0] ?? null;
 }
 
+let warnedAboutTrustedProxyHops = false;
+
+function configuredProxyHops(env: IpEnv): number | null {
+  const raw = env.TRUSTED_PROXY_HOPS?.trim();
+
+  if (!raw) {
+    return null;
+  }
+
+  if (!/^\d+$/.test(raw) || !Number.isSafeInteger(Number(raw))) {
+    if (!warnedAboutTrustedProxyHops) {
+      warnedAboutTrustedProxyHops = true;
+      logSecurityEvent("warn", {
+        category: "client_ip_config",
+        message:
+          "TRUSTED_PROXY_HOPS is not a whole number of 0 or more; using the default client address handling.",
+        metadata: { variable: "TRUSTED_PROXY_HOPS", value: raw },
+      });
+    }
+
+    return null;
+  }
+
+  return Number(raw);
+}
+
+function addressFromRight(value: string | null, hops: number): string | null {
+  const addresses = (value ?? "")
+    .split(",")
+    .map((address) => address.trim())
+    .filter(Boolean);
+
+  return hops < addresses.length
+    ? addresses[addresses.length - 1 - hops]!
+    : null;
+}
+
 /**
  * The headers that carry the visitor's address, most trustworthy first.
  *
@@ -74,8 +113,8 @@ function forwardedForAddress(value: string | null): string | null {
  * Anywhere else those two names mean nothing special and anyone could send
  * them, so the usual proxy headers are used instead. There the app has to
  * sit behind a reverse proxy that sets them: X-Forwarded-For is read from
- * its end (see forwardedForAddress), so what a visitor puts at its start
- * does not count.
+ * its end, so what a visitor puts at its start does not count. An explicit
+ * TRUSTED_PROXY_HOPS setting selects the address before the configured hops.
  */
 export function getClientIpHeaderNames(env: IpEnv = process.env): string[] {
   return env.VERCEL === "1"
@@ -88,6 +127,13 @@ export function getClientIpAddress(
   env: IpEnv = process.env,
 ): string | null {
   const offVercel = env.VERCEL !== "1";
+  const proxyHops = offVercel ? configuredProxyHops(env) : null;
+
+  if (offVercel && proxyHops !== null) {
+    // When operators configure an exact X-Forwarded-For chain, do not fall
+    // back to alternate headers that may not have been sanitized by it.
+    return addressFromRight(headers.get("x-forwarded-for"), proxyHops);
+  }
 
   for (const name of getClientIpHeaderNames(env)) {
     const address =

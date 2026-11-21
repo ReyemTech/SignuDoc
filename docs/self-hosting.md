@@ -329,6 +329,14 @@ To close the route, set a secret. A caller then has to send `Authorization: Bear
 
 Sign-in, sign-up, password reset, the signing pages, uploads and sending are rate limited per visitor. The counts are kept in the `rate_limits` table in Postgres, so they hold across every instance of the app. On Vercel the visitor's address is read from the header Vercel sets itself, which a visitor cannot forge. If the database cannot be reached, each instance falls back to counting in its own memory.
 
+Off Vercel, `X-Forwarded-For` is read from the right, skipping private-network addresses. If your proxy chain appends addresses after the visitor address, set `TRUSTED_PROXY_HOPS` to the number of those trusted proxies, including private addresses; the app then selects the address just before them. Leave it unset to keep the default private-address filtering. Set it only when the app is reachable through that known proxy chain, and verify the address with a real request before relying on it for rate limits or audit records. If the proxy path omits the visitor address entirely, no hop count can recover it. The app must not be reachable around a proxy that is trusted to overwrite or append these headers.
+
+The route-specific PDF read and signing submission limits are shared by the signing link, regardless of the visitor's address. An additional aggregate public-link limit applies per visitor address when one is available; if the app cannot determine an address, it skips that aggregate limit instead of grouping all visitors under one `unknown` address. Other route limits remain scoped to their documented visitor or resource keys.
+
+## Password breach check
+
+In production, new passwords are checked against the Have I Been Pwned breach list using its range API: only a short hash prefix leaves the server. If the service cannot be reached, sign-up fails rather than accepting an unchecked password. `PASSWORD_BREACH_CHECK=off` disables the check for a server that cannot reach `api.pwnedpasswords.com`, but then breached passwords can be accepted.
+
 ## Bot protection
 
 The app can use [Vercel BotID](https://vercel.com/docs/botid), an invisible check that a request comes from a real browser, on the requests a script would go for: creating an account, signing in, asking for a password reset or verification email, the contact form and first-run setup.
@@ -345,7 +353,7 @@ It is opt-in for now because it has not yet been proven against a live Vercel de
 
 For production containers and the Helm chart, see [Run SignuDoc on Kubernetes](kubernetes.md).
 
-SignuDoc is a regular Next.js app and runs anywhere Node.js 24 and Postgres do:
+SignuDoc is a regular Next.js app and runs anywhere Node.js 24 or 26 and Postgres do:
 
 ```bash
 npm run db:migrate
@@ -357,10 +365,12 @@ Away from Vercel, a few things Vercel does for you are yours to set:
 
 - `DATABASE_URL`, pointing at your Postgres. Run `npm run db:migrate` on every deploy; it only applies what is new.
 - `APP_URL`, the site's public HTTPS address.
-- `BETTER_AUTH_SECRET`, at least 32 characters (`openssl rand -hex 32`). Without it a secret is derived from the database password, which must then be at least 12 characters long.
+- `BETTER_AUTH_SECRET`, at least 32 characters (`openssl rand -hex 32`). Without it a secret is derived from the database password, which must then be at least 12 characters long. A production site on a public URL logs a warning when the derived secret is used.
+- `TRUSTED_PROXY_HOPS`, when your trusted proxy chain adds addresses after the visitor address in `X-Forwarded-For`; count every proxy that appends, including private proxies. See [Rate limits](#rate-limits). Leave it unset to use private-address filtering.
 - `RESEND_API_KEY`, from your Resend account.
 - Files are kept on the machine's disk under `.data/storage` (`STORAGE_LOCAL_DIR` changes where), so that disk must survive restarts. To use a Vercel Blob store from elsewhere, set `BLOB_READ_WRITE_TOKEN`.
 - Leave `EMAIL_DRIVER` unset. The capture driver is for development only.
+- `EMAIL_CAPTURE_DIR`, only when `EMAIL_DRIVER=capture`, changes where captured email JSON files are written. The capture driver is disabled on public production deployments.
 
 Self-hosted operators are responsible for:
 
