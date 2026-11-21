@@ -6,7 +6,12 @@ import path from "node:path";
 
 import type { Resend } from "resend";
 
-import { createEmailService } from "./email.ts";
+import {
+  canSendEmail,
+  createEmailService,
+  createLazyEmailService,
+  type EmailService,
+} from "./email.ts";
 
 // What the Resend client is asked to do when the service turns a request
 // away for rate. Nothing here talks to Resend.
@@ -160,4 +165,35 @@ test("parallel capture sends reuse the same id and reject a changed payload", as
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("a lazy email service is only built when it first sends, and only once", async () => {
+  let built = 0;
+  const service = createLazyEmailService(() => {
+    built += 1;
+    return {
+      async send(message) {
+        return { accepted: [message.to], messageId: "m-1", rejected: [] };
+      },
+      async sendBatch() {
+        return [];
+      },
+    } satisfies EmailService;
+  });
+  assert.equal(built, 0);
+  await service.send(MESSAGE);
+  await service.sendBatch([MESSAGE]);
+  assert.equal(built, 1);
+});
+
+test("a lazy email service with no provider fails on send", async () => {
+  const service = createLazyEmailService(() => createEmailService({ env: {} }));
+  await assert.rejects(service.send(MESSAGE), /RESEND_API_KEY/);
+});
+
+test("signup knows when there is no email provider to send with", () => {
+  assert.equal(canSendEmail({ NODE_ENV: "production" }), false);
+  assert.equal(canSendEmail({ NODE_ENV: "production", RESEND_API_KEY: "re_test" }), true);
+  assert.equal(canSendEmail({ EMAIL_DRIVER: "capture", NODE_ENV: "development" }), true);
+  assert.equal(canSendEmail({ APP_URL: "https://sign.example.com", EMAIL_DRIVER: "capture", NODE_ENV: "production" }), false);
 });

@@ -50,6 +50,9 @@ const appEnv = {
   // a real Vercel Blob store, direct browser upload included.
   STORAGE_DRIVER: process.env.E2E_STORAGE_DRIVER ?? "local",
   STORAGE_LOCAL_DIR: path.join(e2eDataDir, "storage"),
+  // Embedded signing and the webhook receiver use local HTTP in E2E.
+  EMBED_ALLOW_HTTP_ORIGINS: "1",
+  WEBHOOK_ALLOW_PRIVATE_URLS: "1",
   DURABLE_JOBS_ENABLED: e2eRecoveryEnabled ? "true" : "false",
   CRON_SECRET: e2eRecoveryEnabled ? e2eCronSecret : "",
   AUDIT_LOG: "off",
