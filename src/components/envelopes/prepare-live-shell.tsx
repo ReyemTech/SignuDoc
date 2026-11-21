@@ -67,6 +67,10 @@ import {
 import { InteractivePlacedField } from "./interactive-placed-field";
 import { PdfPageCanvas } from "./pdf-page-canvas";
 import { getSignerPalette } from "./signer-palette";
+import {
+  pasteFieldGroup,
+  repeatFieldsOnPages,
+} from "@/lib/utils/field-duplication";
 
 type PrepareFieldType = FieldPlacement["type"];
 
@@ -323,6 +327,7 @@ function clearSelectedFieldFromViewportClick(
   event: ReactPointerEvent<HTMLElement>,
   armedTool: PrepareFieldType | null,
   setSelectedFieldId: Dispatch<SetStateAction<string | null>>,
+  setSelectedFieldIds: Dispatch<SetStateAction<string[]>>,
 ) {
   if (armedTool) {
     return;
@@ -338,6 +343,7 @@ function clearSelectedFieldFromViewportClick(
   }
 
   setSelectedFieldId(null);
+  setSelectedFieldIds([]);
 }
 
 function buildFieldRequest(fields: readonly PrepareField[]) {
@@ -448,6 +454,8 @@ function PrepareLiveShellContent({
     signers[0]?.id ?? "",
   );
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
+  const [selectedFieldIds, setSelectedFieldIds] = useState<string[]>([]);
+  const [fieldClipboard, setFieldClipboard] = useState<PrepareField[]>([]);
   const [armedTool, setArmedTool] = useState<PrepareFieldType | null>(null);
   const [fields, setFields] = useState<PrepareField[]>(initialFields);
   const [isMobileToolsOpen, setIsMobileToolsOpen] = useState(false);
@@ -495,6 +503,9 @@ function PrepareLiveShellContent({
     fields.find(
       (field) => field.id === selectedFieldId && field.page === activePage,
     ) ?? null;
+  const selectedFields = fields.filter((field) =>
+    selectedFieldIds.includes(field.id),
+  );
   const selectedSigner =
     signers.find((signer) => signer.id === selectedSignerId) ?? signers[0];
   const missingSignatureSigner = signers.find(
@@ -520,9 +531,19 @@ function PrepareLiveShellContent({
   const fieldEditorActions = selectedField
     ? {
         onAddRadioButton: () =>
-          addRadioButton(selectedField.id, setFields, setSelectedFieldId),
+          addRadioButton(
+            selectedField.id,
+            setFields,
+            setSelectedFieldId,
+            setSelectedFieldIds,
+          ),
         onDelete: () =>
-          deleteField(selectedField.id, setFields, setSelectedFieldId),
+          deleteField(
+            selectedField.id,
+            setFields,
+            setSelectedFieldId,
+            setSelectedFieldIds,
+          ),
         onSetLabel: (label: string | undefined) =>
           updateField(selectedField.id, { label }, setFields),
         onSetOptions: (options: string[]) =>
@@ -667,7 +688,7 @@ function PrepareLiveShellContent({
       }
 
       event.preventDefault();
-      deleteField(fieldId, setFields, setSelectedFieldId);
+      deleteField(fieldId, setFields, setSelectedFieldId, setSelectedFieldIds);
     }
 
     window.addEventListener("keydown", handleDeleteFieldKeydown);
@@ -678,6 +699,42 @@ function PrepareLiveShellContent({
   }, [isFieldInteracting, selectedFieldId]);
 
   useEffect(() => {
+    function handleFieldClipboard(event: KeyboardEvent) {
+      if (
+        !(event.metaKey || event.ctrlKey) ||
+        isTextEntryTarget(event.target) ||
+        event.altKey
+      ) {
+        return;
+      }
+
+      if (event.key.toLowerCase() === "c" && selectedFields.length > 0) {
+        event.preventDefault();
+        setFieldClipboard(
+          selectedFields.map((field) => ({
+            ...field,
+            options: field.options ? [...field.options] : undefined,
+          })),
+        );
+      } else if (event.key.toLowerCase() === "v" && fieldClipboard.length > 0) {
+        event.preventDefault();
+        const pasted = pasteFieldGroup(
+          fieldClipboard,
+          activePage,
+          newLocalId,
+        ) as PrepareField[];
+        setFields((current) => [...current, ...pasted]);
+        setSelectedFieldIds(pasted.map((field) => field.id));
+        setSelectedFieldId(pasted[0]?.id ?? null);
+        setSelectedSignerId(pasted[0]?.signerId ?? selectedSignerId);
+      }
+    }
+
+    window.addEventListener("keydown", handleFieldClipboard);
+    return () => window.removeEventListener("keydown", handleFieldClipboard);
+  }, [activePage, fieldClipboard, selectedFields, selectedSignerId]);
+
+  useEffect(() => {
     if (zoomLevel > DEFAULT_DOCUMENT_ZOOM_LEVEL) {
       return;
     }
@@ -685,6 +742,11 @@ function PrepareLiveShellContent({
     setIsDocumentPanning(false);
     documentPanGestureRef.current = null;
   }, [zoomLevel]);
+
+  useEffect(() => {
+    setSelectedFieldIds([]);
+    setSelectedFieldId(null);
+  }, [activePage]);
 
   // Each save replaces the whole list, so saves go one at a time, in the
   // order they were asked for. Otherwise an older autosave still on its
@@ -929,6 +991,7 @@ function PrepareLiveShellContent({
                         tool.type,
                         setArmedTool,
                         setSelectedFieldId,
+                        setSelectedFieldIds,
                         setIsMobileToolsOpen,
                       )
                     }
@@ -1034,7 +1097,72 @@ function PrepareLiveShellContent({
                 </button>
               </div>
 
-              <div className="flex justify-center lg:justify-end">
+              <div className="flex flex-wrap items-center justify-center gap-2 lg:col-span-3 lg:row-start-2 lg:justify-start">
+                <button
+                  className="btn-quiet min-h-10"
+                  disabled={selectedFields.length === 0 || pageCount < 2}
+                  onClick={() => {
+                    const targets = Array.from(
+                      { length: pageCount },
+                      (_, index) => index + 1,
+                    ).filter(
+                      (page) => !selectedFields.some((field) => field.page === page),
+                    );
+                    const copies = repeatFieldsOnPages(
+                      selectedFields,
+                      targets,
+                      newLocalId,
+                    ) as PrepareField[];
+                    if (copies.length) {
+                      setFields((current) => [...current, ...copies]);
+                    }
+                  }}
+                  type="button"
+                >
+                  Repeat on all pages
+                </button>
+                <button
+                  className="btn-quiet min-h-10"
+                  disabled={selectedFields.length === 0}
+                  onClick={() =>
+                    setFieldClipboard(
+                      selectedFields.map((field) => ({
+                        ...field,
+                        options: field.options ? [...field.options] : undefined,
+                      })),
+                    )
+                  }
+                  type="button"
+                >
+                  Copy {selectedFieldIds.length > 1 ? "fields" : "field"}
+                </button>
+                <button
+                  className="btn-quiet min-h-10"
+                  disabled={fieldClipboard.length === 0}
+                  onClick={() => {
+                    const pasted = pasteFieldGroup(
+                      fieldClipboard,
+                      activePage,
+                      newLocalId,
+                    ) as PrepareField[];
+                    setFields((current) => [...current, ...pasted]);
+                    setSelectedFieldIds(pasted.map((field) => field.id));
+                    setSelectedFieldId(pasted[0]?.id ?? null);
+                    setSelectedSignerId(pasted[0]?.signerId ?? selectedSignerId);
+                  }}
+                  type="button"
+                >
+                  Paste
+                </button>
+                <span className="sr-only" aria-live="polite">
+                  {selectedFieldIds.length} fields selected. Use Shift-click to select multiple.
+                </span>
+                <p className="w-full text-center text-xs text-(--secondary) lg:text-left">
+                  Shift-click fields to select a group.
+                </p>
+              </div>
+
+              <div className="flex justify-center lg:col-start-3 lg:row-start-1 lg:justify-end">
                 <SaveStatusIndicator
                   onRetrySave={() =>
                     void persistFields(currentFieldsRef.current)
@@ -1117,6 +1245,7 @@ function PrepareLiveShellContent({
                         event,
                         armedTool,
                         setSelectedFieldId,
+                        setSelectedFieldIds,
                       )
                     }
                     style={{
@@ -1142,6 +1271,7 @@ function PrepareLiveShellContent({
                             setArmedTool,
                             setFields,
                             setSelectedFieldId,
+                            setSelectedFieldIds,
                           )
                         }
                         type="button"
@@ -1176,7 +1306,7 @@ function PrepareLiveShellContent({
                         <InteractivePlacedField
                           coordinateScale={1}
                           field={field}
-                          isSelected={selectedField?.id === field.id}
+                          isSelected={selectedFieldIds.includes(field.id)}
                           key={field.id}
                           label={
                             field.type === "radio" && field.label
@@ -1196,10 +1326,16 @@ function PrepareLiveShellContent({
                               setFields,
                             )
                           }
-                          onSelect={() => {
+                          onSelect={(additive) => {
                             setArmedTool(null);
                             setSelectedSignerId(field.signerId);
                             setSelectedFieldId(field.id);
+                            setSelectedFieldIds((current) => {
+                              if (!additive) return [field.id];
+                              return current.includes(field.id)
+                                ? current.filter((id) => id !== field.id)
+                                : [...current, field.id];
+                            });
                           }}
                           signer={signer}
                         />
@@ -1289,6 +1425,7 @@ function PrepareLiveShellContent({
               tool,
               setArmedTool,
               setSelectedFieldId,
+              setSelectedFieldIds,
               setIsMobileToolsOpen,
             )
           }
@@ -1865,9 +2002,11 @@ function handleToolSelect(
   tool: PrepareFieldType,
   setArmedTool: Dispatch<SetStateAction<PrepareFieldType | null>>,
   setSelectedFieldId: Dispatch<SetStateAction<string | null>>,
+  setSelectedFieldIds: Dispatch<SetStateAction<string[]>>,
   setIsMobileToolsOpen: Dispatch<SetStateAction<boolean>>,
 ) {
   setSelectedFieldId(null);
+  setSelectedFieldIds([]);
   setArmedTool((currentTool) => (currentTool === tool ? null : tool));
   setIsMobileToolsOpen(false);
 }
@@ -1881,6 +2020,7 @@ function placeField(
   setArmedTool: Dispatch<SetStateAction<PrepareFieldType | null>>,
   setFields: Dispatch<SetStateAction<PrepareField[]>>,
   setSelectedFieldId: Dispatch<SetStateAction<string | null>>,
+  setSelectedFieldIds: Dispatch<SetStateAction<string[]>>,
 ) {
   const pageRect = event.currentTarget.getBoundingClientRect();
   const tool = getFieldTool(armedTool);
@@ -1918,6 +2058,7 @@ function placeField(
 
   setFields((currentFields) => [...currentFields, nextField]);
   setSelectedFieldId(nextField.id);
+  setSelectedFieldIds([nextField.id]);
   setArmedTool(null);
 }
 
@@ -1953,6 +2094,7 @@ function addRadioButton(
   fieldId: string,
   setFields: Dispatch<SetStateAction<PrepareField[]>>,
   setSelectedFieldId: Dispatch<SetStateAction<string | null>>,
+  setSelectedFieldIds: Dispatch<SetStateAction<string[]>>,
 ) {
   const nextId = newLocalId();
 
@@ -1989,6 +2131,7 @@ function addRadioButton(
     ];
   });
   setSelectedFieldId(nextId);
+  setSelectedFieldIds([nextId]);
 }
 
 function moveField(
@@ -2075,11 +2218,13 @@ function deleteField(
   fieldId: string,
   setFields: Dispatch<SetStateAction<PrepareField[]>>,
   setSelectedFieldId: Dispatch<SetStateAction<string | null>>,
+  setSelectedFieldIds: Dispatch<SetStateAction<string[]>>,
 ) {
   setFields((currentFields) =>
     currentFields.filter((field) => field.id !== fieldId),
   );
   setSelectedFieldId(null);
+  setSelectedFieldIds([]);
 }
 
 function changePage(

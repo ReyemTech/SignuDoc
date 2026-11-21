@@ -54,7 +54,7 @@ type InteractivePlacedFieldProps = {
   onInteractionChange?: (isActive: boolean) => void;
   onMove: (deltaX: number, deltaY: number) => void;
   onResize: (corner: FieldResizeHandle, deltaX: number, deltaY: number) => void;
-  onSelect: () => void;
+  onSelect: (additive: boolean) => void;
   signer: {
     color: string;
     name: string;
@@ -117,7 +117,7 @@ export function InteractivePlacedField({
 
     event.preventDefault();
     event.stopPropagation();
-    onSelect();
+    onSelect(event.shiftKey || event.ctrlKey || event.metaKey);
 
     if (typeof event.currentTarget.setPointerCapture === "function") {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -204,7 +204,7 @@ export function InteractivePlacedField({
     }
 
     event.preventDefault();
-    onSelect();
+    onSelect(false);
   }
 
   return (
