@@ -3,6 +3,7 @@
 import { DownloadIcon } from "lucide-react";
 import Image from "next/image";
 import {
+  type FocusEvent as ReactFocusEvent,
   type PointerEvent as ReactPointerEvent,
   useEffect,
   useRef,
@@ -536,6 +537,10 @@ export function SigningLiveShell({
     });
   const [signatureModal, setSignatureModal] =
     useState<SignatureModalState | null>(null);
+  const [nextFieldTarget, setNextFieldTarget] = useState<{
+    fieldId: string;
+    page: number;
+  } | null>(null);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [textValues, setTextValues] = useState<Record<string, string>>({});
   // Text answers too long for their box on the finished document, with how
@@ -556,6 +561,7 @@ export function SigningLiveShell({
     }).format(new Date()),
   );
   const paperGridRef = useRef<HTMLDivElement | null>(null);
+  const lastFocusedFieldIdRef = useRef<string | null>(null);
   const documentPanGestureRef = useRef<DocumentPanGesture | null>(null);
 
   const activePageRecord =
@@ -633,11 +639,22 @@ export function SigningLiveShell({
 
     return true;
   });
+  const orderedActionFields = [...actionSummaryFields].sort(
+    (left, right) =>
+      left.page - right.page || left.y - right.y || left.x - right.x,
+  );
+  const isFieldBlockingFinish = (field: SigningCurrentField) =>
+    !isFieldComplete(field, record.currentSignerFields, enteredValues) ||
+    (field.type === "text" && tooLongAnswers[field.id] !== undefined);
+  const nextFieldTargets = orderedActionFields.filter(
+    (field) =>
+      (field.required ||
+        (field.type === "text" && tooLongAnswers[field.id] !== undefined)) &&
+      isFieldBlockingFinish(field),
+  );
   const remainingFields = countAnswerableFields(
     record.currentSignerFields,
-    (field) =>
-      field.required &&
-      !isFieldComplete(field, record.currentSignerFields, enteredValues),
+    (field) => field.required && isFieldBlockingFinish(field),
   );
   // An optional number field may be left empty, but not filled with
   // something that is not a number.
@@ -665,6 +682,34 @@ export function SigningLiveShell({
           ((requiredFieldCount - remainingFields) / requiredFieldCount) * 100,
         );
   const isDocumentReady = pdfRenderState === "ready";
+
+  useEffect(() => {
+    if (
+      !nextFieldTarget ||
+      nextFieldTarget.page !== activePage ||
+      !isDocumentReady
+    ) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      const target = document.getElementById(
+        `signing-field-${nextFieldTarget.fieldId}`,
+      );
+      if (!target) return;
+
+      target.focus({ preventScroll: true });
+      target.scrollIntoView({
+        behavior: "smooth",
+        block: "center",
+        inline: "center",
+      });
+      lastFocusedFieldIdRef.current = nextFieldTarget.fieldId;
+      setNextFieldTarget(null);
+    });
+
+    return () => window.cancelAnimationFrame(frame);
+  }, [activePage, isDocumentReady, nextFieldTarget]);
 
   useEffect(() => {
     latestTextValuesRef.current = textValues;
@@ -760,6 +805,29 @@ export function SigningLiveShell({
     }
 
     setZoomLevel(nextZoomLevel);
+  }
+
+  function goToNextRequiredField() {
+    if (nextFieldTargets.length === 0) return;
+
+    const currentIndex = orderedActionFields.findIndex(
+      (field) => field.id === lastFocusedFieldIdRef.current,
+    );
+    const nextField =
+      nextFieldTargets.find(
+        (field) =>
+          orderedActionFields.findIndex((ordered) => ordered.id === field.id) >
+          currentIndex,
+      ) ?? nextFieldTargets[0];
+
+    if (!nextField) return;
+
+    lastFocusedFieldIdRef.current = nextField.id;
+    setNextFieldTarget({ fieldId: nextField.id, page: nextField.page });
+    if (nextField.page !== activePage) {
+      setPdfRenderState("loading");
+      setActivePage(nextField.page);
+    }
   }
 
   function handleSignatureFieldClick(field: SigningCurrentField) {
@@ -1067,7 +1135,16 @@ export function SigningLiveShell({
                   />
                 </div>
 
-                <div className="flex items-center justify-center gap-3">
+                <div className="flex flex-wrap items-center justify-center gap-3">
+                  <button
+                    aria-label={`Go to next required field. ${String(nextFieldTargets.length)} remaining.`}
+                    className="btn-quiet min-h-10 px-3 text-sm font-semibold"
+                    disabled={nextFieldTargets.length === 0}
+                    onClick={goToNextRequiredField}
+                    type="button"
+                  >
+                    Next field
+                  </button>
                   <button
                     aria-label="Previous page"
                     className="btn-quiet size-10 px-0"
@@ -1128,6 +1205,13 @@ export function SigningLiveShell({
                 onPointerDown={beginDocumentPan}
                 onPointerMove={handleDocumentPanMove}
                 onPointerUp={endDocumentPan}
+                onFocusCapture={(event: ReactFocusEvent<HTMLDivElement>) => {
+                  const field = (event.target as HTMLElement).closest<HTMLElement>(
+                    "[data-signing-field-id]",
+                  );
+                  const fieldId = field?.dataset.signingFieldId;
+                  if (fieldId) lastFocusedFieldIdRef.current = fieldId;
+                }}
                 ref={paperGridRef}
               >
                 <div
@@ -1714,6 +1798,8 @@ function CurrentSignerField({
             : "bg-[rgb(var(--accent-rgb)/0.07)] hover:bg-[rgb(var(--accent-rgb)/0.16)]"
         }`}
         data-signing-field="true"
+        data-signing-field-id={field.id}
+        id={`signing-field-${field.id}`}
         onClick={onSignatureClick}
         style={frame}
         type="button"
@@ -1789,6 +1875,7 @@ function CurrentSignerField({
           aria-invalid={tooLongMessage ? true : undefined}
           aria-label={getFieldLabel(field)}
           className="h-full w-full border-none bg-transparent px-2 text-sm text-(--fg) outline-none placeholder:text-(--placeholder)"
+          data-signing-field-id={field.id}
           id={`signing-field-${field.id}`}
           name={`signing-field-${field.id}`}
           onChange={(event) => onTextChange(event.target.value)}
@@ -1816,6 +1903,7 @@ function CurrentSignerField({
           aria-label={getFieldLabel(field)}
           autoComplete="off"
           className="h-full w-full border-none bg-transparent px-2 text-sm text-(--fg) outline-none placeholder:text-(--placeholder)"
+          data-signing-field-id={field.id}
           id={`signing-field-${field.id}`}
           inputMode="decimal"
           name={`signing-field-${field.id}`}
@@ -1839,6 +1927,7 @@ function CurrentSignerField({
           className={`h-full w-full cursor-pointer border-none bg-transparent bg-size-[0.75rem] bg-position-[right_0.25rem_center] pr-5 pl-1.5 text-sm outline-none ${
             textValue ? "text-(--fg)" : "text-(--secondary)"
           }`}
+          data-signing-field-id={field.id}
           id={`signing-field-${field.id}`}
           name={`signing-field-${field.id}`}
           onChange={(event) => onTextChange(event.target.value)}
@@ -1868,6 +1957,8 @@ function CurrentSignerField({
             : "bg-white hover:bg-[rgb(var(--accent-rgb)/0.10)]"
         }`}
         data-signing-field="true"
+        data-signing-field-id={field.id}
+        id={`signing-field-${field.id}`}
         // An answer that is needed can be changed but not taken back; one
         // that is optional can be cleared by choosing it again.
         onClick={() => onCheckboxChange(field.required ? true : !checkboxValue)}
@@ -1895,6 +1986,8 @@ function CurrentSignerField({
           : "bg-white hover:bg-[rgb(var(--accent-rgb)/0.10)]"
       }`}
       data-signing-field="true"
+      data-signing-field-id={field.id}
+      id={`signing-field-${field.id}`}
       onClick={() => onCheckboxChange(!checkboxValue)}
       style={frame}
       type="button"
