@@ -474,7 +474,7 @@ test("a deletion scheduled after the retention period's list was read still keep
           if (
             !scheduled &&
             typeof args[0] === "string" &&
-            args[0].includes("retention_warned_at AS")
+            args[0].includes('AS "retentionWarnedAt"')
           ) {
             scheduled = true;
             await target.query(

@@ -786,11 +786,14 @@ export async function sendManualEnvelopeNudge(
 
     try {
       if (persisted.jobId) {
-        const delivered = await tryDeliverWorkflowEmails([persisted.jobId], {
+        await tryDeliverWorkflowEmails([persisted.jobId], {
           database,
           emailService: service,
         });
-        if (delivered.has(persisted.jobId)) reminded.push(persisted);
+        // Durable mode has committed the reminder before delivery starts.
+        // A provider outage leaves the job pending for recovery, but the
+        // sender's request was still accepted and the new link is active.
+        reminded.push(persisted);
       } else {
         await deliverReminder(persisted, "manual", database, service!);
         reminded.push(persisted);
