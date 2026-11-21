@@ -1,4 +1,8 @@
 import { SIGNUDOC_NAME, type Branding } from "../branding.ts";
+import {
+  buildBrandPalette,
+  DEFAULT_BRAND_COLOR,
+} from "../brand-color.ts";
 import { getEnv, type EnvSource } from "../utils/env.ts";
 import { escapeHtml } from "../utils/html.ts";
 import { requireConfigValue } from "./service-config.ts";
@@ -77,6 +81,16 @@ export function withUserEmailLegalFooter(
 ): EmailBodyContent {
   const links = buildFooterLinks(branding, env);
   const logoHeader = buildLogoHeader(branding, env);
+  // The shared frame uses a normalized, contrast-safe color. Hosted mode
+  // intentionally has no install branding and therefore uses SignuDoc's
+  // default color.
+  const palette = buildBrandPalette(
+    branding.hosted
+      ? DEFAULT_BRAND_COLOR
+      : (branding.brandColor ?? DEFAULT_BRAND_COLOR),
+  );
+  const accent = palette?.accent ?? DEFAULT_BRAND_COLOR;
+  const accentInk = palette?.accentInk ?? accent;
   const textLines: string[] = [];
   const htmlLines: string[] = [];
 
@@ -101,19 +115,32 @@ export function withUserEmailLegalFooter(
     htmlLines.push(escapeHtml(sentBy));
   }
 
-  if (htmlLines.length === 0) {
-    return logoHeader
-      ? { htmlBody: `${logoHeader}${input.htmlBody}`, textBody: input.textBody }
-      : input;
-  }
-
-  const htmlFooter = [
-    '<hr style="margin:24px 0;border:none;border-top:1px solid #e2e2e2;" />',
-    `<p>${htmlLines.join("<br />")}</p>`,
+  const htmlFooter = htmlLines.length
+    ? [
+        '<hr style="margin:24px 0;border:none;border-top:1px solid #e2e2e2;" />',
+        `<p style="margin:0;color:#5b6072;font:12px/1.6 Arial,sans-serif;">${htmlLines.join("<br />")}</p>`,
+      ].join("")
+    : "";
+  const brandName = escapeHtml(
+    branding.hosted
+      ? branding.productName
+      : (branding.organizationName ?? branding.productName),
+  );
+  const htmlFrame = [
+    '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="border-collapse:collapse;background:#f5f6fa;">',
+    '<tbody><tr><td align="center" style="padding:24px 12px;">',
+    '<table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" style="width:100%;max-width:600px;border-collapse:separate;border-spacing:0;background:#ffffff;border:1px solid #e3e5ec;border-radius:12px;">',
+    `<tbody><tr><td style="height:5px;background:${accent};font-size:0;line-height:0;">&nbsp;</td></tr>`,
+    `<tr><td style="padding:28px 32px 32px;font:15px/1.6 Arial,sans-serif;color:#202332;"><p style="margin:0 0 20px;color:${accentInk};font:600 13px/1.4 Arial,sans-serif;">${brandName}</p>`,
+    input.htmlBody,
+    htmlFooter,
+    '</td></tr></tbody></table></td></tr></tbody></table>',
   ].join("");
 
   return {
-    htmlBody: `${logoHeader}${input.htmlBody}${htmlFooter}`,
+    // Keep the logo first for mail clients that hide later remote images;
+    // every value in the frame's CSS comes from the safe palette above.
+    htmlBody: `${logoHeader}${htmlFrame}`,
     // Each entry starts with an empty line; one more newline puts that
     // empty line between the message and the footer.
     textBody: `${input.textBody}\n${textLines.join("\n")}`,
