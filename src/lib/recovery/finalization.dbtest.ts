@@ -83,7 +83,7 @@ async function fixture(sourceStorage = storage) {
   await sourceStorage.putObject({ key, body, contentType: "application/pdf" });
   const link = await issueSigningLink({ expiresInSeconds: 3600 });
   await database.query(
-    `INSERT INTO "user"(id,name,email,"emailVerified",identity_verified_at) VALUES($1,'Owner',$1||'@example.test',true,1),($2,'Signing Person',$3,true,1)`,
+    `INSERT INTO "user"(id,name,email,"emailVerified",identity_verified_at,identity_verified_name,identity_verified_email) VALUES($1,'Owner',$1||'@example.test',true,1,'Owner',$1||'@example.test'),($2,'Signing Person',$3,true,1,'Signing Person',$3)`,
     [user, account, email],
   );
   await database.query(

@@ -46,7 +46,7 @@ If the site opens on a page that says to connect a database, the database was no
 
 ### What it costs
 
-[What it costs](../README.md#what-it-costs), in the README, puts a year of SignuDoc next to DocuSign for teams of 5 to 50.
+[What it costs](../README.md#what-it-costs), in the README, puts a year of SignuDoc next to a per-seat e-signature plan for teams of 5 to 50.
 
 - **Vercel.** The free Hobby plan is enough to run SignuDoc, but Vercel [limits Hobby to personal, non-commercial use](https://vercel.com/docs/limits/fair-use-guidelines). An organization using this for its work belongs on Vercel Pro. Everything here works the same on both.
 - **Neon, Vercel Blob and Resend** each have a free plan with limits: see [Neon](https://neon.com/faqs/free-plan-limits-and-quotas), [Vercel Blob](https://vercel.com/docs/vercel-blob/usage-and-pricing) and [Resend](https://resend.com/pricing). The two you are most likely to meet first, at the time of writing, are Resend's 100 emails a day, which is about 20 two-signer documents, and Vercel Blob's 2,000 uploads a month, which is about 250 documents. Every signing invitation, reminder and completed copy is an email, and every PDF, sealed copy and certificate is an upload. [What it costs](../README.md#what-it-costs) in the README works through all of the limits. None of these plans bills you for going over. It stops instead, until the month turns over or, for the two 1 GB storage limits, until you delete old documents or move up.
@@ -140,6 +140,7 @@ A deployment made with the button needs no environment variables. These are ther
 | `RESEND_REGION`                                     | Where Resend sends from when the app adds your domain, for example `eu-west-1`. See [Running in the EU](#running-in-the-eu).                                                                           |
 | `SEAL_P12_BASE64`, `SEAL_P12_PASSWORD`              | Seal finished PDFs with a certificate from a certificate authority instead of the install's own. See [Signed PDFs and the seal](#signed-pdfs-and-the-seal).                                            |
 | `SEAL_TIMESTAMP_URL`                                | An RFC 3161 timestamp server that adds a trusted time to each seal, and long-term validation. See [Long-term validation](#long-term-validation).                                                       |
+| `MAX_SIGNERS_PER_ENVELOPE`                          | The most signers one envelope can have, from 1 to 100. 25 when unset. See [Signing order](signing-order.md).                                                                                           |
 | `EIDEASY_CLIENT_ID`, `EIDEASY_SECRET`               | Let senders ask for advanced or qualified signatures in the signers' own names, through eID Easy. See [Signatures in the signers' own names](#signatures-in-the-signers-own-names-eidas-ades-and-qes). |
 | `CSC_API_URL`, `CSC_CLIENT_ID`, `CSC_CLIENT_SECRET` | The same through a trust service provider's remote signing service (CSC API v2). See [Signatures in the signers' own names](#signatures-in-the-signers-own-names-eidas-ades-and-qes).                  |
 | `BACKUP_BLOB_READ_WRITE_TOKEN`, `BACKUP_KEEP_DAYS`  | A daily backup of the database and files to a second Blob store. See [Backup and restore](backup-and-restore.md).                                                                                      |
@@ -154,6 +155,7 @@ The first time you open a new install it takes you to `/setup`. There you name y
 
 - **Who can sign up.** The install starts by letting people with an email address at the administrator's own domain create accounts (or nobody else, if the administrator used a public mailbox such as Gmail). The administrator can change this under Settings, Organization: people at listed domains, nobody, or anyone. People who are only sent a document to sign never need an account.
 - **More administrators.** Settings, Organization lists everyone with an account under People, where an administrator can make someone else an administrator or take that away. There is always at least one. When an account is closed, its finished documents and their audit trails move to the longest-standing administrator, because they are the organization's records. If that person later stops being an administrator, those documents move on to one who stays, and the documents they sent themselves stay with them.
+- **What signers agree to before signing.** Before a signer can sign, they read a disclosure about using electronic records and signatures and tick a box to agree. The built-in disclosure says they may sign on paper instead, ask for a paper copy, and withdraw. Under Settings, Organization, "What signers agree to before signing", an administrator can write their own words in its place, or start from the standard text and change it. Separate paragraphs with a blank line, start a line with `## ` to make a heading, and write `{sender}` and `{contact}` where the sender's name and the address to write to go. Leave it empty to use the built-in text. A custom text is limited to 6,000 characters, and a heading needs words under it. Each signer's agreement records a version of the words they saw: the built-in text keeps its dated version, and a custom text is named by a fingerprint of the text, so the version changes whenever the text does. The words themselves, filled in as the signer read them, are kept in that signer's audit trail, so the record stays complete if the setting is changed later. Saving words of your own first shows a notice: the standard text covers what the U.S. E-SIGN Act requires before a consumer agrees to sign electronically (choosing paper, getting a paper copy, withdrawing and what that means, and the device and software needed), and removing or changing it may make signatures and records invalid. Saving needs an administrator to press "I agree", and each change to the setting is in the site audit trail with the version of the notice they agreed to. Saving the standard text unchanged, or going back to it, needs no notice. The consent step itself cannot be turned off. The hosted service always shows the built-in text. SignuDoc is not legal advice, and that includes the standard text: check any wording with your own legal counsel before you rely on it.
 - **Email.** Settings, Organization also shows whether email is working. While no sender address is set, mail goes out from Resend's test address, which only reaches the owner of the Resend account. Enter a sender address at your domain and the page shows the DNS records to add and checks them for you. Mail from that address is not delivered until its domain is verified.
 - **`SETUP_TOKEN`.** A new install can be claimed by whoever opens it first. If its URL will be public before you get to it, set `SETUP_TOKEN` to a secret of your own and the setup page will ask for it.
 - **An install from before this page existed** has accounts but no administrator. Set `SETUP_TOKEN`, sign in with the account that should be in charge, and open `/setup`. It asks for a support address if the install has none. Sign-up stays open, as it was, until that administrator changes it.
@@ -176,6 +178,18 @@ These cover the people with an account (senders and administrators). Signers who
 - **Sessions.** A session lasts 7 days by default. Under Settings, Organization, Sign-in security an administrator can sign people out after 15 minutes to 8 hours without use, and at the latest 8 hours to 3 days after they signed in. A change applies to sessions that are already open, from their next click. Anyone can sign out on every device at once under Settings, Signed-in devices.
 - **Wrong passwords.** Ten wrong passwords for one email address within 15 minutes stop sign-in for that address until the 15 minutes are up. This happens whether or not the address has an account, so it says nothing about which ones do. Ten wrong codes at the second step lock that step for 15 minutes in the same way.
 - **The site audit trail** (Settings, Organization, Sign-in security) records each sign-in and failed sign-in with the address it came from, lockouts, sign-outs, password changes and resets, two-step sign-in being turned on, off or reset, new backup codes, and changes to settings, roles, the logo, the email domain, identity confirmations and signing locks. The rows form one hash chain, so a changed or removed row shows, and the trail downloads as CSV.
+
+### API keys
+
+Another app can create and send envelopes through the [SignuDoc API](api.md). An administrator makes a key for it under Settings, Organization, API keys. The key is shown once and only its hash is stored. It acts as the administrator who made it, skips two-step sign-in (it is for servers, not people), and stops working when it is revoked, expires, or its administrator stops being one. Making and revoking keys is in the site audit trail.
+
+### Webhooks
+
+An administrator can add webhook endpoints under Settings, Organization, Webhooks, so another app hears when an envelope is sent, viewed, signed, completed, declined, voided or expires. Deliveries are signed, retried for about two and a half days, and listed in a delivery log. Adding, changing and removing endpoints is in the site audit trail. Retries that are due are sent by the next request that changes an envelope, the next API call, or a daily cron job on `/api/internal/webhooks`, which takes the same `CRON_SECRET` as the daily cleanup. See [Webhooks](api.md#webhooks).
+
+### Embedded signing
+
+An app can show the signing page inside its own site, for envelopes it sends through the API with embedded delivery: no invitations are emailed, and the app says who the signer is. An administrator lists the sites allowed to do this under Settings, Organization, Embedded signing; with none listed it is off, and no page can be framed. Removing a site stops the links already made for it. See [Embedded signing](api.md#embedded-signing).
 
 ### Send the audit trail to your SIEM
 
@@ -202,17 +216,18 @@ People can sign in through your organization's identity provider instead of with
 How it behaves:
 
 - **New people** get an account the first time they sign in, under the same sign-up rule as a password sign-up (Settings, Organization, Who can sign up). So the email domain limit holds for single sign-on too. With Google this matters: any Google account can use the button, and the rule decides who gets an account. To let only your directory in, set the rule to your domains, or to nobody and add people some other way first.
-- **People who already have an account** with the same email address are signed in to it, if their address here is confirmed and the provider does not say theirs is unverified. Microsoft Entra ID does not say either way, and its addresses are trusted.
+- **People who already have an account** with the same email address are signed in to it, if their address here is confirmed and the provider says theirs is verified (`email_verified` is `true`). An address the provider does not vouch for is never tied to an existing account, and a new account made with it has to confirm the address by email first. Microsoft Entra ID does not send `email_verified`: add the optional `xms_edov` claim to the app's ID token (App registrations, Token configuration, Add optional claim, ID, `xms_edov`), which says your tenant owns the address's domain.
 - **Two-step sign-in** is not asked for after single sign-on: the provider's sign-in, with its own MFA, is the check. When an administrator requires two-step sign-in, it applies to people who have a password; someone who only uses single sign-on is not held up.
 - **Turning passwords off.** With single sign-on set up, `PASSWORD_SIGN_IN=off` stops password sign-in, password sign-up and password reset links. Put one or two administrator addresses in `PASSWORD_SIGN_IN_ALLOWED_EMAILS` (comma-separated) so there is a way in if the provider is down; their sign-in page shows "Sign in with a password instead". Without single sign-on set up, `PASSWORD_SIGN_IN=off` does nothing, so nobody is locked out by a half-finished setup.
 - **The site audit trail** records single sign-on sign-ins, and refused ones with the reason (for example, an address the sign-up rule turned away).
+- **API keys** keep working after their administrator is removed at the provider, because that does not change their role here. When an administrator leaves, take the role away under People, which revokes their keys, or revoke the keys under API keys. See [Keys](api.md#keys).
 - A missing or broken setting (one of the three left out, an issuer that is not `https://`) turns single sign-on off and leaves a warning in the function logs, so password sign-in keeps working.
 
 SAML is not supported. Okta, Entra ID and Google all offer OIDC for the same application.
 
 ## Your responsibilities
 
-Your install carries your organization's name, not SignuDoc's. In Settings, link your own terms and privacy policy (without a privacy link, signers see a notice built from your settings at `/signer-privacy`; check it), keep the support address you gave at setup pointed at a mailbox someone reads, and choose how long finished documents are kept. An administrator can also delete a finished envelope by hand, from its page; the deletion is recorded in the install's audit log (Settings, Organization, "Site audit trail"), with the document's fingerprints and the reason given. Under GDPR your organization is the controller; Settings, Organization has the tools to answer a signer who asks for their data or for its erasure.
+Your install carries your organization's name, not SignuDoc's. In Settings, link your own terms and privacy policy (without a privacy link, signers see a notice built from your settings at `/signer-privacy`; check it), keep the support address you gave at setup pointed at a mailbox someone reads, and choose how long finished documents are kept. Administrators see every envelope in the install that has been sent (Documents, "Everyone's"), whoever sent it; a draft stays its sender's own. They can open and download any of them, and ask for a finished one to be deleted from its page. The deletion waits 14 days: its sender is emailed a link to download it, any administrator can cancel until then, and the daily cleanup deletes it after that. A Part 11 record needs a reason. Sending, voiding, reminders and edits stay with the envelope's sender. An administrator's download of another member's file, each deletion request, each cancellation and each deletion are recorded in the install's audit log (Settings, Organization, "Site audit trail"), deletions with the document's fingerprints, its sender and the reason given. Under GDPR your organization is the controller; Settings, Organization has the tools to answer a signer who asks for their data or for its erasure.
 
 ## FDA 21 CFR Part 11
 
@@ -314,6 +329,14 @@ To close the route, set a secret. A caller then has to send `Authorization: Bear
 
 Sign-in, sign-up, password reset, the signing pages, uploads and sending are rate limited per visitor. The counts are kept in the `rate_limits` table in Postgres, so they hold across every instance of the app. On Vercel the visitor's address is read from the header Vercel sets itself, which a visitor cannot forge. If the database cannot be reached, each instance falls back to counting in its own memory.
 
+Off Vercel, `X-Forwarded-For` is read from the right, skipping private-network addresses. If your proxy chain appends addresses after the visitor address, set `TRUSTED_PROXY_HOPS` to the number of those trusted proxies, including private addresses; the app then selects the address just before them. Leave it unset to keep the default private-address filtering. Set it only when the app is reachable through that known proxy chain, and verify the address with a real request before relying on it for rate limits or audit records. If the proxy path omits the visitor address entirely, no hop count can recover it. The app must not be reachable around a proxy that is trusted to overwrite or append these headers.
+
+The route-specific PDF read and signing submission limits are shared by the signing link, regardless of the visitor's address. An additional aggregate public-link limit applies per visitor address when one is available; if the app cannot determine an address, it skips that aggregate limit instead of grouping all visitors under one `unknown` address. Other route limits remain scoped to their documented visitor or resource keys.
+
+## Password breach check
+
+In production, new passwords are checked against the Have I Been Pwned breach list using its range API: only a short hash prefix leaves the server. If the service cannot be reached, sign-up fails rather than accepting an unchecked password. `PASSWORD_BREACH_CHECK=off` disables the check for a server that cannot reach `api.pwnedpasswords.com`, but then breached passwords can be accepted.
+
 ## Bot protection
 
 The app can use [Vercel BotID](https://vercel.com/docs/botid), an invisible check that a request comes from a real browser, on the requests a script would go for: creating an account, signing in, asking for a password reset or verification email, the contact form and first-run setup.
@@ -330,7 +353,7 @@ It is opt-in for now because it has not yet been proven against a live Vercel de
 
 For production containers and the Helm chart, see [Run SignuDoc on Kubernetes](kubernetes.md).
 
-SignuDoc is a regular Next.js app and runs anywhere Node.js 24 and Postgres do:
+SignuDoc is a regular Next.js app and runs anywhere Node.js 24 or 26 and Postgres do:
 
 ```bash
 npm run db:migrate
@@ -342,10 +365,12 @@ Away from Vercel, a few things Vercel does for you are yours to set:
 
 - `DATABASE_URL`, pointing at your Postgres. Run `npm run db:migrate` on every deploy; it only applies what is new.
 - `APP_URL`, the site's public HTTPS address.
-- `BETTER_AUTH_SECRET`, at least 32 characters (`openssl rand -hex 32`). Without it a secret is derived from the database password, which must then be at least 12 characters long.
+- `BETTER_AUTH_SECRET`, at least 32 characters (`openssl rand -hex 32`). Without it a secret is derived from the database password, which must then be at least 12 characters long. A production site on a public URL logs a warning when the derived secret is used.
+- `TRUSTED_PROXY_HOPS`, when your trusted proxy chain adds addresses after the visitor address in `X-Forwarded-For`; count every proxy that appends, including private proxies. See [Rate limits](#rate-limits). Leave it unset to use private-address filtering.
 - `RESEND_API_KEY`, from your Resend account.
 - Files are kept on the machine's disk under `.data/storage` (`STORAGE_LOCAL_DIR` changes where), so that disk must survive restarts. To use a Vercel Blob store from elsewhere, set `BLOB_READ_WRITE_TOKEN`.
 - Leave `EMAIL_DRIVER` unset. The capture driver is for development only.
+- `EMAIL_CAPTURE_DIR`, only when `EMAIL_DRIVER=capture`, changes where captured email JSON files are written. The capture driver is disabled on public production deployments.
 
 Self-hosted operators are responsible for:
 

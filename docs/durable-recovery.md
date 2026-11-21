@@ -99,7 +99,7 @@ Queue payloads can include complete messages and attachments. Backups, WAL and r
 
 ## Validate on disposable fixtures
 
-With Node 24, Chromium and a dedicated PostgreSQL database whose name contains `e2e`, set `E2E_DATABASE_URL` and run `npm run test:e2e` for legacy mode. Run `E2E_DURABLE_JOBS=1 npm run test:e2e` for the same flows through durable recovery. Playwright resets that database and the local test data directory. It uses a signing provider stand-in and captures all mail to JSON.
+With Node 24 or 26, Chromium and a dedicated PostgreSQL database whose name contains `e2e`, set `E2E_DATABASE_URL` and run `npm run test:e2e` for legacy mode. Run `E2E_DURABLE_JOBS=1 npm run test:e2e` for the same flows through durable recovery. Playwright resets that database and the local test data directory. It uses a signing provider stand-in and captures all mail to JSON.
 
 For the production-container browser run, build the Linux amd64 runner shown below. Point `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, and the AWS SDK credentials at a private disposable test store with an existing bucket. Use `S3_FORCE_PATH_STYLE=true` for local MinIO. Run the browser test as a non-root user so captured files remain accessible on the host. To run the real worker-kill checks against the same test store outside the browser, set `S3_INTEGRATION_TEST=1` and run `npm run test:db`.
 

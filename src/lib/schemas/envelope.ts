@@ -151,6 +151,7 @@ export const envelopeRecordSchema = z.object({
   evidenceKey: z.string().trim().min(1).nullable().optional(),
   sourcePdfHash: sourcePdfHashSchema,
   signedPdfSha256: sourcePdfHashSchema.nullable().optional(),
+  publicVerificationTokenHash: sourcePdfHashSchema.nullable().optional(),
   evidenceSha256: sourcePdfHashSchema.nullable().optional(),
   recipientEvidenceSha256: sourcePdfHashSchema.nullable().optional(),
   sentAt: unixTimestampSchema.nullable().optional(),

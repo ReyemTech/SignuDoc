@@ -14,7 +14,7 @@ import {
 } from "@/lib/signing";
 import { logRouteError } from "@/lib/security/logging";
 import {
-  applyRateLimit,
+  applyPublicLinkRateLimit,
   buildRateLimitKey,
 } from "@/lib/security/route-controls";
 import {
@@ -33,13 +33,9 @@ export async function POST(
   context: SigningSubmitRouteContext,
 ) {
   const { token } = await context.params;
-  const rateLimitResponse = await applyRateLimit({
+  const rateLimitResponse = await applyPublicLinkRateLimit({
     category: "signing_submit",
-    key: buildRateLimitKey([
-      "signing-submit",
-      token,
-      getClientIpAddress(request.headers) ?? "unknown",
-    ]),
+    key: buildRateLimitKey(["signing-submit", token]),
     limit: 10,
     request,
     windowMs: 10 * 60 * 1000,
