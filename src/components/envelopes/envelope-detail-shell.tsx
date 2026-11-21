@@ -560,7 +560,7 @@ export function EnvelopeDetailShell({
           {isOwnEnvelope ? "← Documents" : "← All envelopes"}
         </Link>
 
-        <div className="mt-5 flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
+        <div className="mt-5 flex flex-col gap-6">
           <div className="flex min-w-0 items-center gap-5">
             {documentUrl ? (
               <a
@@ -624,7 +624,7 @@ export function EnvelopeDetailShell({
             </div>
           </div>
 
-          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap lg:justify-end">
+          <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap">
             {documentUrl ? (
               <ShellButton href={documentUrl} inNewTab variant="secondary">
                 <FileTextIcon
