@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { E2E_PASSWORD } from "./support/admin-session";
+import { signInAsAdministrator } from "./support/admin-session";
 import { extractLink, waitForEmail } from "./support/outbox";
 import { writeSamplePdf } from "./support/sample-pdf";
 
@@ -11,17 +11,7 @@ test("Next field follows incomplete signatures across pages and disables when do
   page,
 }, testInfo) => {
   await test.step("the sender places one signature field on each page", async () => {
-    const runId = String(Date.now());
-
-    await page.goto("/setup");
-    await page.getByLabel("Organization name").fill("Next Field Test");
-    await page.getByLabel("Your name").fill("Nora Administrator");
-    await page.getByLabel("Your email").fill(`admin+${runId}@example.com`);
-    await page.getByLabel("Password").fill(E2E_PASSWORD);
-    await page.getByLabel("Support email").fill(`support+${runId}@example.com`);
-    await page.getByLabel("Setup token").fill("e2e-setup-token");
-    await page.getByRole("button", { name: "Finish setup" }).click();
-    await expect(page).toHaveURL(/\/settings#organization$/);
+    await signInAsAdministrator(page);
 
     const pdfPath = await writeSamplePdf(testInfo.outputPath("next-field.pdf"));
 
