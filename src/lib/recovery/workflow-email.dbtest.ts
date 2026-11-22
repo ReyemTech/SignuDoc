@@ -496,7 +496,7 @@ test("Part 11 lock persists through queue failure and recovers its alert without
     administrator,
   ]);
   await database.query(
-    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, identity_verified_name = name, identity_verified_email = email, signing_failed_attempts = 4 WHERE id = $1',
     [person, clock()],
   );
   const state = async () =>
@@ -799,7 +799,7 @@ test("account purge retires an unreconciled Part 11 alert without recreating cip
     admin,
   ]);
   await database.query(
-    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, identity_verified_name = name, identity_verified_email = email, signing_failed_attempts = 4 WHERE id = $1',
     [person, clock()],
   );
   const failed = afterStatement(
@@ -856,7 +856,7 @@ async function leaveSigningLockAlertPending(
   emailService: EmailService,
 ) {
   await database.query(
-    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, signing_failed_attempts = 4 WHERE id = $1',
+    'UPDATE "user" SET "emailVerified" = true, identity_verified_at = $2, identity_verified_name = name, identity_verified_email = email, signing_failed_attempts = 4 WHERE id = $1',
     [person, clock()],
   );
   const offline = afterStatement(

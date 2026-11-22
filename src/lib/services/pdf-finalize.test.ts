@@ -1,16 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { PDFDocument } from "pdf-lib";
+import { PDFDict, PDFDocument, PDFName } from "pdf-lib";
 
 import type { AuditEventRecord, EnvelopeRecord } from "../schemas/envelope.ts";
 import type { FieldRecord } from "../schemas/field.ts";
 import type { SignerRecord } from "../schemas/signer.ts";
+import type { Branding } from "../branding.ts";
 import {
+  computeAuditFingerprint,
   describeAuditActor,
+  findTypedValueTooLongForField,
   renderEnvelopeCertificatePdf,
   renderFinalizedEnvelopePdf,
+  wrapFieldText,
 } from "./pdf-finalize.ts";
+import { embedTextFaces } from "./pdf-fonts.ts";
 import { sha256Hex } from "./pdf-seal.ts";
 import type { StorageService } from "./storage.ts";
 
@@ -44,6 +49,92 @@ async function extractText(pdfBytes: Uint8Array): Promise<string> {
 
   return parts.join("\n");
 }
+
+async function extractPageText(pdfBytes: Uint8Array, pageNumber: number) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const page = await document.getPage(pageNumber);
+  const content = await page.getTextContent();
+  const text = content.items
+    .map((item: { str?: string }) => item.str ?? "")
+    .join(" ");
+
+  await document.destroy();
+
+  return text;
+}
+
+async function getPdfAnnotations(pdfBytes: Uint8Array) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const annotations = [];
+
+  for (let pageNumber = 1; pageNumber <= document.numPages; pageNumber += 1) {
+    const page = await document.getPage(pageNumber);
+    annotations.push({
+      pageNumber,
+      items: (await page.getAnnotations()) as Array<{ url?: string }>,
+    });
+  }
+
+  await document.destroy();
+
+  return annotations;
+}
+
+async function getFirstPageTextItems(pdfBytes: Uint8Array) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const page = await document.getPage(1);
+  const content = await page.getTextContent();
+  const items = (
+    content.items as Array<{
+      str?: string;
+      transform?: number[];
+      width?: number;
+    }>
+  )
+    .filter((item) => item.str && item.transform)
+    .map((item) => ({
+      left: item.transform![4]!,
+      text: item.str!,
+      y: item.transform![5]!,
+    }));
+
+  await document.destroy();
+
+  return items;
+}
+
+const REYEM_BRANDING: Branding = {
+  brandColor: "#00875a",
+  contactUrl: null,
+  hosted: false,
+  logoUrl: "/api/brand/logo",
+  organizationName: "Reyem Tech",
+  privacyUrl: null,
+  productName: "Reyem Tech",
+  signupAvailable: false,
+  supportAddress: null,
+  termsUrl: null,
+};
+
+const ONE_PIXEL_LOGO = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+  "base64",
+);
 
 async function makeFixture() {
   const sourceDocument = await PDFDocument.create();
@@ -223,6 +314,197 @@ test("the certificate prints names, titles and browser strings as they are", asy
   const reloaded = await PDFDocument.load(pdfBytes);
 
   assert.ok(reloaded.getTitle()?.includes("業務委託契約書"));
+});
+
+test("signer evidence is laid out in two-column cards", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const items = await getFirstPageTextItems(pdfBytes);
+  const firstSigner = items.find((item) => item.text.includes(SIGNER_NAME));
+  const secondSigner = items.find((item) =>
+    item.text.includes(SECOND_SIGNER_NAME),
+  );
+
+  assert.ok(firstSigner, "the first signer's card is on the certificate");
+  assert.ok(secondSigner, "the second signer's card is on the certificate");
+  assert.ok(
+    Math.abs(firstSigner.left - secondSigner.left) > 200,
+    "the two signer cards occupy separate columns",
+  );
+});
+
+test("the brand header shows the logo instead of repeating the company name", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      branding: REYEM_BRANDING,
+      brandLogo: {
+        bytes: ONE_PIXEL_LOGO,
+        contentType: "image/png",
+        version: "logo-v1",
+      },
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const text = (await extractText(pdfBytes)).replace(/\s+/g, " ");
+  const pdf = await PDFDocument.load(pdfBytes);
+  const items = await getFirstPageTextItems(pdfBytes);
+  const title = items.find((item) =>
+    item.text.includes("Certificate of Completion"),
+  );
+  const imageObjects = pdf
+    .getPage(0)
+    .node.Resources()!
+    .lookup(PDFName.of("XObject"), PDFDict)
+    .keys();
+
+  assert.ok(!text.includes("Reyem Tech"), text);
+  assert.ok(title, "the certificate title is printed on the first page");
+  assert.ok(title.y > 630, "the title sits close beneath the logo");
+  assert.ok(
+    imageObjects.length >= 1,
+    "the configured logo is embedded as a page image",
+  );
+});
+
+test("the company name appears in the certificate header when there is no logo", async () => {
+  const fixture = await makeFixture();
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      branding: REYEM_BRANDING,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+    },
+    { seal: saveUnsealed },
+  );
+  const text = (await extractText(pdfBytes)).replace(/\s+/g, " ");
+
+  assert.ok(text.includes("Reyem Tech"), text);
+});
+
+test("the verification link and QR share the final certificate page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl = "https://esign.reyem.tech/verify/envelope/token-123";
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      brandLogo: {
+        bytes: ONE_PIXEL_LOGO,
+        contentType: "image/png",
+        version: "logo-v1",
+      },
+      branding: REYEM_BRANDING,
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+      verificationUrl,
+    },
+    { seal: saveUnsealed },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+  const finalPageImageObjects = pdf
+    .getPage(pdf.getPageCount() - 1)
+    .node.Resources()!
+    .lookup(PDFName.of("XObject"), PDFDict)
+    .keys();
+
+  assert.equal(pdf.getPageCount(), 1, "no verification-only page is added");
+  assert.ok(link, "the verification URL is a clickable PDF link");
+  assert.equal(link.pageNumber, pdf.getPageCount());
+  assert.ok(
+    finalPageImageObjects.length >= 2,
+    "the final page contains both the brand logo and QR image",
+  );
+  assert.ok((await extractText(pdfBytes)).includes(verificationUrl));
+});
+
+test("a long audit history keeps the verification panel on its last event page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl =
+    "https://esign.reyem.tech/verify/envelope/long-history";
+  const repeatedViews: AuditEventRecord[] = Array.from(
+    { length: 80 },
+    (_, index) => ({
+      ...fixture.auditEvents[0]!,
+      createdAt: fixture.auditEvents[0]!.createdAt + index + 1,
+      event: "viewed",
+      id: `event-viewed-${String(index)}`,
+    }),
+  );
+  const pdfBytes = await renderEnvelopeCertificatePdf(
+    {
+      auditEvents: [...fixture.auditEvents, ...repeatedViews],
+      envelope: fixture.envelope,
+      signers: fixture.signers,
+      verificationUrl,
+    },
+    { seal: saveUnsealed },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const lastPageNumber = pdf.getPageCount();
+  const lastPageText = await extractPageText(pdfBytes, lastPageNumber);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+
+  assert.ok(lastPageNumber > 1, "the audit history spans multiple pages");
+  assert.ok(lastPageText.includes("viewed"), lastPageText);
+  assert.ok(lastPageText.includes(verificationUrl), lastPageText);
+  assert.equal(link?.pageNumber, lastPageNumber);
+});
+
+test("the signed PDF adds verification to its audit page without a QR-only page", async () => {
+  const fixture = await makeFixture();
+  const verificationUrl = "https://esign.reyem.tech/verify/envelope/token-456";
+  const pdfBytes = await renderFinalizedEnvelopePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      completedAt: fixture.envelope.completedAt!,
+      envelope: fixture.envelope,
+      fields: fixture.fields,
+      includeAuditTrail: true,
+      pages: [],
+      signers: fixture.signers,
+      sourcePdfKey: fixture.envelope.sourcePdfKey,
+      verificationUrl,
+    },
+    { seal: saveUnsealed, storageService: fixture.storageService },
+  );
+  const pdf = await PDFDocument.load(pdfBytes);
+  const annotations = await getPdfAnnotations(pdfBytes);
+  const link = annotations
+    .flatMap((page) =>
+      page.items.map((item) => ({ pageNumber: page.pageNumber, ...item })),
+    )
+    .find((annotation) => annotation.url === verificationUrl);
+
+  assert.equal(
+    pdf.getPageCount(),
+    2,
+    "one evidence page follows the source PDF",
+  );
+  assert.ok(link, "the signed PDF carries the clickable verification link");
+  assert.equal(link.pageNumber, 2);
+  assert.ok((await extractText(pdfBytes)).includes(verificationUrl));
 });
 
 test("the certificate names the people who were sent a copy", async () => {
@@ -625,11 +907,11 @@ test("a sent row names the sender, not the first signer (issue #52)", async () =
     const text = await render(redacted);
 
     assert.ok(!text.includes(`${SIGNER_NAME} <sam@sender.example>`), text);
-    assert.match(text, /sent \| sam@sender\.example/);
-    assert.match(text, /reminded_auto \| system/);
+    assert.match(text, /sent sam@sender\.example/);
+    assert.match(text, /reminded_auto system/);
     assert.ok(
       text.includes(
-        `viewed | ${SIGNER_NAME} <${redacted ? "signer" : "lukasz@example.com"}>`,
+        `viewed ${SIGNER_NAME} <${redacted ? "signer" : "lukasz@example.com"}>`,
       ),
       text,
     );
@@ -671,5 +953,415 @@ test("describeAuditActor keeps the signer's name on the signer's own rows", () =
       metadata: { signerEmail: "p@example.com", signerName: "Priya Patel" },
     }),
     "system",
+  );
+});
+
+// A Text field in the place and size from issue #90: right of centre on a
+// US Letter page, 19% of the page wide and 6% high.
+const NARROW_FIELD = { height: 0.06, page: 1, width: 0.19, x: 0.69, y: 0.32 };
+const LETTER_PAGE = { heightPt: 792, pageNumber: 1, widthPt: 612 };
+
+async function extractTextItems(pdfBytes: Uint8Array) {
+  const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(pdfBytes),
+    useSystemFonts: false,
+    verbosity: 0,
+  }).promise;
+  const page = await document.getPage(1);
+  const content = await page.getTextContent();
+  const items = (
+    content.items as Array<{
+      str?: string;
+      transform?: number[];
+      width?: number;
+    }>
+  )
+    .filter((item) => item.str && item.transform)
+    .map((item) => ({
+      left: item.transform![4]!,
+      right: item.transform![4]! + (item.width ?? 0),
+      text: item.str!,
+      y: item.transform![5]!,
+    }));
+
+  await document.destroy();
+
+  return items;
+}
+
+async function renderOneTextField(value: string) {
+  const fixture = await makeFixture();
+  const field: FieldRecord = {
+    ...NARROW_FIELD,
+    createdAt: 1_800_000_000,
+    envelopeId: fixture.envelope.id,
+    id: "long-text",
+    required: true,
+    signerId: "signer-1",
+    submittedAt: 1_800_000_000,
+    type: "text",
+    updatedAt: 1_800_000_000,
+    value,
+  };
+
+  return renderFinalizedEnvelopePdf(
+    {
+      auditEvents: fixture.auditEvents,
+      completedAt: fixture.envelope.completedAt!,
+      envelope: fixture.envelope,
+      fields: [field],
+      pages: [LETTER_PAGE],
+      signers: fixture.signers,
+      sourcePdfKey: fixture.envelope.sourcePdfKey,
+    },
+    { seal: saveUnsealed, storageService: fixture.storageService },
+  );
+}
+
+const LONG_ANSWER = [
+  "BEGIN",
+  "The tenant agrees to keep the garden tidy, to water the plants",
+  "twice a week in summer, and to tell the landlord about any leak",
+  "within two days of finding it.",
+  "FINISH-MARKER",
+].join(" ");
+
+test("a long text answer wraps inside its box and is kept whole", async () => {
+  const items = await extractTextItems(await renderOneTextField(LONG_ANSWER));
+  const fieldLeft = NARROW_FIELD.x * 612;
+  const fieldRight = (NARROW_FIELD.x + NARROW_FIELD.width) * 612;
+  const fieldTop = 792 - NARROW_FIELD.y * 792;
+  const fieldBottom = fieldTop - NARROW_FIELD.height * 792;
+  const joined = items
+    .map((item) => item.text)
+    .join(" ")
+    .replace(/\s+/g, " ");
+
+  assert.ok(joined.includes("BEGIN"));
+  assert.ok(joined.includes("FINISH-MARKER"));
+  assert.ok(new Set(items.map((item) => Math.round(item.y))).size > 1);
+
+  for (const item of items) {
+    assert.ok(item.left >= fieldLeft, `${item.text} starts left of its box`);
+    assert.ok(item.right <= fieldRight + 0.5, `${item.text} runs past its box`);
+    assert.ok(item.y >= fieldBottom && item.y <= fieldTop);
+  }
+});
+
+test("a short text answer is still drawn on one line", async () => {
+  const items = await extractTextItems(await renderOneTextField("Approved"));
+
+  assert.deepEqual(
+    items.map((item) => item.text),
+    ["Approved"],
+  );
+});
+
+const ISSUE_90_ANSWER = `BEGIN ${"W".repeat(240)} FINISH-MARKER`;
+
+test("an answer already accepted that is too long is drawn whole, not cut off", async () => {
+  const items = await extractTextItems(
+    await renderOneTextField(ISSUE_90_ANSWER),
+  );
+  const joined = items.map((item) => item.text).join("");
+
+  assert.ok(joined.includes("FINISH-MARKER"));
+  assert.equal(joined.replace(/[^W]/g, "").length, 240);
+
+  for (const item of items) {
+    assert.ok(item.right <= 612, `${item.text} runs off the page`);
+  }
+});
+
+test("signing is told when an answer cannot fit its box at a readable size", async () => {
+  const field = { ...NARROW_FIELD };
+
+  assert.equal(
+    await findTypedValueTooLongForField(
+      [{ field, value: LONG_ANSWER }],
+      [LETTER_PAGE],
+    ),
+    null,
+  );
+
+  const tooLong = await findTypedValueTooLongForField(
+    [
+      { field, value: "Approved" },
+      { field, value: ISSUE_90_ANSWER },
+    ],
+    [LETTER_PAGE],
+  );
+
+  assert.ok(tooLong);
+  assert.equal(tooLong.page, 1);
+  assert.ok(tooLong.maxCharacters > 0);
+  assert.ok(tooLong.maxCharacters < ISSUE_90_ANSWER.length);
+
+  // The length it names does fit.
+  assert.equal(
+    await findTypedValueTooLongForField(
+      [
+        {
+          field,
+          value: Array.from(ISSUE_90_ANSWER)
+            .slice(0, tooLong.maxCharacters)
+            .join(""),
+        },
+      ],
+      [LETTER_PAGE],
+    ),
+    null,
+  );
+});
+
+test("a box shorter than two readable lines takes only one", async () => {
+  // 3.6 pt high: one line at the readable size, as before, but no second.
+  const field = { ...NARROW_FIELD, height: 0.0045 };
+
+  assert.equal(
+    await findTypedValueTooLongForField(
+      [{ field, value: "Approved" }],
+      [LETTER_PAGE],
+    ),
+    null,
+  );
+  assert.ok(
+    await findTypedValueTooLongForField(
+      [{ field, value: LONG_ANSWER }],
+      [LETTER_PAGE],
+    ),
+  );
+});
+
+test("spaces inside an answer are kept as they were typed", async () => {
+  const faces = await embedTextFaces(await PDFDocument.create(), [
+    "AB  12 and more words",
+  ]);
+
+  // pdf.js merges runs of spaces when it extracts text, so the lines are
+  // checked as they are laid out.
+  assert.deepEqual(wrapFieldText(faces.regular, 10, 500, "AB  12"), ["AB  12"]);
+  assert.deepEqual(
+    wrapFieldText(faces.regular, 10, 60, "AB  12 and more words"),
+    ["AB  12 and", "more words"],
+  );
+});
+
+// Audit table rows print the timestamp and event in separate columns. Returns
+// those event labels in the order the certificate lists them.
+function certificateEventOrder(text: string): string[] {
+  const auditEvents = text.split("Audit events").at(-1) ?? "";
+  return [
+    ...auditEvents.matchAll(
+      /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2} UTC ([a-z_]+)/g,
+    ),
+  ].map((match) => match[1]);
+}
+
+async function renderCertificateText(
+  envelope: EnvelopeRecord,
+  signers: SignerRecord[],
+  auditEvents: AuditEventRecord[],
+): Promise<string> {
+  return (
+    await extractText(
+      await renderEnvelopeCertificatePdf(
+        { auditEvents, envelope, signers },
+        { seal: saveUnsealed },
+      ),
+    )
+  ).replace(/\s+/g, " ");
+}
+
+test("the last signature is listed before completed in the same second (issue #97)", async () => {
+  const fixture = await makeFixture();
+  const now = fixture.envelope.completedAt ?? 0;
+  // The ids sort after any generated id, so a sort by time then id would
+  // put the completed row first.
+  const auditEvents: AuditEventRecord[] = [
+    {
+      actorEmail: "yamada@example.com",
+      actorType: "signer",
+      createdAt: now,
+      envelopeId: fixture.envelope.id,
+      event: "signed",
+      id: "zz-event-signed",
+      metadata: { signerId: "signer-2", signerName: SECOND_SIGNER_NAME },
+    },
+  ];
+  const text = await renderCertificateText(
+    fixture.envelope,
+    fixture.signers,
+    auditEvents,
+  );
+
+  assert.deepEqual(certificateEventOrder(text), ["signed", "completed"], text);
+});
+
+test("a recorded completed row keeps its place in the recorded order (issue #97)", async () => {
+  const fixture = await makeFixture();
+  const now = fixture.envelope.completedAt ?? 0;
+  const auditEvents: AuditEventRecord[] = [
+    {
+      actorEmail: "yamada@example.com",
+      actorType: "signer",
+      createdAt: now,
+      envelopeId: fixture.envelope.id,
+      event: "signed",
+      id: "zz-event-signed",
+      metadata: { signerId: "signer-2", signerName: SECOND_SIGNER_NAME },
+    },
+    {
+      actorType: "system",
+      createdAt: now,
+      envelopeId: fixture.envelope.id,
+      event: "completed",
+      id: "aa-event-completed",
+      metadata: null,
+    },
+    {
+      actorType: "system",
+      createdAt: now,
+      envelopeId: fixture.envelope.id,
+      event: "email_sent",
+      id: "00-event-email",
+      metadata: null,
+    },
+  ];
+  const text = await renderCertificateText(
+    fixture.envelope,
+    fixture.signers,
+    auditEvents,
+  );
+
+  assert.deepEqual(
+    certificateEventOrder(text),
+    ["signed", "completed", "email_sent"],
+    text,
+  );
+});
+
+test("declined and voided certificates keep same-second events in recorded order (issue #97)", async () => {
+  const fixture = await makeFixture();
+  const at = 1_799_999_000;
+  const sameSecond = (
+    event: AuditEventRecord["event"],
+    id: string,
+  ): AuditEventRecord => ({
+    actorType: "system",
+    createdAt: at,
+    envelopeId: fixture.envelope.id,
+    event,
+    id,
+    metadata: null,
+  });
+
+  for (const [status, terminalEvent] of [
+    ["declined", "declined"],
+    ["voided", "voided"],
+  ] as const) {
+    const envelope: EnvelopeRecord = {
+      ...fixture.envelope,
+      completedAt: null,
+      declinedAt: status === "declined" ? at : null,
+      status,
+      voidedAt: status === "voided" ? at : null,
+    };
+    // Recorded order: sent, signed, the next invitation, then the end. The
+    // ids are in reverse, so a sort by id would turn them around.
+    const auditEvents = [
+      sameSecond("sent", "d-sent"),
+      sameSecond("signed", "c-signed"),
+      sameSecond("email_sent", "b-email"),
+      sameSecond(terminalEvent, "a-end"),
+    ];
+    const text = await renderCertificateText(
+      envelope,
+      fixture.signers,
+      auditEvents,
+    );
+
+    assert.deepEqual(
+      certificateEventOrder(text),
+      ["sent", "signed", "email_sent", terminalEvent],
+      text,
+    );
+  }
+});
+
+test("a captured email is not described as accepted by a mail provider (issue #106)", async () => {
+  const fixture = await makeFixture();
+  const emailSent = (id: string, messageId: string): AuditEventRecord => ({
+    actorType: "system",
+    createdAt: 1_799_999_000,
+    envelopeId: fixture.envelope.id,
+    event: "email_sent",
+    id,
+    metadata: {
+      messageId,
+      recipient: "lukasz@example.com",
+      signerId: "signer-1",
+      template: "signing_invitation",
+    },
+  });
+  const auditEvents = [
+    emailSent("event-captured", "capture-1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"),
+    emailSent("event-provider", "4ef9a417-02e9-4d39-ad75-9611e0fcc33c"),
+  ];
+  const text = (
+    await extractText(
+      await renderEnvelopeCertificatePdf(
+        {
+          auditEvents,
+          envelope: fixture.envelope,
+          redactForRecipients: false,
+          signers: fixture.signers,
+        },
+        { seal: saveUnsealed },
+      ),
+    )
+  ).replace(/\s+/g, " ");
+
+  assert.ok(
+    text.includes(
+      "captured locally as capture-1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed, not sent",
+    ),
+    text,
+  );
+  assert.ok(
+    !text.includes(
+      "accepted by the mail provider as capture-1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
+    ),
+    text,
+  );
+  assert.ok(
+    text.includes(
+      "accepted by the mail provider as 4ef9a417-02e9-4d39-ad75-9611e0fcc33c",
+    ),
+    text,
+  );
+});
+
+test("the new wording leaves the audit fingerprint of a captured email unchanged (issue #106)", () => {
+  // Certificates sealed before the fix printed this fingerprint for the same
+  // row, so they still match the stored audit trail.
+  assert.equal(
+    computeAuditFingerprint([
+      {
+        actorType: "system",
+        createdAt: 1_799_999_000,
+        envelopeId: "env",
+        event: "email_sent",
+        id: "event-captured",
+        metadata: {
+          messageId: "capture-1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed",
+          recipient: "lukasz@example.com",
+          signerId: "signer-1",
+          template: "signing_invitation",
+        },
+      },
+    ]),
+    "876cbd8661559c69681db5458f3baf2f8e1c8ccc4c43c9352691608e68b61c32",
   );
 });

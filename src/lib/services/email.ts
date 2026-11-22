@@ -11,6 +11,7 @@ import {
   resolveSettings,
 } from "../settings.ts";
 import { type EmailTemplateKind } from "../types/domain.ts";
+import { CAPTURED_MESSAGE_ID_PREFIX } from "./captured-email.ts";
 import { getEnv, isLocalDeployment, type EnvSource } from "../utils/env.ts";
 import { buildEmailAddresses, type EmailAddresses } from "./email-addresses.ts";
 import {
@@ -241,7 +242,7 @@ function createCaptureEmailService(
     const stableId = options?.idempotencyKey
       ? createHash("sha256").update(options.idempotencyKey).digest("hex")
       : null;
-    const messageId = `capture-${stableId ?? randomUUID()}`;
+    const messageId = `${CAPTURED_MESSAGE_ID_PREFIX}${stableId ?? randomUUID()}`;
     const filePath = path.join(
       /*turbopackIgnore: true*/ captureDir,
       stableId
@@ -357,6 +358,30 @@ export function isEmailNotConnectedError(error: unknown): boolean {
     error instanceof ServiceConfigurationError &&
     error.message.startsWith("email service ")
   );
+}
+
+/** Whether this install has an email provider to send with. */
+export function canSendEmail(env: EnvSource = process.env): boolean {
+  try {
+    createEmailService({ env });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Build a provider only if a message is actually sent. */
+export function createLazyEmailService(
+  create: () => EmailService = () => createEmailService(),
+): EmailService {
+  let service: EmailService | undefined;
+  const resolve = () => (service ??= create());
+
+  return {
+    send: async (message, options) => resolve().send(message, options),
+    sendBatch: async (messages, options) =>
+      resolve().sendBatch(messages, options),
+  };
 }
 
 export function createEmailService({

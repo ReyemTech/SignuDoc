@@ -25,6 +25,8 @@ import {
   type ScheduledAccountClosure,
 } from "./retention.ts";
 import { resolvePublicSupportAddress } from "./public-contact.ts";
+import { ROLE_CHANGE_LOCK_ID } from "./people.ts";
+import type { RequestClient } from "./security/request.ts";
 import {
   createEmailService,
   resolveEmailAddresses,
@@ -33,7 +35,7 @@ import {
 import { recordSystemAuditEvent } from "./services/system-audit.ts";
 import { ServiceConfigurationError } from "./services/service-config.ts";
 import { getBranding } from "./settings.ts";
-import { type EnvSource } from "./utils/env.ts";
+import { isHostedMode, type EnvSource } from "./utils/env.ts";
 
 type SenderAccountRow = {
   email: string;
@@ -47,6 +49,8 @@ type EnvelopeCountRow = {
 };
 
 type RequestAccountClosureOptions = {
+  /** Where the request came from, for the audit trail. */
+  client?: RequestClient;
   database?: DbExecutor;
   env?: EnvSource;
   emailService?: EmailService;
@@ -234,6 +238,29 @@ function formatRetentionDeadline(timestamp: number): string {
   return new Date(timestamp * 1000).toISOString().replace(".000Z", " UTC");
 }
 
+export const LAST_ADMIN_CLOSURE_MESSAGE =
+  "You are the only administrator. Make someone else an administrator first, then close your account.";
+
+export async function accountClosureBlock(
+  user: { id: string },
+  database: DbExecutor = getDb(),
+  env: EnvSource = process.env,
+): Promise<string | null> {
+  if (isHostedMode(env)) return null;
+  const row = await queryOne<{ has_other_admin: boolean; role: string }>(
+    database,
+    `SELECT role, EXISTS (SELECT 1 FROM "user" AS other WHERE other.role = 'admin' AND other.id <> $1 AND NOT EXISTS (SELECT 1 FROM account_closure_requests WHERE user_id = other.id)) AS has_other_admin FROM "user" WHERE id = $1`,
+    [user.id],
+  );
+  return row?.role === "admin" && !row.has_other_admin
+    ? LAST_ADMIN_CLOSURE_MESSAGE
+    : null;
+}
+
+function isPool(database: DbExecutor): database is DbPool {
+  return "connect" in database && "totalCount" in database;
+}
+
 async function buildAccountClosureEmail(
   account: SenderAccountRow,
   closureSchedule: ScheduledAccountClosure,
@@ -274,14 +301,17 @@ function accountClosureAudit(
   account: SenderAccountRow,
   closureSchedule: ScheduledAccountClosure,
   database: DbExecutor,
+  client: RequestClient = {},
 ) {
   return recordSystemAuditEvent(
     {
       actorEmail: account.email,
       actorUserId: account.id,
       event: "account_closure_requested",
+      ipAddress: client.ipAddress ?? null,
       metadata: { purgeAfterAt: closureSchedule.purgeAfterAt },
       targetUserId: account.id,
+      userAgent: client.userAgent ?? null,
     },
     database,
   );
@@ -302,6 +332,7 @@ export async function requestAccountClosure(
   userId: string,
   input: unknown,
   {
+    client = {},
     database = getDb(),
     env = process.env,
     emailService,
@@ -317,9 +348,12 @@ export async function requestAccountClosure(
         [userId],
       );
       if (!account) throw new AccountMutationError("Account not found.", 404);
+      await tx.query("SELECT pg_advisory_xact_lock($1)", [ROLE_CHANGE_LOCK_ID]);
+      const blocked = await accountClosureBlock(account, tx, env);
+      if (blocked) throw new AccountMutationError(blocked, 409);
       const closureSchedule = await scheduleAccountClosure(userId, tx);
       if (closureSchedule.alreadyQueued) return { closureSchedule };
-      await accountClosureAudit(account, closureSchedule, tx);
+      await accountClosureAudit(account, closureSchedule, tx, client);
 
       const addresses = await resolveEmailAddresses(env, tx);
       if (!addresses.supportAddress) {
@@ -362,9 +396,17 @@ export async function requestAccountClosure(
     throw new AccountMutationError("Account not found.", 404);
   }
 
-  const closureSchedule = await scheduleAccountClosure(userId, database);
+  const guardAndSchedule = async (tx: DbExecutor) => {
+    await tx.query("SELECT pg_advisory_xact_lock($1)", [ROLE_CHANGE_LOCK_ID]);
+    const blocked = await accountClosureBlock(account, tx, env);
+    if (blocked) throw new AccountMutationError(blocked, 409);
+    return scheduleAccountClosure(userId, tx);
+  };
+  const closureSchedule = isPool(database)
+    ? await withTransaction(guardAndSchedule, database)
+    : await guardAndSchedule(database);
   if (!closureSchedule.alreadyQueued) {
-    await accountClosureAudit(account, closureSchedule, database).catch(
+    await accountClosureAudit(account, closureSchedule, database, client).catch(
       (error: unknown) => {
         console.error(
           `Failed to record the account closure request for user ${userId}:`,

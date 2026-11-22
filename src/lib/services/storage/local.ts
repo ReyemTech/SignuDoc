@@ -14,7 +14,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 
 import { parseFinalizationAttemptKey } from "../storage-keys.ts";
-import { type EnvSource } from "../../utils/env.ts";
+import { type EnvSource, readEnv } from "../../utils/env.ts";
 import {
   normalizeStorageKey,
   StorageObjectNotFoundError,
@@ -28,6 +28,8 @@ import {
 const LOCAL_BUCKET_NAME = "local";
 const DEFAULT_LOCAL_STORAGE_DIR = ".data/storage";
 const METADATA_SUFFIX = ".meta.json";
+
+let warnedAboutEmptyDirectory = false;
 
 type CreateLocalStorageServiceOptions = {
   env?: EnvSource;
@@ -125,11 +127,24 @@ export function createLocalStorageService({
     );
   }
 
+  // An empty STORAGE_LOCAL_DIR counts as not set. Earlier versions took it
+  // to mean the working directory itself. Said once per process.
+  if (
+    !warnedAboutEmptyDirectory &&
+    rootDir === undefined &&
+    env.STORAGE_LOCAL_DIR?.trim() === ""
+  ) {
+    warnedAboutEmptyDirectory = true;
+    console.warn(
+      `[storage] STORAGE_LOCAL_DIR is empty, so files are kept in ${DEFAULT_LOCAL_STORAGE_DIR}. Earlier versions kept them in the working directory: move them, or set STORAGE_LOCAL_DIR to that folder.`,
+    );
+  }
+
   // The comment stops Turbopack from tracing the whole project into the
   // server bundle because of a path it cannot analyse.
   const resolvedRootDir = path.resolve(
     /*turbopackIgnore: true*/ rootDir ??
-      env.STORAGE_LOCAL_DIR?.trim() ??
+      readEnv(env, "STORAGE_LOCAL_DIR") ??
       DEFAULT_LOCAL_STORAGE_DIR,
   );
 

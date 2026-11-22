@@ -1,6 +1,10 @@
 "use client";
 
-import { useRef, type KeyboardEvent, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useRef,
+  type KeyboardEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 
 import { type FieldResizeHandle } from "@/lib/utils/pdf-coords";
 
@@ -50,7 +54,7 @@ type InteractivePlacedFieldProps = {
   onInteractionChange?: (isActive: boolean) => void;
   onMove: (deltaX: number, deltaY: number) => void;
   onResize: (corner: FieldResizeHandle, deltaX: number, deltaY: number) => void;
-  onSelect: () => void;
+  onSelect: (additive: boolean) => void;
   signer: {
     color: string;
     name: string;
@@ -113,7 +117,7 @@ export function InteractivePlacedField({
 
     event.preventDefault();
     event.stopPropagation();
-    onSelect();
+    onSelect(event.shiftKey || event.ctrlKey || event.metaKey);
 
     if (typeof event.currentTarget.setPointerCapture === "function") {
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -159,7 +163,8 @@ export function InteractivePlacedField({
       onInteractionChange?.(true);
     }
 
-    const scaledDeltaX = (deltaClientX / gesture.viewportWidth) * coordinateScale;
+    const scaledDeltaX =
+      (deltaClientX / gesture.viewportWidth) * coordinateScale;
     const scaledDeltaY =
       (deltaClientY / gesture.viewportHeight) * coordinateScale;
 
@@ -199,7 +204,7 @@ export function InteractivePlacedField({
     }
 
     event.preventDefault();
-    onSelect();
+    onSelect(false);
   }
 
   return (
@@ -242,7 +247,9 @@ export function InteractivePlacedField({
               className={`absolute ${handle.positionClassName} ${handle.cursorClassName} z-1 size-4 rounded-full bg-white shadow-[0_4px_10px_rgba(28,29,43,0.18)]`}
               key={handle.corner}
               onPointerCancel={endGesture}
-              onPointerDown={(event) => beginGesture(event, "resize", handle.corner)}
+              onPointerDown={(event) =>
+                beginGesture(event, "resize", handle.corner)
+              }
               onPointerMove={handlePointerMove}
               onPointerUp={endGesture}
               style={{

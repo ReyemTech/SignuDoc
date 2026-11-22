@@ -14,10 +14,20 @@ type SignersPageProps = {
 export default async function SignersPage({ params }: SignersPageProps) {
   const { id } = await params;
   let record: Awaited<ReturnType<typeof getDraftSignerStepDataForUser>> = null;
+  let sender: { email: string; name: string } | undefined;
   let initialState: "error" | undefined;
 
   try {
     const session = await getAuthSession();
+    sender = session
+      ? {
+          email: session.user.email,
+          name:
+            typeof session.user.name === "string" && session.user.name.trim()
+              ? session.user.name.trim()
+              : session.user.email,
+        }
+      : undefined;
     record = session
       ? await getDraftSignerStepDataForUser(session.user.id, id, getDb())
       : null;
@@ -41,6 +51,7 @@ export default async function SignersPage({ params }: SignersPageProps) {
       initialState={initialState}
       key={id}
       record={record ?? undefined}
+      sender={sender}
     />
   );
 }

@@ -1,5 +1,6 @@
 .next
 node_modules
+public/pdfjs
 tsconfig.tsbuildinfo
 
 # Helm templates use Go template syntax within YAML.

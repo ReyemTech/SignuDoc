@@ -122,4 +122,4 @@ Each CronJob calls the internal Service by HTTP POST using `Authorization: Beare
 
 ## Validate chart changes
 
-With Node.js 24, Helm and [Mike Farah's yq](https://github.com/mikefarah/yq) v4 installed, run `node charts/signudoc/tests/validate.mjs`. This lints and renders the chart locally and checks the scheduled request against a local HTTP server.
+With Node.js 24 or 26, Helm and [Mike Farah's yq](https://github.com/mikefarah/yq) v4 installed, run `node charts/signudoc/tests/validate.mjs`. This lints and renders the chart locally and checks the scheduled request against a local HTTP server.

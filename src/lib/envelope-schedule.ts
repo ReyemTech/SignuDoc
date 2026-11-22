@@ -69,8 +69,8 @@ type ExpiredEnvelopeRow = {
   id: string;
   ownerEmail: string;
   ownerName: string | null;
-  signerEmail: string | null;
-  signerName: string | null;
+  /** "Name (email)" of each signer it was waiting on, or null. */
+  waitingOn: string | null;
   title: string;
   userId: string;
 };
@@ -99,13 +99,19 @@ async function listExpiredEnvelopesToNotify(
         e.expires_at AS "expiresAt",
         u.email AS "ownerEmail",
         u.name AS "ownerName",
-        s.name AS "signerName",
-        s.email AS "signerEmail"
+        -- Everyone it was waiting on, in signing order: one signer, or a
+        -- whole step of signers who sign at the same time.
+        (
+          SELECT string_agg(
+            s.name || ' (' || s.email || ')',
+            ', ' ORDER BY s.sign_order, s.id
+          )
+          FROM signers s
+          WHERE s.envelope_id = e.id
+            AND s.status = 'notified'
+        ) AS "waitingOn"
       FROM envelopes e
       JOIN "user" u ON u.id = e.user_id
-      LEFT JOIN signers s
-        ON s.envelope_id = e.id
-        AND s.status = 'notified'
       WHERE e.status = 'sent' AND NOT e.finalization_pending
         AND e.expires_at IS NOT NULL
         AND e.expires_at <= $1
@@ -194,10 +200,9 @@ async function noteExpiryNoticeSent(
 function buildExpiryNotice(envelope: ExpiredEnvelopeRow) {
   const appUrl = resolveAppUrl();
   const link = appUrl ? `${appUrl}/envelopes/${envelope.id}` : null;
-  const waitingOn =
-    envelope.signerName && envelope.signerEmail
-      ? ` It was still waiting on ${envelope.signerName} (${envelope.signerEmail}).`
-      : "";
+  const waitingOn = envelope.waitingOn
+    ? ` It was still waiting on ${envelope.waitingOn}.`
+    : "";
 
   return {
     subject: emailSubject`"${envelope.title}" expired before everyone signed`,
@@ -316,19 +321,25 @@ async function sendExpiryNotices({
  * reminder interval. Expired ones are left out: their link is dead, and the
  * sender has been told.
  */
-async function listEnvelopesDueForReminder(
+async function listSignersDueForReminder(
   now: number,
   database: DbPool,
-): Promise<string[]> {
-  const rows = await queryMany<{ id: string }>(
+): Promise<{ envelopeId: string; signerId: string }[]> {
+  // One row for each waiting signer who is due: signers of a step that
+  // signs at the same time are each reminded on their own schedule.
+  return queryMany<{ envelopeId: string; signerId: string }>(
     database,
     `
-      SELECT e.id
+      SELECT e.id AS "envelopeId", s.id AS "signerId"
       FROM envelopes e
       JOIN signers s
         ON s.envelope_id = e.id
         AND s.status = 'notified'
-      WHERE e.status = 'sent' AND NOT e.finalization_pending
+      WHERE e.status = 'sent'
+        -- Embedded envelopes get no reminders; left out here, before the
+        -- batch limit, so they cannot fill every batch.
+        AND e.delivery = 'email'
+        AND NOT e.finalization_pending
         AND e.reminder_interval_days IS NOT NULL
         AND (e.expires_at IS NULL OR e.expires_at > $1)
         AND GREATEST(
@@ -344,13 +355,12 @@ async function listEnvelopesDueForReminder(
           COALESCE(s.last_notified_at, 0),
           COALESCE(s.last_nudged_at, 0)
         ) ASC,
-        e.id ASC
+        e.id ASC,
+        s.id ASC
       LIMIT ${BATCH_SIZE}
     `,
     [now, AUTOMATIC_REMINDER_SLACK_SECONDS],
   );
-
-  return rows.map((row) => row.id);
 }
 
 async function sendAutomaticReminders({
@@ -362,7 +372,10 @@ async function sendAutomaticReminders({
   outOfTime,
   summary,
 }: ScheduleRun): Promise<void> {
-  for (const envelopeId of await listEnvelopesDueForReminder(now, database)) {
+  for (const { envelopeId, signerId } of await listSignersDueForReminder(
+    now,
+    database,
+  )) {
     if (outOfTime()) {
       summary.stoppedEarly = true;
       return;
@@ -373,6 +386,7 @@ async function sendAutomaticReminders({
         database,
         emailService: durable ? injectedEmailService : emailService(),
         nowUnixTimestamp: now,
+        signerId,
       });
 
       if (sent) {

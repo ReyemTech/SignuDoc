@@ -4,6 +4,12 @@ import {
   type TransactionPool,
 } from "../db/connection.ts";
 import { recordAuditEvent } from "../services/audit.ts";
+import { readBrandLogo } from "../brand-logo.ts";
+import {
+  createPublicVerificationToken,
+  hashPublicVerificationToken,
+} from "../public-verification.ts";
+import { getBranding } from "../settings.ts";
 import {
   finalizeEnvelope,
   loadInstallSealer,
@@ -45,6 +51,8 @@ export async function processFinalizationJob(
   )
     throw new RecoveryJobError("payload_invalid", true);
   const payload = result.data;
+  const verificationToken =
+    payload.publicVerificationToken ?? createPublicVerificationToken().token;
   const storageService =
     injectedStorage ?? createStorageService({ env, signal });
   const keys = buildFinalizationAttemptKeys({
@@ -108,13 +116,17 @@ export async function processFinalizationJob(
     for (const image of payload.images) await storage.getObject(image.key);
   }
   const sourcePdf = await storage.headObject(payload.envelope.sourcePdfKey);
+  const branding = await getBranding(env, database);
+  const brandLogo = branding.hosted ? null : await readBrandLogo(database);
   const artifacts = await finalizeEnvelope(
-    { ...payload, sourcePdf },
+    { ...payload, sourcePdf, publicVerificationToken: verificationToken },
     {
       generatedAt: payload.generatedAt,
       keys,
       seal,
       signedRevision,
+      branding,
+      brandLogo,
       storageService: storage,
       env,
       signal,
@@ -126,7 +138,8 @@ export async function processFinalizationJob(
       const published = await tx.query(
         `UPDATE envelopes SET status = 'completed', finalization_pending = false,
            signed_pdf_key = $2, evidence_key = $3, completed_at = $4, updated_at = $4,
-           signed_pdf_sha256 = $5, evidence_sha256 = $6, recipient_evidence_sha256 = $7
+           signed_pdf_sha256 = $5, evidence_sha256 = $6, recipient_evidence_sha256 = $7,
+           public_verification_token_hash = $8
          WHERE id = $1 AND status = 'sent' AND finalization_pending`,
         [
           job.envelopeId,
@@ -136,6 +149,7 @@ export async function processFinalizationJob(
           artifacts.signedPdf.sha256,
           artifacts.certificate.sha256,
           artifacts.recipientCertificate.sha256,
+          hashPublicVerificationToken(verificationToken),
         ],
       );
       if (!published.rowCount)
