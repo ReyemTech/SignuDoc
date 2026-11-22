@@ -2,16 +2,19 @@ import { createHash } from "node:crypto";
 
 import type pg from "pg";
 
-// One account may send ten envelopes an hour (the limit in
-// src/app/api/envelopes/[id]/send/route.ts), and together the tests send
-// more than that as the administrator. A test that sends starts that count
-// afresh, so whether it is refused does not depend on how many ran before.
+// The browser suite shares one administrator, so tests that create drafts or
+// send envelopes start those rate limits afresh. Their result must not depend
+// on which tests ran before them.
 
 export async function startSendLimitAfresh(
   database: pg.Client,
   userId: string,
 ): Promise<void> {
-  await database.query("delete from public.rate_limits where key = $1", [
-    createHash("sha256").update(`envelope-send:${userId}`).digest("hex"),
+  const keys = ["draft-create", "envelope-send"].map((prefix) =>
+    createHash("sha256").update(`${prefix}:${userId}`).digest("hex"),
+  );
+
+  await database.query("delete from public.rate_limits where key = any($1)", [
+    keys,
   ]);
 }
