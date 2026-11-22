@@ -56,7 +56,7 @@ function capturedAt(email: CapturedEmail) {
 
 // A synchronous test scheduler. It starts only after a producer has run and
 // there are no background requests to stop when a test fails.
-async function drainRecovery() {
+export async function drainRecovery() {
   const response = await fetch(new URL("/api/internal/recovery", e2eAppUrl), {
     method: "POST",
     headers: { Authorization: `Bearer ${e2eCronSecret}` },

@@ -1,7 +1,12 @@
 import { expect, test } from "@playwright/test";
 
+import { e2eRecoveryEnabled } from "../playwright.config";
 import { signInAsAdministrator } from "./support/admin-session";
-import { extractLink, waitForEmail } from "./support/outbox";
+import {
+  drainRecovery,
+  extractLink,
+  waitForEmail,
+} from "./support/outbox";
 import { writeSamplePdf } from "./support/sample-pdf";
 
 // Runs after signing-flow.spec.ts, which sets up the install and its
@@ -84,6 +89,7 @@ test("on a wide screen a completed envelope's buttons wrap instead of covering i
       .click();
     await expect(signerPage).toHaveURL(/\/sign\/[^/]+\/done/);
     await signerContext.close();
+    if (e2eRecoveryEnabled) await drainRecovery();
   });
 
   for (const width of [1424, 1044]) {

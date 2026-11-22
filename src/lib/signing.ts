@@ -3332,7 +3332,7 @@ async function submitSigningOnce(
       await deleteReplacedRevision(replacedRevisionKey, storageService);
       return signingSubmitResponseSchema.parse({
         envelopeId: context.envelope.id,
-        redirectPath: getSigningDoneRedirectPath(token, context.envelope.title),
+        redirectPath: doneRedirectPath,
         submittedAt,
       });
     }

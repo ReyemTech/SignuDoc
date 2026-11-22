@@ -7,7 +7,12 @@ import {
   e2eOutboxDir,
   e2eSetupToken,
 } from "../playwright.config";
-import { extractLink, extractLinks, waitForEmail } from "./support/outbox";
+import {
+  drainRecovery,
+  extractLink,
+  extractLinks,
+  waitForEmail,
+} from "./support/outbox";
 import { totpCode } from "./support/totp";
 import { startEmbedParent } from "./support/embed-parent";
 import { writeLargePdf, writeSamplePdf } from "./support/sample-pdf";
@@ -1874,7 +1879,11 @@ test("an administrator makes an API key and a webhook, an app sends and download
     const endpoints = page.getByRole("list", { name: "Webhook endpoints" });
 
     await expect(endpoints.getByText(receiver.url)).toBeVisible();
-    await endpoints.getByRole("button", { name: "Send test" }).click();
+    await endpoints
+      .getByRole("listitem")
+      .filter({ hasText: receiver.url })
+      .getByRole("button", { name: "Send test" })
+      .click();
     await expect(page.getByText("The test event was delivered")).toBeVisible();
     expect(receiver.received.map((webhook) => webhook.json.type)).toEqual([
       "webhook.test",
@@ -1980,6 +1989,7 @@ test("an administrator makes an API key and a webhook, an app sends and download
       .click();
     await expect(signerPage).toHaveURL(/\/sign\/[^/]+\/done/);
     await signer.close();
+    if (e2eRecoveryEnabled) await drainRecovery();
 
     // A cut-off body, or JSON that is not an object, is refused, never
     // read as "no reason given". Sent as bytes: Playwright would turn a
@@ -2307,6 +2317,8 @@ test("an app shows the signing page in its own site, only on a site an administr
         ),
       )
       .toContain("signudoc:signed");
+
+    if (e2eRecoveryEnabled) await drainRecovery();
 
     const messages = await portalPage.evaluate(
       () =>
