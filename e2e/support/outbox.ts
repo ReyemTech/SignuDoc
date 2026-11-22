@@ -57,18 +57,28 @@ function capturedAt(email: CapturedEmail) {
 // A synchronous test scheduler. It starts only after a producer has run and
 // there are no background requests to stop when a test fails.
 export async function drainRecovery() {
-  const response = await fetch(new URL("/api/internal/recovery", e2eAppUrl), {
-    method: "POST",
-    headers: { Authorization: `Bearer ${e2eCronSecret}` },
-    redirect: "error",
-    signal: AbortSignal.timeout(25_000),
-  });
-  const summary = await response.json();
-  if (!response.ok || summary?.status !== "ran" || summary.enabled !== true) {
-    throw new Error(
-      `The recovery fixture could not drain the queue (HTTP ${response.status}).`,
-    );
+  for (let batch = 0; batch < 10; batch += 1) {
+    const response = await fetch(new URL("/api/internal/recovery", e2eAppUrl), {
+      method: "POST",
+      headers: { Authorization: `Bearer ${e2eCronSecret}` },
+      redirect: "error",
+      signal: AbortSignal.timeout(25_000),
+    });
+    const summary = await response.json();
+    if (!response.ok || summary?.status !== "ran" || summary.enabled !== true) {
+      throw new Error(
+        `The recovery fixture could not drain the queue (HTTP ${response.status}).`,
+      );
+    }
+    if (summary.budgetExhausted) {
+      throw new Error("The recovery fixture exhausted its time budget.");
+    }
+    // The worker claims at most 20 jobs per request. Keep asking while a
+    // full batch ran so earlier unrelated work cannot strand the test's job.
+    if (summary.processed < 20) return;
   }
+
+  throw new Error("The recovery fixture did not drain within ten batches.");
 }
 
 /** Waits for the newest captured email with this template and recipient. */
