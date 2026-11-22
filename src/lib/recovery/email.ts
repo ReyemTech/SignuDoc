@@ -24,6 +24,7 @@ import {
 import { EMAIL_CODE_MAX_ATTEMPTS } from "../signer-checks.ts";
 import { emailTemplateKinds, envelopeStatuses } from "../types/domain.ts";
 import { readEnv, type EnvSource } from "../utils/env.ts";
+import { releaseSentWebhook } from "../webhooks/outbox.ts";
 import {
   RETENTION_DAY_SECONDS,
   RETENTION_WARNING_DAYS,
@@ -643,4 +644,12 @@ export async function processEmailJob(
             acknowledgeEmail(envelopeId, job.userId, payload, messageId, tx)
         : undefined,
   });
+  if (envelopeId && message.template === "signing_invitation") {
+    await releaseSentWebhook(envelopeId, database).catch((error: unknown) => {
+      console.error(
+        `Releasing the envelope.sent webhook of ${envelopeId} failed:`,
+        error,
+      );
+    });
+  }
 }
