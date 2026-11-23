@@ -74,12 +74,12 @@
 - Consumes: the release plan from Task 2 and the chart archive from `package-chart.sh`.
 - Produces: SHA, SemVer, and `latest` image tags; SemVer and OCI `latest` chart tags; a GitHub Release for each newly published package version.
 
-- [ ] Give the publishing job the minimum `contents: write` and `packages: write` permissions needed for release creation and package publishing.
-- [ ] Compute the release plan before build/push; validate tag refs against `package.json.version` and chart metadata before publishing.
-- [ ] Build app and migration images with commit SHA tags, add the matching app-version tag for a new stable release, and move `latest` only on successful main builds.
-- [ ] Push the Helm chart at its stable SemVer for a new version, otherwise use the SHA-suffixed branch version; move the GHCR-only `latest` alias only on main builds.
-- [ ] Create the GitHub Release with generated notes when the package version has not been released; keep retries idempotent and do not overwrite existing SemVer content.
-- [ ] Run package workflow validation, full unit tests, typecheck, lint, chart validation, and package smoke checks.
+- [x] Give the publishing job the minimum `contents: write` and `packages: write` permissions needed for release creation and package publishing.
+- [x] Compute the release plan before build/push; validate tag refs against `package.json.version` and chart metadata before publishing.
+- [x] Build app and migration images with commit SHA tags, add the matching app-version tag for a new stable release, and move `latest` only on successful main builds.
+- [x] Push the Helm chart at its stable SemVer for a new version, otherwise use the SHA-suffixed branch version; move the GHCR-only `latest` alias only on main builds.
+- [x] Create the GitHub Release with generated notes when the package version has not been released; keep retries idempotent and do not overwrite existing SemVer content.
+- [x] Run package workflow validation, full unit tests, typecheck, lint, chart validation, and package smoke checks.
 
 ### Task 4: Document release and Argo tracking behavior
 
