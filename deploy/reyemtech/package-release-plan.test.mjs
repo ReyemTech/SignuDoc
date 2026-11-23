@@ -1,9 +1,14 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { planPackageRelease } from "./package-release-plan.mjs";
 
 const commit = "a".repeat(40);
 const version = "0.9.0";
+const publishWorkflow = readFileSync(
+  new URL("../../.github/workflows/publish-packages.yml", import.meta.url),
+  "utf8",
+);
 
 function plan(overrides = {}) {
   return planPackageRelease({
@@ -112,5 +117,19 @@ test("invalid package versions and short SHAs are rejected", () => {
   assert.throws(
     () => plan({ versionTagExists: false, releaseExists: true }),
     /exists without its Git tag/,
+  );
+});
+
+test("the workflow safely reads false release flags under Bash errexit", () => {
+  assert.match(
+    publishWorkflow,
+    /create_release=\$\(jq -r '\.createRelease \| tostring'/,
+  );
+});
+
+test("the ORAS chart alias uses a registry reference without oci scheme", () => {
+  assert.match(
+    publishWorkflow,
+    /oras tag "\$\{chart_ref#oci:\/\/\}:\$CHART_VERSION" latest/,
   );
 });

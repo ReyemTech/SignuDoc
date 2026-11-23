@@ -93,7 +93,7 @@ jobs:
           chart_version=$(jq -er '.chartVersion' "$plan")
           chart_latest=$(jq -r '.chartLatestTag // empty' "$plan")
           release_tag=$(jq -er '.releaseTag' "$plan")
-          create_release=$(jq -er '.createRelease' "$plan")
+          create_release=$(jq -r '.createRelease | tostring' "$plan")
           image_tags=$(jq -er '.imageTags | join("\n")' "$plan")
 
           node charts/signudoc/tests/validate.mjs
@@ -261,5 +261,5 @@ jobs:
           chart_ref="$CHART_REGISTRY/signudoc"
           chart_manifest=$(docker buildx imagetools inspect "${chart_ref#oci://}:$CHART_VERSION" --format '{{json .Manifest}}')
           chart_digest=$(jq -er '.digest | select(test("^sha256:[0-9a-f]{64}$"))' <<< "$chart_manifest")
-          oras tag "${chart_ref}:$CHART_VERSION" latest
+          oras tag "${chart_ref#oci://}:$CHART_VERSION" latest
           echo "$chart_ref:latest -> $chart_digest (main build; Argo CD uses SemVer)" | tee -a "$GITHUB_STEP_SUMMARY"
