@@ -265,7 +265,7 @@ jobs:
           # This copy's Helm chart is not in upstream SignuDoc. Keep its
           # application version in step with the release merged above.
           chart=charts/signudoc/Chart.yaml
-          if [ -f "$chart" ]; then
+          if [ "$needs_code" = "true" ] && [ -f "$chart" ]; then
             app_version=$(jq -er '.version | strings' package.json)
             awk -v app_version="$app_version" '
               /^appVersion:[[:space:]]*/ {

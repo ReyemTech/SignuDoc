@@ -316,6 +316,18 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
   );
   assert.match(chart, /^version: 1\.7\.3$/m);
   assert.match(chart, /^appVersion: "0\.2\.0"$/m);
+  const chartDiff = git(
+    origin,
+    "diff",
+    "--unified=0",
+    "signudoc-update/v0.2.0^",
+    "signudoc-update/v0.2.0",
+    "--",
+    "charts/signudoc/Chart.yaml",
+  );
+  assert.match(chartDiff, /^-appVersion: "0\.1\.0"$/m);
+  assert.match(chartDiff, /^\+appVersion: "0\.2\.0"$/m);
+  assert.doesNotMatch(chartDiff, /^[-+]version:/m);
   // The commit names the release, so the next run knows where it stands.
   assert.match(
     git(origin, "log", "-1", "--format=%B", "signudoc-update/v0.2.0"),
@@ -481,6 +493,17 @@ test("adding the token later brings in the workflow files that were left", () =>
   assert.equal(runUpdate(checkout(origin), upstream).status, 0);
   squashMerge(origin, "signudoc-update/v0.2.0");
 
+  // The app is already current; this later run should only catch up workflows.
+  const localChange = checkout(origin);
+  write(
+    localChange,
+    "charts/signudoc/Chart.yaml",
+    'apiVersion: v2\nname: signudoc\nversion: 1.7.3\nappVersion: "0.1.0"\n',
+  );
+  git(localChange, "add", "charts/signudoc/Chart.yaml");
+  git(localChange, "commit", "--quiet", "-m", "Keep local chart metadata");
+  git(localChange, "push", "--quiet", "origin", "main");
+
   const withToken = runUpdate(checkout(origin), upstream, { hasToken: true });
 
   assert.equal(withToken.status, 0, withToken.stderr);
@@ -490,6 +513,10 @@ test("adding the token later brings in the workflow files that were left", () =>
   assert.equal(
     show(origin, branch, ".github/workflows/ci.yml"),
     "name: CI\non: push",
+  );
+  assert.match(
+    show(origin, branch, "charts/signudoc/Chart.yaml"),
+    /^appVersion: "0\.1\.0"$/m,
   );
   assert.equal(
     git(origin, "diff", "--name-only", "main", branch),
@@ -517,6 +544,7 @@ test("workflow files left behind do not block the next release", () => {
     ".github/workflows/ci.yml",
     "name: CI\non: [push, pull_request]\n",
   );
+  write(upstream, "package.json", '{ "version": "0.3.0" }\n');
   write(upstream, "src/app.ts", "export const a = 1;\nexport const b = 4;\n");
   git(upstream, "commit", "--quiet", "-am", "Third");
   git(upstream, "tag", "v0.3.0");
@@ -531,6 +559,14 @@ test("workflow files left behind do not block the next release", () => {
   assert.equal(
     show(origin, "signudoc-update/v0.3.0", ".github/workflows/ci.yml"),
     "name: CI",
+  );
+  assert.match(
+    show(origin, "signudoc-update/v0.3.0", "charts/signudoc/Chart.yaml"),
+    /^version: 1\.7\.3$/m,
+  );
+  assert.match(
+    show(origin, "signudoc-update/v0.3.0", "charts/signudoc/Chart.yaml"),
+    /^appVersion: "0\.3\.0"$/m,
   );
 
   // And with the token, both releases' workflow changes arrive at once.
