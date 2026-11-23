@@ -314,7 +314,7 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
     "signudoc-update/v0.2.0",
     "charts/signudoc/Chart.yaml",
   );
-  assert.match(chart, /^version: 1\.7\.3$/m);
+  assert.match(chart, /^version: 0\.2\.0$/m);
   assert.match(chart, /^appVersion: "0\.2\.0"$/m);
   const chartDiff = git(
     origin,
@@ -325,9 +325,10 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
     "--",
     "charts/signudoc/Chart.yaml",
   );
+  assert.match(chartDiff, /^-version: 1\.7\.3$/m);
+  assert.match(chartDiff, /^\+version: 0\.2\.0$/m);
   assert.match(chartDiff, /^-appVersion: "0\.1\.0"$/m);
   assert.match(chartDiff, /^\+appVersion: "0\.2\.0"$/m);
-  assert.doesNotMatch(chartDiff, /^[-+]version:/m);
   // The commit names the release, so the next run knows where it stands.
   assert.match(
     git(origin, "log", "-1", "--format=%B", "signudoc-update/v0.2.0"),
@@ -516,6 +517,10 @@ test("adding the token later brings in the workflow files that were left", () =>
   );
   assert.match(
     show(origin, branch, "charts/signudoc/Chart.yaml"),
+    /^version: 1\.7\.3$/m,
+  );
+  assert.match(
+    show(origin, branch, "charts/signudoc/Chart.yaml"),
     /^appVersion: "0\.1\.0"$/m,
   );
   assert.equal(
@@ -562,7 +567,7 @@ test("workflow files left behind do not block the next release", () => {
   );
   assert.match(
     show(origin, "signudoc-update/v0.3.0", "charts/signudoc/Chart.yaml"),
-    /^version: 1\.7\.3$/m,
+    /^version: 0\.3\.0$/m,
   );
   assert.match(
     show(origin, "signudoc-update/v0.3.0", "charts/signudoc/Chart.yaml"),
