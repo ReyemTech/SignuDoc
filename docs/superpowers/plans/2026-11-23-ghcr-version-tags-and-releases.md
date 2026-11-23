@@ -32,11 +32,13 @@
 ### Task 1: Synchronize stable chart metadata
 
 **Files:**
+
 - Modify: `.github/workflows/update-signudoc.yml`
 - Modify: `src/lib/update-workflow.test.ts`
 - Modify: `charts/signudoc/Chart.yaml`
 
 **Interfaces:**
+
 - Consumes: `package.json.version` from the upstream release tree.
 - Produces: generated release branch with chart `version` and `appVersion` both equal to the package version.
 
@@ -49,6 +51,7 @@
 ### Task 2: Test release metadata and chart packaging
 
 **Files:**
+
 - Create: `deploy/reyemtech/package-release-plan.mjs`
 - Create: `deploy/reyemtech/package-release-plan.test.mjs`
 - Modify: `package.json`
@@ -56,6 +59,7 @@
 - Modify: `charts/signudoc/tests/validate.mjs`
 
 **Interfaces:**
+
 - `planPackageRelease(input)` consumes event/ref/version/tag-existence facts and returns the immutable image tags, chart version, whether a GitHub Release is due, and the chart alias target.
 - The chart packaging script consumes the full commit SHA and ref details; stable packages use the package version and branch packages use a SHA-suffixed version.
 
@@ -68,9 +72,11 @@
 ### Task 3: Publish packages and create GitHub Releases
 
 **Files:**
+
 - Modify: `.github/workflows/publish-packages.yml`
 
 **Interfaces:**
+
 - Consumes: the release plan from Task 2 and the chart archive from `package-chart.sh`.
 - Produces: SHA, SemVer, and `latest` image tags; SemVer and OCI `latest` chart tags; a GitHub Release for each newly published package version.
 
@@ -84,8 +90,9 @@
 ### Task 4: Document release and Argo tracking behavior
 
 **Files:**
+
 - Modify: `docs/reyemtech-deployment.md`
 
-- [ ] Document that a package-version change on main creates the GitHub Release and SemVer package tags, while `latest` tracks successful main builds.
-- [ ] Document that Argo’s `0.*` selects chart SemVer and cannot select the OCI `latest` alias.
-- [ ] Run `git diff --check` and review the final PR diff for unrelated files.
+- [x] Document that a package-version change on main creates the GitHub Release and SemVer package tags, while `latest` tracks successful main builds.
+- [x] Document that Argo’s `0.*` selects chart SemVer and cannot select the OCI `latest` alias.
+- [x] Run `git diff --check` and review the final PR diff for unrelated files.
