@@ -8,6 +8,85 @@ release says when it does.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-22
+
+People can now work as a team, seeing the envelopes their teammates send,
+and a sender can put approvers in the signing order, who approve or reject
+the document instead of signing it. This release changes the database: see
+the end of this entry.
+
+### Teams
+
+- Teams. An administrator makes teams in Settings and puts people on them.
+  People on a team see the envelopes their teammates have sent, read-only,
+  in a "My team" view on the dashboard, and can download their audit trail
+  and, once finished, the signed PDF and certificate. Drafts stay private,
+  and only the sender changes an envelope. Team changes and teammates'
+  views and downloads are recorded in the site audit trail. See
+  [docs/teams.md](docs/teams.md) (PR #158 by @MattJackson).
+
+### Approvers
+
+- Anyone in the signing order can be an approver instead of a signer: on
+  the signers page, pick "Approves or rejects it (no fields)". An approver
+  reviews the document and approves or rejects it. They have no fields and
+  nothing of theirs is stamped on the signed PDF. Approvers take their turn
+  in the steps like signers, and a rejection ends the envelope, as a decline
+  does (PR #159 by @MattJackson).
+- Invitations and reminders ask an approver to approve, not to sign. The
+  audit trail, the envelope page and the certificate show "Approved" and
+  "Rejected", and the certificate lists approvals on their own, so an
+  approval is never read as a signature. Certificates of envelopes without
+  approvers are unchanged.
+- Templates keep who approves, so do copies of an envelope and Send to
+  many. The API shows each person's `role` (`signer` or `approver`);
+  webhooks report an approval as `signer.signed` and a rejection as
+  `envelope.declined`. See [docs/signing-order.md](docs/signing-order.md).
+- Approvers are not offered in Part 11 mode, where an approval is an
+  electronic signature: make the approver a signer with the meaning
+  Approval instead. They cannot be combined with advanced or qualified
+  signatures through a signing provider either.
+- The send confirmation counts signers and approvers apart, and the public
+  verify page says how many approvers there were (PR #249).
+
+### Fixes
+
+- In Settings, a team added while the list of teams was still loading
+  could be hidden until the page was reloaded (PR #249).
+- A declined envelope's certificate now lists the checks the signer had
+  passed before declining, as it does for a signature.
+
+### Upgrading
+
+This release changes the database, in two migrations:
+
+- `20261121100000_teams.sql` adds the `teams` and `team_members` tables.
+- `20261121110000_approvers.sql` lets a signer row have the role
+  `approver`, adds the `approved` and `rejected` audit events, and stops a
+  field from being given to an approver. A copy of the app from before this
+  release still runs on the database, but leaves approvers out of the
+  signing order: roll back past it only with no approvers on envelopes out
+  for signature.
+
+On Vercel the production build applies the migrations. On other hosts, run
+`npm run db:migrate` as on every deploy.
+
+Thank you to @MattJackson, who built both headline features of this
+release. Teams draw a careful line: teammates can read and download but
+never change, drafts stay private, and every look is on the record.
+Approvers fit into the signing order without a second set of rules, are
+kept apart from signatures everywhere it counts, and stay out of Part 11
+and provider signatures where an approval would not hold up. They answered
+every review note quickly, too.
+
+## [0.8.0] - 2026-11-21
+
+An administrator can now write the words signers agree to before signing,
+and this release closes a set of security gaps found in a review of the
+code. Upgrading matters most for installs that use Part 11 mode, single
+sign-on or backups. This release changes the database: see the end of this
+entry.
+
 ### Settings
 
 - An administrator can write the disclosure signers read and agree to before
@@ -23,9 +102,65 @@ release says when it does.
   they read. The hosted service keeps the standard text (PR #193 by
   @carefulcomputer).
 
-This needs one migration, `20261119130000_consent_disclosure.sql`, which adds
-the `app_settings.consent_disclosure` column. Until it has run, the setting
-reads as empty and signers see the standard text.
+### Security
+
+- Single sign-on counts an email address as verified only when the identity
+  provider says so (`email_verified` set to true, or Microsoft Entra's
+  `xms_edov`). Before, a provider that left the claim out was trusted.
+- In Part 11 mode, an administrator's identity confirmation now holds the
+  name and email address that were confirmed, and it counts only while the
+  account still has both. Changing either one needs a new confirmation
+  before the person can sign. Sending refuses a signer name that does not
+  match the confirmed name, signatures are made in the confirmed name, and
+  each signature checks again.
+- Restoring a backup ends the sessions, sign-in codes, emailed signing codes,
+  signing links and open signing-provider sessions it brought back, so a
+  restore cannot bring an ended session or link back to life. Download links
+  keep working. Restoring an older backup also fills in the rows that later
+  migrations backfill.
+- A certificate seals the audit trail as it stands while the envelope is
+  held, so an event recorded at the same moment cannot be left out.
+- Wrong access codes are counted per signer and code over a week, across
+  every link and address: after 10, the signer has to wait or ask the sender
+  for a new code. Tries sent at the same moment cannot slip past the count.
+- Public signing and download links are limited to 1,000 requests per
+  address every 10 minutes, and the text-fit check is limited per link.
+- Off Vercel, the visitor's address is read from the end of
+  `X-Forwarded-For`, where the last trusted proxy put it, so a visitor
+  cannot choose the address that rate limits count against.
+- A PDF with more than 1,000 pages is refused at upload.
+- Sending refuses a dropdown whose box is too small to show its choices
+  readably, so the signer is never handed one they cannot read.
+- Failed sign-ins to addresses that have no account are recorded in the
+  site audit trail, up to 20 an hour per address.
+
+### Upgrading
+
+If you use Part 11 mode, people whose confirmation came before this release
+keep it: the migration records their current name and address as the
+confirmed ones. From then on, a change to either needs an administrator to
+confirm the person again.
+
+This release changes the database, in three migrations:
+
+- `20261119130000_consent_disclosure.sql` adds the
+  `app_settings.consent_disclosure` column. Until it has run, the setting
+  reads as empty and signers see the standard text.
+- `20261120100000_identity_verified_snapshot.sql` adds
+  `identity_verified_name` and `identity_verified_email` to the `user` table
+  and fills them for people already confirmed.
+- `20261120110000_repair_edited_migrations.sql` adds columns that a database
+  which ran an early copy of three 0.5 and 0.7 migrations lacks (a preview
+  deployment sharing the production database, for one). On a database that
+  ran the final copies it changes nothing.
+
+On Vercel the production build applies the migrations. On other hosts, run
+`npm run db:migrate` as on every deploy.
+
+Thank you to @carefulcomputer, who built the editable consent disclosure in
+#193: the setting, the version that follows the text, and the care to keep
+the hosted service on the standard words. It gave this release its headline
+feature, and the E-SIGN notice was added on top of their work.
 
 ## [0.7.0] - 2026-11-20
 
@@ -605,6 +740,8 @@ checked against the real services:
 
 SignuDoc is software, not legal advice. See the README's legal disclaimer.
 
+[0.9.0]: https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.9.0
+[0.8.0]: https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.8.0
 [0.7.0]: https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.7.0
 [0.6.0]: https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.6.0
 [0.5.2]: https://github.com/NYLLON-SOFTWARE/SignuDoc/releases/tag/v0.5.2

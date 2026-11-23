@@ -77,6 +77,8 @@ type SignerRow = {
   lastNotifiedAt: number | null;
   lastNudgedAt: number | null;
   name: string;
+  /** Read only where the certificate is made again. */
+  role?: string;
   signedAt: number | null;
   signOrder: number;
   signingStep?: number | null;
@@ -158,6 +160,7 @@ function mapSignerRow(row: SignerRow): SignerRecord {
     lastNotifiedAt: row.lastNotifiedAt,
     lastNudgedAt: row.lastNudgedAt,
     name: row.name,
+    role: row.role === "approver" ? "approver" : undefined,
     signOrder: row.signOrder,
     signingStep: row.signingStep ?? null,
     signedAt: row.signedAt,
@@ -349,11 +352,13 @@ async function listSignersForEnvelope(
         signed_at AS "signedAt",
         declined_at AS "declinedAt",
         decline_reason AS "declineReason",
+        role,
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM signers
       WHERE envelope_id = $1
-        AND role = 'signer'
+        -- The signing order: signers and approvers, never copy recipients.
+        AND role IN ('signer', 'approver')
       ORDER BY sign_order ASC, id ASC
     `,
     [envelopeId],

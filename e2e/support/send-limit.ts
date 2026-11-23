@@ -14,7 +14,7 @@ export async function startSendLimitAfresh(
     createHash("sha256").update(`${prefix}:${userId}`).digest("hex"),
   );
 
-  await database.query("delete from public.rate_limits where key = any($1)", [
+  await database.query("delete from public.rate_limits where key = any($1::text[])", [
     keys,
   ]);
 }
