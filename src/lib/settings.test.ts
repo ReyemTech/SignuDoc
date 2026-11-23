@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { buildBranding } from "./branding.ts";
+import type { DbExecutor } from "./db/connection.ts";
 import {
+  getSigningPageBranding,
   isMissingSchemaError,
   resolveSettings,
   type AppSettings,
@@ -163,4 +165,50 @@ test("a stored color that is not one is ignored rather than put on a page", () =
   );
 
   assert.equal(branding.brandColor, null);
+});
+
+test("signing pages use built-in branding when settings cannot be read", async () => {
+  const unavailableDatabase = {
+    query: async () => {
+      throw new Error("connection timeout");
+    },
+  } as unknown as DbExecutor;
+
+  const branding = await getSigningPageBranding({}, unavailableDatabase);
+
+  assert.equal(branding.productName, "SignuDoc");
+  assert.equal(branding.organizationName, null);
+});
+
+test("signing pages keep stored branding when settings can be read", async () => {
+  const storedDatabase = {
+    query: async () => ({
+      rows: [
+        {
+          allowed_email_domains: ["acme.com"],
+          brand_color: "#1a73e8",
+          consent_disclosure: null,
+          email_ready_at: null,
+          logo_hash: "0123456789abcdef",
+          organization_name: "Acme Corp",
+          part11_mode: false,
+          privacy_url: "https://acme.com/privacy",
+          require_two_factor: false,
+          retention_days: null,
+          sender_address: "sign@acme.com",
+          session_idle_minutes: null,
+          session_max_hours: null,
+          setup_completed_at: 1_800_000_000,
+          signup_mode: "domains",
+          support_address: "help@acme.com",
+          terms_url: "https://acme.com/terms",
+        },
+      ],
+    }),
+  } as unknown as DbExecutor;
+
+  const branding = await getSigningPageBranding({}, storedDatabase);
+
+  assert.equal(branding.productName, "Acme Corp");
+  assert.equal(branding.brandColor, "#1a73e8");
 });
