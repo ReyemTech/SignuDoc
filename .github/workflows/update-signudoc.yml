@@ -262,6 +262,25 @@ jobs:
           git checkout --quiet -b "$branch"
           git read-tree -u --reset "$merged_tree"
 
+          # This copy's Helm chart is not in upstream SignuDoc. Keep its
+          # application version in step with the release merged above.
+          chart=charts/signudoc/Chart.yaml
+          if [ -f "$chart" ]; then
+            app_version=$(jq -er '.version | strings' package.json)
+            awk -v app_version="$app_version" '
+              /^appVersion:[[:space:]]*/ {
+                if (updated) exit 1
+                print "appVersion: \"" app_version "\""
+                updated = 1
+                next
+              }
+              { print }
+              END { if (!updated) exit 1 }
+            ' "$chart" > "$RUNNER_TEMP/Chart.yaml"
+            mv "$RUNNER_TEMP/Chart.yaml" "$chart"
+            git add -- "$chart"
+          fi
+
           # GitHub refuses a push that changes workflow files unless the
           # token may change workflows, which a workflow's own token may not.
           new_wf_base="$target"

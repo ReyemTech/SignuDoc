@@ -123,6 +123,7 @@ function makeCopy(
   upstream: string,
   change?: (dir: string) => void,
   changeFirstCommit?: (dir: string) => void,
+  includeChart = true,
 ) {
   const origin = path.join(scratch, `origin-${String((counter += 1))}.git`);
   const work = path.join(scratch, `copy-${String(counter)}`);
@@ -136,6 +137,13 @@ function makeCopy(
       env: gitEnv,
     },
   );
+  if (includeChart) {
+    write(
+      work,
+      "charts/signudoc/Chart.yaml",
+      'apiVersion: v2\nname: signudoc\nversion: 1.7.3\nappVersion: "0.1.0"\n',
+    );
+  }
   changeFirstCommit?.(work);
   git(work, "add", ".");
   git(work, "commit", "--quiet", "-m", "Initial commit");
@@ -301,6 +309,13 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
     show(origin, "signudoc-update/v0.2.0", "db/migrations/002_more.sql"),
     "alter table t add c int;",
   );
+  const chart = show(
+    origin,
+    "signudoc-update/v0.2.0",
+    "charts/signudoc/Chart.yaml",
+  );
+  assert.match(chart, /^version: 1\.7\.3$/m);
+  assert.match(chart, /^appVersion: "0\.2\.0"$/m);
   // The commit names the release, so the next run knows where it stands.
   assert.match(
     git(origin, "log", "-1", "--format=%B", "signudoc-update/v0.2.0"),
@@ -318,6 +333,29 @@ test("a Deploy-button copy gets a pull request with the new release", () => {
   assert.match(
     result.summary,
     /Opened https:\/\/github\.com\/acme\/signudoc\/pull\/1/,
+  );
+});
+
+test("a release update works when the copy has no Helm chart", () => {
+  const upstream = makeUpstream();
+  const { origin } = makeCopy(upstream, undefined, undefined, false);
+  const result = runUpdate(checkout(origin), upstream);
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    show(origin, "signudoc-update/v0.2.0", "package.json"),
+    '{ "version": "0.2.0" }',
+  );
+  assert.equal(
+    git(
+      origin,
+      "ls-tree",
+      "-r",
+      "--name-only",
+      "signudoc-update/v0.2.0",
+      "charts/signudoc/Chart.yaml",
+    ),
+    "",
   );
 });
 
