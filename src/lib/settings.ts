@@ -13,6 +13,7 @@ import {
   type SignupMode,
   type SignupPolicy,
 } from "./signup-policy.ts";
+import { logSecurityEvent } from "./security/logging.ts";
 import { getEnv, isHostedMode, type EnvSource } from "./utils/env.ts";
 
 // Install-wide settings: one row in app_settings, written by the first-run
@@ -364,6 +365,24 @@ export async function getBranding(
       ? resolveSettings(await readStoredSettings(database), env)
       : await getSettings(env),
   );
+}
+
+/** Signing must remain renderable when a brief database outage hides branding. */
+export async function getSigningPageBranding(
+  env: EnvSource = process.env,
+  database?: DbExecutor,
+): Promise<Branding> {
+  try {
+    return await getBranding(env, database);
+  } catch {
+    logSecurityEvent("warn", {
+      category: "signing_branding_fallback",
+      message:
+        "Stored branding could not be loaded; using the built-in brand for this signing page.",
+    });
+
+    return buildBranding(resolveSettings(null, env));
+  }
 }
 
 export function toSignupPolicy(settings: AppSettings): SignupPolicy {

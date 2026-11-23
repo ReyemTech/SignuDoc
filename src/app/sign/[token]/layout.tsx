@@ -4,7 +4,7 @@ import { connection } from "next/server";
 
 import { BrandingProvider } from "@/components/layout/branding-provider";
 import { getInstallMetadata } from "@/lib/install";
-import { getBranding } from "@/lib/settings";
+import { getSigningPageBranding } from "@/lib/settings";
 
 export async function generateMetadata(): Promise<Metadata> {
   await connection();
@@ -21,7 +21,7 @@ export default async function SigningLayout({
   await connection();
 
   return (
-    <BrandingProvider branding={await getBranding()}>
+    <BrandingProvider branding={await getSigningPageBranding()}>
       {children}
     </BrandingProvider>
   );
