@@ -59,11 +59,11 @@
 - `planPackageRelease(input)` consumes event/ref/version/tag-existence facts and returns the immutable image tags, chart version, whether a GitHub Release is due, and the chart alias target.
 - The chart packaging script consumes the full commit SHA and ref details; stable packages use the package version and branch packages use a SHA-suffixed version.
 
-- [ ] Add tests for a first 0.9.0 main release, a rerun with an existing release, a later main build, a matching and mismatched version tag, and a historical tag that cannot move `latest`.
-- [ ] Register the new test in `npm test` and run it to verify expected failures.
-- [ ] Implement the pure release-plan function and validate strict `X.Y.Z` versions.
-- [ ] Require chart `version` and `appVersion` to match `package.json.version`; verify stable package mode creates a `0.9.0` chart and branch mode creates a SHA-suffixed chart.
-- [ ] Run the new tests and `node charts/signudoc/tests/validate.mjs`.
+- [x] Add tests for a first 0.9.0 main release, a rerun with an existing release, a later main build, a matching and mismatched version tag, and a historical tag that cannot move `latest`.
+- [x] Register the new test in `npm test` and run it to verify expected failures.
+- [x] Implement the pure release-plan function and validate strict `X.Y.Z` versions.
+- [x] Require chart `version` and `appVersion` to match `package.json.version`; verify stable package mode creates a `0.9.0` chart and branch mode creates a SHA-suffixed chart.
+- [x] Run the new tests and `node charts/signudoc/tests/validate.mjs`.
 
 ### Task 3: Publish packages and create GitHub Releases
 

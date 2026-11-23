@@ -19,7 +19,7 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"src/**/*.test.ts\" \"db/**/*.test.mjs\" \"e2e/support/*.unit.ts\"",
+    "test": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test \"src/**/*.test.ts\" \"db/**/*.test.mjs\" \"e2e/support/*.unit.ts\" \"deploy/reyemtech/*.test.mjs\"",
     "restore-backup": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/restore-backup.ts",
     "test:db": "node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON --test --test-concurrency=1 \"src/**/*.dbtest.ts\"",
     "test:e2e": "playwright test"

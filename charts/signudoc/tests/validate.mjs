@@ -2,6 +2,9 @@ import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { createServer } from "node:http";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const chart = fileURLToPath(new URL("../", import.meta.url));
@@ -524,5 +527,52 @@ for (const options of [[], s3, ["--set", "storage.existingClaim=documents"]]) {
   execFileSync("helm", ["lint", "--strict", chart, ...options], {
     stdio: "inherit",
   });
+}
+
+const repository = fileURLToPath(new URL("../../../", import.meta.url));
+const packageVersion = JSON.parse(
+  readFileSync(join(repository, "package.json"), "utf8"),
+).version;
+const commit = "a".repeat(40);
+const packageDirectory = mkdtempSync(join(tmpdir(), "signudoc-chart-package-"));
+try {
+  for (const [refType, refName, expected] of [
+    ["tag", `v${packageVersion}`, packageVersion],
+    ["branch", "main", `${packageVersion}-sha-${commit}`],
+    ["branch", "main", packageVersion],
+  ]) {
+    const output = execFileSync(
+      "bash",
+      [
+        "deploy/reyemtech/package-chart.sh",
+        commit,
+        refType,
+        refName,
+        packageDirectory,
+        expected === packageVersion ? "stable" : "snapshot",
+      ],
+      { cwd: repository, encoding: "utf8" },
+    ).trim();
+    assert.equal(output, expected);
+    const archive = join(packageDirectory, `signudoc-${expected}.tgz`);
+    assert.equal(
+      execFileSync("helm", ["show", "chart", archive], {
+        encoding: "utf8",
+      }).match(/^version: (.+)$/m)?.[1],
+      expected,
+    );
+    assert.equal(
+      execFileSync("helm", ["show", "chart", archive], {
+        encoding: "utf8",
+      }).match(/^appVersion: (.+)$/m)?.[1],
+      packageVersion,
+    );
+    const values = execFileSync("helm", ["show", "values", archive], {
+      encoding: "utf8",
+    });
+    assert.match(values, new RegExp(`tag: ["']?${commit}["']?`));
+  }
+} finally {
+  rmSync(packageDirectory, { recursive: true, force: true });
 }
 console.log("Chart rendering and scheduled HTTP checks passed.");
